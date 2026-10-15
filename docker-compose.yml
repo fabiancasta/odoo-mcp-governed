@@ -1,0 +1,49 @@
+# odoo-mcp-governed — hardened deployment.
+#
+# Before the first `docker compose up`:
+#   cp .env.example .env && chmod 600 .env        # then fill in the secrets
+#   mkdir -m 700 -p data                          # owned by you, not by root
+#
+# The port is published on 127.0.0.1 only. Put a TLS reverse proxy in front;
+# if you must publish on all interfaces, see deploy/firewall-docker.sh —
+# Docker's port publishing bypasses UFW.
+services:
+  mcp:
+    build:
+      context: .
+      args:
+        APP_UID: ${APP_UID:-1000}
+    image: odoo-mcp-governed:local
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+    ports:
+      - "127.0.0.1:${MCP_EXTERNAL_PORT:-8020}:8000"
+    volumes:
+      - ./data:/data
+    # Reach an Odoo running on the Docker host as http://host.docker.internal:<port>.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 200
+    networks:
+      - mcp_net
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  mcp_net:

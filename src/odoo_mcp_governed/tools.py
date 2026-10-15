@@ -1,0 +1,962 @@
+"""The 18 MCP tools.
+
+Every tool follows the same shape: parse arguments, describe the call as a
+:class:`~.governance.ToolCall`, run the Odoo work inside
+``engine.guard(call)``, report how many records were touched. There is no
+other route to the Odoo client — tools receive a :class:`ToolContext`, and the
+context only exposes Odoo through the guard.
+
+What a tool reports as ``fields_touched`` matters more than it looks. It is
+what the sensitive-field rule checks, so it includes field names referenced in
+a search *domain*, not only the fields read or written. Otherwise
+``search_count([("password", "=", guess)])`` would be a perfectly legal
+password oracle that never "reads" the password field.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import http.cookiejar
+import json
+import ssl
+import urllib.parse
+import urllib.request
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
+from typing import Any
+
+from .governance import GuardedCall, Operation, ToolCall, digest_args
+from .governance.policy import WILDCARD, matches
+from .runtime import Runtime, Snapshot
+
+DEFAULT_SEARCH_LIMIT = 100
+DEFAULT_FIELD_ATTRIBUTES = [
+    "string", "type", "required", "readonly", "relation", "selection", "help",
+]
+
+
+class ToolInputError(ValueError):
+    """The arguments were malformed. The message is shown to the agent."""
+
+
+@dataclass
+class ToolContext:
+    runtime: Runtime
+    actor: str
+    snapshot: Snapshot
+    tool: str
+    arguments: dict[str, Any]
+    guarded: bool = False
+
+    def guard(
+        self,
+        *,
+        operation: Operation,
+        model: str | None = None,
+        method: str | None = None,
+        fields: Iterable[str] = (),
+        count: int | None = None,
+    ):
+        self.guarded = True
+        call = ToolCall(
+            actor=self.actor,
+            profile=self.snapshot.profile.name,
+            tool=self.tool,
+            operation=operation,
+            model=model,
+            method=method,
+            fields_touched=tuple(sorted(set(fields))),
+            record_count=count,
+            arg_digest=digest_args(self.arguments),
+        )
+        return self.runtime.engine.guard(call)
+
+    def odoo(self, model: str, method: str, args: list | None = None, kwargs: dict | None = None):
+        return self.snapshot.client.execute(model, method, args, kwargs)
+
+    def cached(self, key: tuple, factory: Callable[[], Any]) -> Any:
+        return self.runtime.cache.get_or_set((self.snapshot.profile.name, *key), factory)
+
+    @property
+    def policy(self):
+        return self.runtime.engine.policy.config
+
+    def redact(self, records: Any) -> Any:
+        """Drop credential-like keys from returned records, whatever was asked.
+
+        The policy refuses calls that *name* a sensitive field. This covers the
+        other case: an agent that asks for all fields and would receive one.
+        """
+        sensitive = {f.lower() for f in self.policy.sensitive_fields}
+        if isinstance(records, list):
+            return [self.redact(r) for r in records]
+        if isinstance(records, dict):
+            return {k: v for k, v in records.items() if k.lower() not in sensitive}
+        return records
+
+
+@dataclass(frozen=True)
+class Tool:
+    name: str
+    description: str
+    operation: Operation
+    properties: dict[str, Any]
+    required: tuple[str, ...]
+    handler: Callable[[ToolContext], Any]
+    annotations: dict[str, Any] = field(default_factory=dict)
+
+    def schema(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "inputSchema": {
+                "type": "object",
+                "properties": self.properties,
+                "required": list(self.required),
+                "additionalProperties": False,
+            },
+            "annotations": self.annotations,
+        }
+
+
+# --- argument helpers ------------------------------------------------------
+
+
+def _arg_str(ctx: ToolContext, name: str, *, required: bool = True, default: str = "") -> str:
+    value = ctx.arguments.get(name, default)
+    if value in (None, "") and not required:
+        return default
+    if not isinstance(value, str) or not value.strip():
+        raise ToolInputError(f"'{name}' must be a non-empty string")
+    return value.strip()
+
+
+def _arg_int(ctx: ToolContext, name: str, default: int, *, minimum: int = 0) -> int:
+    value = ctx.arguments.get(name, default)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ToolInputError(f"'{name}' must be an integer >= {minimum}")
+    return value
+
+
+def _arg_dict(ctx: ToolContext, name: str, *, required: bool = True) -> dict[str, Any]:
+    value = ctx.arguments.get(name)
+    if value is None and not required:
+        return {}
+    if not isinstance(value, dict):
+        raise ToolInputError(f"'{name}' must be an object")
+    return value
+
+
+def _arg_str_list(ctx: ToolContext, name: str) -> list[str] | None:
+    value = ctx.arguments.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ToolInputError(f"'{name}' must be a list of strings")
+    return value
+
+
+def _arg_ids(ctx: ToolContext) -> list[int]:
+    """Accept ``record_id`` (one) or ``ids`` (many), never neither."""
+    if "ids" in ctx.arguments and ctx.arguments["ids"] is not None:
+        ids = ctx.arguments["ids"]
+        if (
+            not isinstance(ids, list)
+            or not ids
+            or not all(isinstance(i, int) and not isinstance(i, bool) and i > 0 for i in ids)
+        ):
+            raise ToolInputError("'ids' must be a non-empty list of positive integers")
+        return list(dict.fromkeys(ids))
+    record_id = ctx.arguments.get("record_id")
+    if isinstance(record_id, bool) or not isinstance(record_id, int) or record_id <= 0:
+        raise ToolInputError("provide 'record_id' (positive integer) or 'ids' (list)")
+    return [record_id]
+
+
+def _arg_domain(ctx: ToolContext) -> list[Any]:
+    domain = ctx.arguments.get("domain", [])
+    if domain is None:
+        return []
+    if not isinstance(domain, list):
+        raise ToolInputError("'domain' must be a list, e.g. [[\"is_company\", \"=\", true]]")
+    return domain
+
+
+def domain_fields(domain: Any) -> set[str]:
+    """Every field name a domain refers to, including each hop of a path.
+
+    ``partner_id.user_ids.password`` yields all three segments, so the
+    sensitive-field rule sees ``password`` however deep it is nested.
+    """
+    found: set[str] = set()
+    if not isinstance(domain, (list, tuple)):
+        return found
+    for leaf in domain:
+        if isinstance(leaf, (list, tuple)) and len(leaf) == 3 and isinstance(leaf[0], str):
+            path = leaf[0]
+            found.add(path)
+            found.update(part for part in path.split(".") if part)
+            if isinstance(leaf[2], (list, tuple)):
+                found |= domain_fields(leaf[2])
+        elif isinstance(leaf, (list, tuple)):
+            found |= domain_fields(leaf)
+    return found
+
+
+def _limit(ctx: ToolContext, default: int = DEFAULT_SEARCH_LIMIT) -> int:
+    requested = _arg_int(ctx, "limit", min(default, ctx.policy.max_records_per_call), minimum=1)
+    # Requests above the ceiling are passed through as-is so policy can refuse
+    # them with a clear reason, rather than silently truncating and letting the
+    # agent believe it saw everything.
+    return requested
+
+
+def _decode_base64(data: str, max_bytes: int) -> bytes:
+    approx = len(data) * 3 // 4
+    if approx > max_bytes * 1.01 + 4:
+        raise ToolInputError(f"attachment exceeds the {max_bytes // (1024 * 1024)} MB limit")
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError):
+        raise ToolInputError("'data_base64' is not valid base64") from None
+    if len(raw) > max_bytes:
+        raise ToolInputError(f"attachment exceeds the {max_bytes // (1024 * 1024)} MB limit")
+    return raw
+
+
+def _max_attachment_bytes(ctx: ToolContext) -> int:
+    return int(ctx.runtime.settings.max_attachment_mb * 1024 * 1024)
+
+
+def _done(guarded: GuardedCall, count: int | None, result: Any) -> Any:
+    guarded.affected(count)
+    return result
+
+
+# --- record tools ----------------------------------------------------------
+
+MODEL = {"type": "string", "description": "Technical model name, e.g. 'res.partner'"}
+RECORD_ID = {"type": "integer", "description": "One record id"}
+IDS = {"type": "array", "items": {"type": "integer"}, "description": "Several record ids"}
+FIELDS = {
+    "type": "array",
+    "items": {"type": "string"},
+    "description": "Fields to return. Omit for all readable fields — prefer naming them.",
+}
+DOMAIN = {
+    "type": "array",
+    "description": "Odoo search domain, e.g. [[\"customer_rank\", \">\", 0]]",
+}
+
+
+def get_record(ctx: ToolContext) -> Any:
+    model = _arg_str(ctx, "model")
+    ids = _arg_ids(ctx)
+    fields = _arg_str_list(ctx, "fields")
+    with ctx.guard(
+        operation=Operation.READ, model=model, fields=fields or (), count=len(ids)
+    ) as g:
+        kwargs = {"fields": fields} if fields else {}
+        records = ctx.redact(ctx.odoo(model, "read", [ids], kwargs))
+        missing = sorted(set(ids) - {r["id"] for r in records})
+        result: dict[str, Any] = {"records": records}
+        if missing:
+            result["missing_ids"] = missing
+        return _done(g, len(records), result)
+
+
+def search_records(ctx: ToolContext) -> Any:
+    model = _arg_str(ctx, "model")
+    domain = _arg_domain(ctx)
+    fields = _arg_str_list(ctx, "fields")
+    limit = _limit(ctx)
+    offset = _arg_int(ctx, "offset", 0)
+    order = _arg_str(ctx, "order", required=False) or None
+    touched = set(fields or ()) | domain_fields(domain)
+    with ctx.guard(operation=Operation.READ, model=model, fields=touched, count=limit) as g:
+        kwargs: dict[str, Any] = {"limit": limit, "offset": offset}
+        if fields:
+            kwargs["fields"] = fields
+        if order:
+            kwargs["order"] = order
+        records = ctx.redact(ctx.odoo(model, "search_read", [domain], kwargs))
+        return _done(
+            g,
+            len(records),
+            {"count": len(records), "limit": limit, "offset": offset, "records": records},
+        )
+
+
+def create_record(ctx: ToolContext) -> Any:
+    model = _arg_str(ctx, "model")
+    values = _arg_dict(ctx, "values")
+    if not values:
+        raise ToolInputError("'values' must not be empty")
+    with ctx.guard(operation=Operation.CREATE, model=model, fields=values, count=1) as g:
+        created = ctx.odoo(model, "create", [values])
+        new_id = created[0] if isinstance(created, list) else created
+        return _done(g, 1, {"id": new_id, "model": model})
+
+
+def update_record(ctx: ToolContext) -> Any:
+    model = _arg_str(ctx, "model")
+    ids = _arg_ids(ctx)
+    values = _arg_dict(ctx, "values")
+    if not values:
+        raise ToolInputError("'values' must not be empty")
+    with ctx.guard(
+        operation=Operation.WRITE, model=model, fields=values, count=len(ids)
+    ) as g:
+        ctx.odoo(model, "write", [ids, values])
+        return _done(g, len(ids), {"success": True, "ids": ids, "fields": sorted(values)})
+
+
+def delete_record(ctx: ToolContext) -> Any:
+    model = _arg_str(ctx, "model")
+    ids = _arg_ids(ctx)
+    with ctx.guard(operation=Operation.DELETE, model=model, count=len(ids)) as g:
+        ctx.odoo(model, "unlink", [ids])
+        return _done(g, len(ids), {"success": True, "deleted_ids": ids})
+
+
+def execute_method(ctx: ToolContext) -> Any:
+    model = _arg_str(ctx, "model")
+    method = _arg_str(ctx, "method")
+    args = ctx.arguments.get("args", []) or []
+    kwargs = ctx.arguments.get("kwargs", {}) or {}
+    if not isinstance(args, list) or not isinstance(kwargs, dict):
+        raise ToolInputError("'args' must be a list and 'kwargs' an object")
+    # Best-effort description of what the call touches: record ids if the first
+    # argument looks like them, and the keys of any value dicts passed along.
+    count = None
+    if args and isinstance(args[0], list) and all(isinstance(i, int) for i in args[0]):
+        count = len(args[0])
+    touched: set[str] = set()
+    for item in [*args, *kwargs.values()]:
+        if isinstance(item, dict):
+            touched |= set(item)
+    touched |= domain_fields(kwargs.get("domain"))
+    with ctx.guard(
+        operation=Operation.EXECUTE, model=model, method=method, fields=touched, count=count
+    ) as g:
+        result = ctx.odoo(model, method, args, kwargs)
+        return _done(g, count, {"result": ctx.redact(result)})
+
+
+def call_onchange(ctx: ToolContext) -> Any:
+    model = _arg_str(ctx, "model")
+    values = _arg_dict(ctx, "values")
+    changed = _arg_str_list(ctx, "field_names") or list(values)
+    spec = ctx.arguments.get("fields_spec")
+    if spec is not None and not isinstance(spec, dict):
+        raise ToolInputError("'fields_spec' must be an object")
+    touched = set(values) | set(changed) | set(spec or ())
+    with ctx.guard(operation=Operation.READ, model=model, fields=touched, count=1) as g:
+        if spec is None:
+            spec = _default_onchange_spec(ctx, model)
+        result = ctx.odoo(model, "onchange", [[], values, changed, spec])
+        if isinstance(result, dict) and isinstance(result.get("value"), dict):
+            result["value"] = ctx.redact(result["value"])
+        return _done(g, 0, result)
+
+
+def _default_onchange_spec(ctx: ToolContext, model: str) -> dict[str, Any]:
+    """Ask for every simple field, so the answer shows what the change *causes*.
+
+    Requesting only the fields the agent sent would hide exactly the
+    information onchange exists to provide.
+    """
+    defs = _fields_get(ctx, model, ["type"])
+    sensitive = {f.lower() for f in ctx.policy.sensitive_fields}
+    return {
+        name: {}
+        for name, meta in defs.items()
+        if meta.get("type") not in ("one2many", "many2many", "binary")
+        and name.lower() not in sensitive
+    }
+
+
+# --- schema tools ----------------------------------------------------------
+
+
+def _fields_get(ctx: ToolContext, model: str, attributes: list[str]) -> dict[str, Any]:
+    return ctx.cached(
+        ("fields_get", model, tuple(sorted(attributes))),
+        lambda: ctx.odoo(model, "fields_get", [], {"attributes": attributes}),
+    )
+
+
+def get_model_fields(ctx: ToolContext) -> Any:
+    model = _arg_str(ctx, "model")
+    attributes = _arg_str_list(ctx, "attributes") or DEFAULT_FIELD_ATTRIBUTES
+    with ctx.guard(operation=Operation.META, model=model) as g:
+        defs = _fields_get(ctx, model, attributes)
+        return _done(g, None, {"model": model, "field_count": len(defs), "fields": defs})
+
+
+def get_field_names(ctx: ToolContext) -> Any:
+    model = _arg_str(ctx, "model")
+    with ctx.guard(operation=Operation.META, model=model) as g:
+        defs = _fields_get(ctx, model, ["type", "string"])
+        names = {
+            name: f"{meta.get('type')} — {meta.get('string')}"
+            for name, meta in sorted(defs.items())
+        }
+        return _done(g, None, {"model": model, "fields": names})
+
+
+def model_info(ctx: ToolContext) -> Any:
+    model = _arg_str(ctx, "model")
+    with ctx.guard(operation=Operation.META, model=model) as g:
+        rows = ctx.cached(
+            ("ir.model", model),
+            lambda: ctx.odoo(
+                "ir.model",
+                "search_read",
+                [[["model", "=", model]]],
+                {"fields": ["name", "model", "info", "transient", "modules"], "limit": 1},
+            ),
+        )
+        if not rows:
+            raise ToolInputError(f"model {model!r} does not exist in this database")
+        info = rows[0]
+        defs = _fields_get(ctx, model, ["type"])
+        access = {op: _has_access(ctx, model, op) for op in ("read", "write", "create", "unlink")}
+        policy = ctx.policy
+        read_only = ctx.snapshot.profile.read_only
+        return _done(
+            g,
+            None,
+            {
+                "model": info["model"],
+                "name": info["name"],
+                "description": info.get("info") or "",
+                "transient": info.get("transient", False),
+                "modules": info.get("modules", ""),
+                "field_count": len(defs),
+                "odoo_access": access,
+                "governance": {
+                    "readable": matches(model, policy.allowed_models),
+                    "writable": not read_only and matches(model, policy.writable_models),
+                    "deletable": not read_only and matches(model, policy.deletable_models),
+                    "profile_read_only": read_only,
+                },
+            },
+        )
+
+
+def _has_access(ctx: ToolContext, model: str, operation: str) -> bool | None:
+    """Odoo 18+ ``has_access`` (a record method), falling back to the older
+    ``check_access_rights``. ``None`` means neither answered."""
+    from .odoo import OdooError
+
+    try:
+        return bool(ctx.odoo(model, "has_access", [[], operation]))
+    except OdooError:
+        pass
+    try:
+        return bool(ctx.odoo(model, "check_access_rights", [operation, False]))
+    except OdooError:
+        return None
+
+
+def list_models(ctx: ToolContext) -> Any:
+    term = _arg_str(ctx, "filter", required=False)
+    limit = _arg_int(ctx, "limit", 200, minimum=1)
+    with ctx.guard(operation=Operation.META, model=None) as g:
+        domain = [["model", "ilike", term]] if term else []
+        rows = ctx.cached(
+            ("list_models", term),
+            lambda: ctx.odoo(
+                "ir.model", "search_read", [domain], {"fields": ["model", "name", "transient"]}
+            ),
+        )
+        policy = ctx.policy
+        # Only what this server would actually let the agent read: listing
+        # unreachable models just invites calls that will be refused.
+        visible = [
+            {**row, "writable": matches(row["model"], policy.writable_models)}
+            for row in rows
+            if row["model"] not in policy.denied_models
+            and matches(row["model"], policy.allowed_models)
+        ]
+        return _done(
+            g,
+            None,
+            {
+                "count": len(visible[:limit]),
+                "total_matching": len(visible),
+                "allowlist": "all models" if WILDCARD in policy.allowed_models else "restricted",
+                "models": visible[:limit],
+            },
+        )
+
+
+# --- search helpers --------------------------------------------------------
+
+
+def name_search(ctx: ToolContext) -> Any:
+    model = _arg_str(ctx, "model")
+    name = ctx.arguments.get("name", "") or ""
+    if not isinstance(name, str):
+        raise ToolInputError("'name' must be a string")
+    domain = _arg_domain(ctx)
+    operator = _arg_str(ctx, "operator", required=False, default="ilike")
+    limit = _limit(ctx, default=10)
+    with ctx.guard(
+        operation=Operation.READ, model=model, fields=domain_fields(domain), count=limit
+    ) as g:
+        # Positional arguments: the keyword was renamed from ``args`` to
+        # ``domain`` in Odoo 18, and position works on both sides of that.
+        pairs = ctx.odoo(model, "name_search", [name, domain, operator, limit])
+        results = [{"id": p[0], "name": p[1]} for p in pairs]
+        return _done(g, len(results), {"count": len(results), "results": results})
+
+
+def search_count(ctx: ToolContext) -> Any:
+    model = _arg_str(ctx, "model")
+    domain = _arg_domain(ctx)
+    with ctx.guard(operation=Operation.READ, model=model, fields=domain_fields(domain)) as g:
+        count = ctx.odoo(model, "search_count", [domain])
+        # Counting reads no record content, so it does not feed mass_read.
+        return _done(g, None, {"model": model, "count": count})
+
+
+# --- reports and attachments -----------------------------------------------
+
+
+def get_report(ctx: ToolContext) -> Any:
+    report_name = _arg_str(ctx, "report_name")
+    ids = _arg_ids(ctx)
+    rows = ctx.cached(
+        ("report", report_name),
+        lambda: ctx.odoo(
+            "ir.actions.report",
+            "search_read",
+            [[["report_name", "=", report_name]]],
+            {"fields": ["model", "report_type", "name"], "limit": 1},
+        ),
+    )
+    if not rows:
+        raise ToolInputError(f"no report named {report_name!r}")
+    report = rows[0]
+    # Governed on the model the report renders, not on ir.actions.report: a
+    # PDF of an invoice is a read of the invoice.
+    with ctx.guard(
+        operation=Operation.READ, model=report["model"], method=report_name, count=len(ids)
+    ) as g:
+        if report.get("report_type") != "qweb-pdf":
+            raise ToolInputError(f"{report_name!r} is not a PDF report")
+        pdf = _render_pdf(ctx, report_name, ids)
+        return _done(
+            g,
+            len(ids),
+            {
+                "report": report_name,
+                "model": report["model"],
+                "ids": ids,
+                "filename": f"{report_name.replace('.', '_')}.pdf",
+                "mimetype": "application/pdf",
+                "size_bytes": len(pdf),
+                "data_base64": base64.b64encode(pdf).decode("ascii"),
+            },
+        )
+
+
+def _render_pdf(ctx: ToolContext, report_name: str, ids: list[int]) -> bytes:
+    """Render through Odoo's own report route, using a web session.
+
+    The ORM renderer is private, so it cannot be called over RPC at all —
+    the documented route is ``/report/pdf/<name>/<ids>``, which needs a web
+    session. Web sessions require the account password: Odoo accepts API keys
+    for RPC only. A profile configured with only an API key therefore cannot
+    render reports, and this says so rather than failing obscurely.
+    """
+    from .odoo import OdooConnectionError, OdooError
+
+    profile = ctx.snapshot.profile
+    if not profile.password:
+        raise OdooError(
+            "get_report needs the profile's password: Odoo does not accept API keys "
+            "for web sessions, and reports can only be rendered through one",
+            kind="ConfigurationError",
+        )
+    context = ssl.create_default_context()
+    if not profile.ssl_verify:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(jar), urllib.request.HTTPSHandler(context=context)
+    )
+    login = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "method": "call",
+            "params": {
+                "db": profile.database,
+                "login": profile.username,
+                "password": profile.password,
+            },
+        }
+    ).encode()
+    limit = _max_attachment_bytes(ctx)
+    try:
+        request = urllib.request.Request(
+            f"{profile.url}/web/session/authenticate",
+            data=login,
+            headers={"Content-Type": "application/json"},
+        )
+        with opener.open(request, timeout=profile.timeout) as response:
+            body = json.loads(response.read(1_000_000))
+        if body.get("error") or not (body.get("result") or {}).get("uid"):
+            raise OdooConnectionError("web session login failed for this profile")
+        path = f"/report/pdf/{urllib.parse.quote(report_name)}/{','.join(map(str, ids))}"
+        with opener.open(f"{profile.url}{path}", timeout=profile.timeout) as response:
+            if "pdf" not in response.headers.get("Content-Type", ""):
+                raise OdooError("Odoo did not return a PDF for this report", kind="ReportError")
+            data = response.read(limit + 1)
+    except OdooError:
+        raise
+    except Exception as exc:  # urllib raises a wide family; none of it is for the agent
+        raise OdooConnectionError(f"report rendering failed ({type(exc).__name__})") from None
+    if len(data) > limit:
+        raise OdooError("rendered PDF exceeds MAX_ATTACHMENT_MB", kind="ReportError")
+    return data
+
+
+def upload_attachment(ctx: ToolContext) -> Any:
+    model = _arg_str(ctx, "model")
+    record_id = ctx.arguments.get("record_id")
+    if isinstance(record_id, bool) or not isinstance(record_id, int) or record_id <= 0:
+        raise ToolInputError("'record_id' must be a positive integer")
+    filename = _arg_str(ctx, "filename")
+    data = _arg_str(ctx, "data_base64")
+    mimetype = _arg_str(ctx, "mimetype", required=False) or None
+    raw = _decode_base64(data, _max_attachment_bytes(ctx))
+    # Attaching a file to a record changes that record, so it needs write
+    # permission on the record's model — governed as a create against it.
+    with ctx.guard(
+        operation=Operation.CREATE, model=model, fields=("attachment",), count=1
+    ) as g:
+        values: dict[str, Any] = {
+            "name": filename,
+            "datas": base64.b64encode(raw).decode("ascii"),
+            "res_model": model,
+            "res_id": record_id,
+        }
+        if mimetype:
+            values["mimetype"] = mimetype
+        created = ctx.odoo("ir.attachment", "create", [values])
+        new_id = created[0] if isinstance(created, list) else created
+        return _done(
+            g, 1, {"id": new_id, "filename": filename, "size_bytes": len(raw), "res_model": model}
+        )
+
+
+def get_attachment(ctx: ToolContext) -> Any:
+    attachment_id = ctx.arguments.get("attachment_id")
+    if isinstance(attachment_id, bool) or not isinstance(attachment_id, int) or attachment_id <= 0:
+        raise ToolInputError("'attachment_id' must be a positive integer")
+    # Metadata first, to learn which model the file belongs to. Nothing from
+    # this read reaches the agent unless governance then allows the call.
+    meta = ctx.odoo(
+        "ir.attachment",
+        "read",
+        [[attachment_id]],
+        {"fields": ["name", "mimetype", "file_size", "res_model", "res_id"]},
+    )
+    owner = (meta[0].get("res_model") if meta else None) or "ir.attachment"
+    with ctx.guard(operation=Operation.READ, model=owner, fields=("attachment",), count=1) as g:
+        if not meta:
+            raise ToolInputError(f"attachment {attachment_id} does not exist")
+        info = meta[0]
+        if (info.get("file_size") or 0) > _max_attachment_bytes(ctx):
+            raise ToolInputError("attachment exceeds MAX_ATTACHMENT_MB")
+        data = ctx.odoo("ir.attachment", "read", [[attachment_id]], {"fields": ["datas"]})
+        return _done(
+            g,
+            1,
+            {
+                "id": attachment_id,
+                "filename": info["name"],
+                "mimetype": info.get("mimetype"),
+                "size_bytes": info.get("file_size"),
+                "res_model": info.get("res_model"),
+                "res_id": info.get("res_id"),
+                "data_base64": (data[0].get("datas") or "") if data else "",
+            },
+        )
+
+
+# --- server tools ----------------------------------------------------------
+
+
+def cache_stats(ctx: ToolContext) -> Any:
+    with ctx.guard(operation=Operation.ADMIN) as g:
+        return _done(g, None, ctx.runtime.cache.stats())
+
+
+def server_status(ctx: ToolContext) -> Any:
+    from . import __version__
+    from .odoo import OdooError
+
+    with ctx.guard(operation=Operation.ADMIN) as g:
+        client = ctx.snapshot.client
+        odoo: dict[str, Any] = {"reachable": False}
+        try:
+            version = client.version()
+            odoo = {
+                "reachable": True,
+                "server_version": version.get("server_version"),
+                "authenticated": bool(client.uid),
+            }
+        except OdooError as exc:
+            odoo["error"] = exc.kind
+        policy = ctx.policy
+        audit = ctx.runtime.audit
+        return _done(
+            g,
+            None,
+            {
+                "server": {"name": "odoo-mcp-governed", "version": __version__},
+                "profile": ctx.snapshot.profile.public(),
+                "odoo": odoo,
+                "governance": {
+                    "audit_events": audit.store.count(),
+                    "audit_chain_keyed": audit.keyed,
+                    "policy_source": ctx.runtime.policy_store.source,
+                    "allowed_models": sorted(policy.allowed_models),
+                    "writable_models": sorted(policy.writable_models),
+                    "deletable_models": sorted(policy.deletable_models),
+                    "denied_models": sorted(policy.denied_models),
+                    "execute_method": policy.allow_execute_method,
+                    "max_records_per_call": policy.max_records_per_call,
+                },
+            },
+        )
+
+
+# --- registry --------------------------------------------------------------
+
+READ_ONLY = {"readOnlyHint": True, "destructiveHint": False}
+WRITES = {"readOnlyHint": False, "destructiveHint": False}
+DESTRUCTIVE = {"readOnlyHint": False, "destructiveHint": True}
+
+TOOLS: dict[str, Tool] = {
+    t.name: t
+    for t in [
+        Tool(
+            "get_record",
+            "Read one or more records by id.",
+            Operation.READ,
+            {"model": MODEL, "record_id": RECORD_ID, "ids": IDS, "fields": FIELDS},
+            ("model",),
+            get_record,
+            READ_ONLY,
+        ),
+        Tool(
+            "search_records",
+            "Search records with an Odoo domain and return the matching rows.",
+            Operation.READ,
+            {
+                "model": MODEL,
+                "domain": DOMAIN,
+                "fields": FIELDS,
+                "limit": {"type": "integer", "description": "Max rows (default 100)"},
+                "offset": {"type": "integer"},
+                "order": {"type": "string", "description": "e.g. 'create_date desc'"},
+            },
+            ("model",),
+            search_records,
+            READ_ONLY,
+        ),
+        Tool(
+            "create_record",
+            "Create a record.",
+            Operation.CREATE,
+            {"model": MODEL, "values": {"type": "object", "description": "Field values"}},
+            ("model", "values"),
+            create_record,
+            WRITES,
+        ),
+        Tool(
+            "update_record",
+            "Update one or more existing records.",
+            Operation.WRITE,
+            {
+                "model": MODEL,
+                "record_id": RECORD_ID,
+                "ids": IDS,
+                "values": {"type": "object", "description": "Field values to write"},
+            },
+            ("model", "values"),
+            update_record,
+            WRITES,
+        ),
+        Tool(
+            "delete_record",
+            "Delete one or more records. Irreversible.",
+            Operation.DELETE,
+            {"model": MODEL, "record_id": RECORD_ID, "ids": IDS},
+            ("model",),
+            delete_record,
+            DESTRUCTIVE,
+        ),
+        Tool(
+            "execute_method",
+            "Call a public model method, e.g. sale.order.action_confirm. Restricted by policy.",
+            Operation.EXECUTE,
+            {
+                "model": MODEL,
+                "method": {"type": "string"},
+                "args": {"type": "array", "description": "Positional args; record ids first"},
+                "kwargs": {"type": "object"},
+            },
+            ("model", "method"),
+            execute_method,
+            DESTRUCTIVE,
+        ),
+        Tool(
+            "call_onchange",
+            "Simulate a form change and return the values Odoo would compute. Saves nothing.",
+            Operation.READ,
+            {
+                "model": MODEL,
+                "values": {"type": "object", "description": "Current form values"},
+                "field_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Fields that changed (default: keys of values)",
+                },
+                "fields_spec": {"type": "object", "description": "Optional onchange spec"},
+            },
+            ("model", "values"),
+            call_onchange,
+            READ_ONLY,
+        ),
+        Tool(
+            "get_model_fields",
+            "Field definitions of a model (type, relation, required...).",
+            Operation.META,
+            {"model": MODEL, "attributes": {"type": "array", "items": {"type": "string"}}},
+            ("model",),
+            get_model_fields,
+            READ_ONLY,
+        ),
+        Tool(
+            "get_field_names",
+            "Compact list of a model's field names with type and label.",
+            Operation.META,
+            {"model": MODEL},
+            ("model",),
+            get_field_names,
+            READ_ONLY,
+        ),
+        Tool(
+            "model_info",
+            "Model description, Odoo access rights and what this server's policy permits.",
+            Operation.META,
+            {"model": MODEL},
+            ("model",),
+            model_info,
+            READ_ONLY,
+        ),
+        Tool(
+            "list_models",
+            "List the models this server allows access to, optionally filtered.",
+            Operation.META,
+            {
+                "filter": {"type": "string", "description": "Substring of the model name"},
+                "limit": {"type": "integer"},
+            },
+            (),
+            list_models,
+            READ_ONLY,
+        ),
+        Tool(
+            "name_search",
+            "Find records by display name — the quick way to resolve a name to an id.",
+            Operation.READ,
+            {
+                "model": MODEL,
+                "name": {"type": "string"},
+                "domain": DOMAIN,
+                "operator": {"type": "string", "description": "Default 'ilike'"},
+                "limit": {"type": "integer", "description": "Default 10"},
+            },
+            ("model",),
+            name_search,
+            READ_ONLY,
+        ),
+        Tool(
+            "search_count",
+            "Count records matching a domain.",
+            Operation.READ,
+            {"model": MODEL, "domain": DOMAIN},
+            ("model",),
+            search_count,
+            READ_ONLY,
+        ),
+        Tool(
+            "get_report",
+            "Render a PDF report (e.g. an invoice) for records. Returns base64.",
+            Operation.READ,
+            {
+                "report_name": {"type": "string", "description": "e.g. 'account.report_invoice'"},
+                "record_id": RECORD_ID,
+                "ids": IDS,
+            },
+            ("report_name",),
+            get_report,
+            READ_ONLY,
+        ),
+        Tool(
+            "upload_attachment",
+            "Attach a file (base64) to a record.",
+            Operation.CREATE,
+            {
+                "model": MODEL,
+                "record_id": RECORD_ID,
+                "filename": {"type": "string"},
+                "data_base64": {"type": "string"},
+                "mimetype": {"type": "string"},
+            },
+            ("model", "record_id", "filename", "data_base64"),
+            upload_attachment,
+            WRITES,
+        ),
+        Tool(
+            "get_attachment",
+            "Download an attachment as base64.",
+            Operation.READ,
+            {"attachment_id": {"type": "integer"}},
+            ("attachment_id",),
+            get_attachment,
+            READ_ONLY,
+        ),
+        Tool(
+            "cache_stats",
+            "Metadata cache statistics.",
+            Operation.ADMIN,
+            {},
+            (),
+            cache_stats,
+            READ_ONLY,
+        ),
+        Tool(
+            "server_status",
+            "Server, active Odoo profile and governance status.",
+            Operation.ADMIN,
+            {},
+            (),
+            server_status,
+            READ_ONLY,
+        ),
+    ]
+}
+
+assert len(TOOLS) == 18, "the tool surface is a contract — 18 tools"

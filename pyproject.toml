@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "odoo-mcp-governed"
+version = "0.1.0"
+description = "A governed MCP server for Odoo: every tool call is policy-checked, risk-scored and written to a tamper-evident audit log."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Fabian Castano" }]
+keywords = ["mcp", "odoo", "erp", "ai-agents", "governance", "audit"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Office/Business :: Financial",
+  "Topic :: System :: Monitoring",
+]
+
+# The MCP protocol layer, rate limiting and JWT validation surface are small
+# enough to own outright, and owning them is what lets governance sit in front
+# of every byte. Runtime dependencies are kept to what is genuinely needed.
+dependencies = [
+  "pydantic>=2.6",
+  "pydantic-settings>=2.7",
+]
+
+[project.optional-dependencies]
+# The HTTP transport and admin panel. Not needed for stdio-only use.
+http = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.29",
+  "pyjwt>=2.8",
+  "python-multipart>=0.0.9",
+]
+dev = [
+  "httpx>=0.27",
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.4",
+]
+
+[project.scripts]
+odoo-mcp-governed = "odoo_mcp_governed.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/fabiancasta/odoo-mcp-governed"
+Issues = "https://github.com/fabiancasta/odoo-mcp-governed/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/odoo_mcp_governed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# HTML and CSS templates: breaking markup strings at 100 columns makes them
+# harder to read and to diff, not easier.
+"src/odoo_mcp_governed/web/views.py" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# Lets the suite run straight from a checkout without an editable install.
+pythonpath = ["src"]
