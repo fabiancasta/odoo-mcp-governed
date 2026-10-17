@@ -17,6 +17,7 @@ tuning a threshold is a privilege escalation.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -30,6 +31,8 @@ from .events import AuditEvent, Decision, Operation, Outcome, Signal, ToolCall, 
 from .policy import PolicyEngine, PolicyVerdict, reason_code
 
 RISK_BLOCK = "risk_block"
+
+log = logging.getLogger(__name__)
 
 
 class GovernanceDenied(Exception):
@@ -272,6 +275,7 @@ class GovernanceEngine:
         affected_count: int | None = None,
         latency_ms: int = 0,
         error_type: str | None = None,
+        record_ids: tuple[int, ...] = (),
     ) -> AuditEvent:
         return self.audit.record(
             judgement.call,
@@ -283,6 +287,7 @@ class GovernanceEngine:
             affected_count=affected_count,
             latency_ms=latency_ms,
             error_type=error_type,
+            record_ids=record_ids,
         )
 
     # -- the wrapper tools actually use ------------------------------------
@@ -330,6 +335,7 @@ class GovernanceEngine:
                     affected_count=guarded.affected_count,
                     latency_ms=int((time.perf_counter() - started) * 1000),
                     error_type=type(exc).__name__,
+                    record_ids=guarded.record_ids,
                 )
                 raise
             else:
@@ -338,7 +344,16 @@ class GovernanceEngine:
                     outcome=Outcome.OK,
                     affected_count=guarded.affected_count,
                     latency_ms=int((time.perf_counter() - started) * 1000),
+                    record_ids=guarded.record_ids,
                 )
+                for callback in guarded.on_recorded:
+                    # The change already happened in Odoo; a follow-up that
+                    # fails (the change journal) must not report it as failed.
+                    try:
+                        callback(guarded.event)
+                    except Exception:  # noqa: BLE001 - see above
+                        log.exception("post-record callback failed for seq %s",
+                                      guarded.event.seq)
 
     def self_check(self) -> list[str]:
         """Startup sanity check. Returns warnings; raises only if unusable.
@@ -379,10 +394,16 @@ class GuardedCall:
 
     judgement: Judgement
     affected_count: int | None = None
+    record_ids: tuple[int, ...] = ()
     event: AuditEvent | None = field(default=None, repr=False)
+    on_recorded: list[Callable[[AuditEvent], None]] = field(default_factory=list, repr=False)
+    """Run once the successful call's event is sealed, with that event."""
 
     def affected(self, count: int | None) -> None:
         self.affected_count = count
+
+    def touched(self, ids: list[int] | tuple[int, ...]) -> None:
+        self.record_ids = tuple(i for i in ids if isinstance(i, int))
 
     @property
     def flagged(self) -> bool:

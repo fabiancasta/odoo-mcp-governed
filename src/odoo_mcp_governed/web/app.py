@@ -550,6 +550,21 @@ def create_app(runtime: Runtime) -> FastAPI:
             flash=flash,
         ))
 
+    @app.get("/admin/changes", response_class=HTMLResponse)
+    async def changes_view(request: Request, model: str = "", record_id: str = "",
+                           limit: int = 200):
+        if session_for(request) is None:
+            return RedirectResponse("/admin", status_code=303)
+        rid = int(record_id) if record_id.isdigit() else None
+        journal = runtime.journal
+        entries = [] if journal is None else await run_in_threadpool(
+            journal.search, model=model or None, record_id=rid, limit=max(1, min(limit, 2000))
+        )
+        return HTMLResponse(views.changes_page(
+            entries=entries, enabled=journal is not None,
+            filters={"model": model, "record_id": record_id, "limit": str(limit)},
+        ))
+
     @app.post("/admin/audit/anchor")
     async def audit_anchor(request: Request):
         session, form = await admin_form(request)

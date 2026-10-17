@@ -36,6 +36,7 @@ from .governance import (
     ToolCall,
     digest_args,
 )
+from .journal import ChangeJournal
 from .odoo import OdooClient, TTLCache
 from .policy_store import PolicyStore, policy_from_settings
 from .profiles import Profile, ProfileError, ProfileStore
@@ -93,6 +94,7 @@ class Runtime:
 
         self.policy_store = PolicyStore(settings.policy_file, policy_from_settings(settings))
         self.audit = AuditLog(AuditStore(settings.audit_db), hmac_key=settings.hmac_key())
+        self.journal = ChangeJournal(settings.journal_db) if settings.change_journal else None
         self.engine = GovernanceEngine(
             self.audit,
             PolicyEngine(self._effective_policy(self.policy_store.config)),

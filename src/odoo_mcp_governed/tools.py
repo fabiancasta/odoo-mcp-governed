@@ -19,6 +19,7 @@ import base64
 import binascii
 import http.cookiejar
 import json
+import logging
 import ssl
 import urllib.parse
 import urllib.request
@@ -35,6 +36,8 @@ from .governance.policy import (
     matches,
 )
 from .runtime import Runtime, Snapshot
+
+log = logging.getLogger(__name__)
 
 DEFAULT_SEARCH_LIMIT = 100
 DEFAULT_FIELD_ATTRIBUTES = [
@@ -80,6 +83,59 @@ class ToolContext:
 
     def odoo(self, model: str, method: str, args: list | None = None, kwargs: dict | None = None):
         return self.snapshot.client.execute(model, method, args, kwargs)
+
+    # -- change journal ----------------------------------------------------
+
+    def snapshot_before(
+        self, model: str, ids: list[int], fields: Iterable[str] | None = None
+    ) -> dict[int, dict[str, Any]]:
+        """Current values of ``ids``, for the change journal. Empty when the
+        journal is off. ``fields=None`` means every stored, non-binary field —
+        what a delete would lose."""
+        if self.runtime.journal is None or not ids:
+            return {}
+        wanted = set(fields) if fields is not None else None
+        try:
+            if wanted is None:
+                defs = _fields_get(self, model, ["type", "store"])
+                names = [
+                    n for n, meta in defs.items()
+                    if meta.get("store") and meta.get("type") != "binary"
+                ] if isinstance(defs, dict) else []
+                kwargs = {"fields": names} if names else {}
+            else:
+                kwargs = {"fields": sorted(wanted)}
+            rows = self.odoo(model, "read", [ids], kwargs)
+        except Exception:  # noqa: BLE001 - the journal must not block the change
+            log.exception("change journal: could not read %s %s before the change", model, ids)
+            return {}
+        result: dict[int, dict[str, Any]] = {}
+        for row in self.redact(rows if isinstance(rows, list) else [], model):
+            if not isinstance(row, dict) or not isinstance(row.get("id"), int):
+                continue
+            values = {k: v for k, v in row.items() if k != "id"}
+            if wanted is not None:
+                values = {k: v for k, v in values.items() if k in wanted}
+            result[row["id"]] = values
+        return result
+
+    def journal(
+        self,
+        guarded: GuardedCall,
+        model: str,
+        operation: str,
+        changes: dict[int, tuple[dict[str, Any] | None, dict[str, Any] | None]],
+    ) -> None:
+        """Write ``changes`` once the call's audit event is sealed."""
+        journal = self.runtime.journal
+        if journal is None or not changes:
+            return
+        guarded.on_recorded.append(
+            lambda event: journal.add(
+                audit_seq=event.seq, ts=event.ts, actor=event.actor, profile=event.profile,
+                model=model, operation=operation, changes=changes,
+            )
+        )
 
     def cached(self, key: tuple, factory: Callable[[], Any]) -> Any:
         return self.runtime.cache.get_or_set((self.snapshot.profile.name, *key), factory)
@@ -310,6 +366,9 @@ def create_record(ctx: ToolContext) -> Any:
     with ctx.guard(operation=Operation.CREATE, model=model, fields=values, count=1) as g:
         created = ctx.odoo(model, "create", [values])
         new_id = created[0] if isinstance(created, list) else created
+        if isinstance(new_id, int):
+            g.touched([new_id])
+            ctx.journal(g, model, "create", {new_id: (None, ctx.redact(values, model))})
         return _done(g, 1, {"id": new_id, "model": model})
 
 
@@ -322,7 +381,11 @@ def update_record(ctx: ToolContext) -> Any:
     with ctx.guard(
         operation=Operation.WRITE, model=model, fields=values, count=len(ids)
     ) as g:
+        before = ctx.snapshot_before(model, ids, values)
         ctx.odoo(model, "write", [ids, values])
+        g.touched(ids)
+        after = ctx.redact(values, model)
+        ctx.journal(g, model, "write", {i: (before.get(i), after) for i in ids})
         return _done(g, len(ids), {"success": True, "ids": ids, "fields": sorted(values)})
 
 
@@ -330,7 +393,10 @@ def delete_record(ctx: ToolContext) -> Any:
     model = _arg_str(ctx, "model")
     ids = _arg_ids(ctx)
     with ctx.guard(operation=Operation.DELETE, model=model, count=len(ids)) as g:
+        before = ctx.snapshot_before(model, ids)
         ctx.odoo(model, "unlink", [ids])
+        g.touched(ids)
+        ctx.journal(g, model, "unlink", {i: (before.get(i), None) for i in ids})
         return _done(g, len(ids), {"success": True, "deleted_ids": ids})
 
 
@@ -358,6 +424,10 @@ def execute_method(ctx: ToolContext) -> Any:
         operation=Operation.EXECUTE, model=model, method=method, fields=touched, count=count
     ) as g:
         result = ctx.odoo(model, method, args, kwargs)
+        if count is not None:
+            # What a method changes is unknowable from outside; which records
+            # it was called on is not.
+            g.touched(args[0])
         return _done(g, count, {"result": ctx.redact(result, model)})
 
 
@@ -667,6 +737,8 @@ def upload_attachment(ctx: ToolContext) -> Any:
             values["mimetype"] = mimetype
         created = ctx.odoo("ir.attachment", "create", [values])
         new_id = created[0] if isinstance(created, list) else created
+        if isinstance(new_id, int):
+            g.touched([new_id])
         return _done(
             g, 1, {"id": new_id, "filename": filename, "size_bytes": len(raw), "res_model": model}
         )

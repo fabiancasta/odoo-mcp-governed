@@ -123,6 +123,9 @@ class Settings(BaseSettings):
 
     # --- storage ---
     data_dir: Path = Path("./data")
+    change_journal: bool = True
+    """Keep before/after values of every change in data/changes.db (0600).
+    Costs one extra read per write or delete."""
     audit_hmac_key: str = ""
 
     # --- governance: initial policy (policy.json overrides once it exists) ---
@@ -187,6 +190,10 @@ class Settings(BaseSettings):
     @property
     def token_file(self) -> Path:
         return self.data_dir / "mcp_token.json"
+
+    @property
+    def journal_db(self) -> Path:
+        return self.data_dir / "changes.db"
 
     @property
     def audit_db(self) -> Path:

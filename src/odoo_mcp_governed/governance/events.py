@@ -154,6 +154,8 @@ class AuditEvent:
     error_type: str | None
     prev_hash: str
     hash: str = ""
+    record_ids: tuple[int, ...] = ()
+    """Ids the call created, changed or deleted, when known. Ids, never values."""
 
     def payload(self) -> dict[str, Any]:
         """The canonical, hashed content of this event.
@@ -185,7 +187,11 @@ class AuditEvent:
             "latency_ms": self.latency_ms,
             "error_type": self.error_type,
             "prev_hash": self.prev_hash,
-        }
+        } | (
+            # Only present when there are ids, so every event written before
+            # this field existed hashes exactly as it did then.
+            {"record_ids": list(self.record_ids)} if self.record_ids else {}
+        )
 
     def compute_hash(self, key: bytes | None = None) -> str:
         """Seal this event.

@@ -98,6 +98,7 @@ class AuditLog:
         affected_count: int | None = None,
         latency_ms: int = 0,
         error_type: str | None = None,
+        record_ids: tuple[int, ...] = (),
     ) -> AuditEvent:
         """Seal and append one event. Returns the event, with its hash filled in."""
         with self._store.lock:
@@ -122,6 +123,7 @@ class AuditLog:
                 latency_ms=latency_ms,
                 error_type=error_type,
                 prev_hash=last_hash,
+                record_ids=tuple(record_ids),
             )
             event.hash = event.compute_hash(self._key)
             self._store.insert(event)
