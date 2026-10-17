@@ -13,8 +13,7 @@ leaked — and is built so that when that happens the damage is bounded and the
 evidence survives.
 
 > **Status:** v0.2 — all 18 tools, stdio and HTTP transports, admin panel and
-> Docker deployment work end to end against Odoo 19. 325 tests, run on every
-> push by GitHub Actions.
+> Docker deployment work end to end against Odoo 19. 325 tests.
 
 ## What the operator gets
 
