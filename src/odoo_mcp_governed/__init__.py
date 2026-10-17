@@ -12,4 +12,4 @@ The governance layer is not a wrapper bolted onto the tools; the tools cannot
 reach Odoo except through it.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
