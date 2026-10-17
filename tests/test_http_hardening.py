@@ -111,3 +111,40 @@ class TestOrigin:
 
 def test_the_default_bind_address_is_loopback(tmp_path) -> None:
     assert Settings(_env_file=None, data_dir=tmp_path).mcp_host == "127.0.0.1"
+
+
+class TestMalformedInput:
+    def test_deeply_nested_json_is_a_parse_error_not_a_500(self, tmp_path) -> None:
+        """L1: 100k levels of nesting made json.loads raise RecursionError,
+        which surfaced as a 500 with a traceback in the log."""
+        runtime, client = app_with(tmp_path)
+        body = b"[" * 100_000 + b"]" * 100_000
+        response = client.post("/mcp", content=body,
+                               headers={**bearer(runtime), "Content-Type": "application/json"})
+        assert response.status_code == 400
+
+    def test_moderately_nested_json_is_refused_before_dispatch(self, tmp_path) -> None:
+        """Shallow enough to parse, deep enough to exhaust the recursion in
+        domain handling later on."""
+        runtime, client = app_with(tmp_path)
+        domain: list = []
+        for _ in range(500):
+            domain = [domain]
+        message = rpc("tools/call", {"name": "search_count",
+                                     "arguments": {"model": "res.partner", "domain": domain}})
+        response = client.post("/mcp", json=message, headers=bearer(runtime))
+        assert response.status_code == 400
+        assert tool_events(runtime) == 0
+
+    def test_oversized_headers_are_refused(self, tmp_path) -> None:
+        """L5: a 1 MB header was accepted."""
+        runtime, client = app_with(tmp_path)
+        response = client.post("/mcp", json=rpc("ping"),
+                               headers={**bearer(runtime), "X-Junk": "a" * 64_000})
+        assert response.status_code == 431
+
+    def test_ordinary_headers_are_fine(self, tmp_path) -> None:
+        runtime, client = app_with(tmp_path)
+        response = client.post("/mcp", json=rpc("ping"),
+                               headers={**bearer(runtime), "X-Trace": "a" * 2_000})
+        assert response.status_code == 200

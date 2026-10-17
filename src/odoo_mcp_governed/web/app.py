@@ -71,6 +71,43 @@ FLASH = {
 }
 
 
+class HeaderSizeLimit:
+    """Refuse requests whose headers add up to more than ``max_bytes``."""
+
+    def __init__(self, app, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http":
+            size = sum(len(k) + len(v) for k, v in scope.get("headers") or [])
+            if size > self.max_bytes:
+                body = b'{"error": "request headers too large"}'
+                await send({"type": "http.response.start", "status": 431,
+                            "headers": [(b"content-type", b"application/json"),
+                                        (b"content-length", str(len(body)).encode())]})
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self.app(scope, receive, send)
+
+
+def nesting_depth_exceeds(value: Any, limit: int) -> bool:
+    """Whether ``value`` nests lists and objects deeper than ``limit``.
+
+    Iterative on purpose: the point is to refuse input that would exhaust
+    recursion, so the check itself must not recurse.
+    """
+    stack = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        if isinstance(item, (list, dict)):
+            if depth > limit:
+                return True
+            children = item.values() if isinstance(item, dict) else item
+            stack.extend((child, depth + 1) for child in children)
+    return False
+
+
 class BodySizeLimit:
     """Buffer the body up to a limit, then hand it on; refuse anything larger.
 
@@ -149,6 +186,7 @@ def create_app(runtime: Runtime) -> FastAPI:
     chain_cache: dict[str, Any] = {"at": 0.0, "status": None}
 
     app.add_middleware(BodySizeLimit, max_bytes=int(settings.max_body_mb * 1024 * 1024))
+    app.add_middleware(HeaderSizeLimit, max_bytes=settings.max_header_kb * 1024)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
@@ -279,8 +317,15 @@ def create_app(runtime: Runtime) -> FastAPI:
             return JSONResponse({"error": "Content-Type must be application/json"}, status_code=415)
         try:
             payload = json.loads(await request.body())
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            # RecursionError: tens of thousands of nested brackets.
             return JSONResponse(_error(None, PARSE_ERROR, "parse error"), status_code=400)
+        if nesting_depth_exceeds(payload, settings.max_json_depth):
+            return JSONResponse(
+                _error(None, INVALID_REQUEST,
+                       f"message nests deeper than {settings.max_json_depth} levels"),
+                status_code=400,
+            )
 
         messages = payload if isinstance(payload, list) else [payload]
         if len(messages) > settings.mcp_max_batch:

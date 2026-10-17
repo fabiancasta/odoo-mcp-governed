@@ -1069,4 +1069,7 @@ TOOLS: dict[str, Tool] = {
     ]
 }
 
-assert len(TOOLS) == 18, "the tool surface is a contract — 18 tools"
+# The tool surface is a contract with every connected agent. A real check, not
+# an assert: asserts vanish under ``python -O``.
+if len(TOOLS) != 18:
+    raise RuntimeError(f"the tool surface is a contract — 18 tools, found {len(TOOLS)}")

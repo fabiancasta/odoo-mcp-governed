@@ -90,6 +90,8 @@ earlier deployment did not have.
 | Own network | `mcp_net` |
 | Secrets in `.env`, outside git and the image | `.gitignore`, `.dockerignore` |
 | **beyond:** published on `127.0.0.1` only by default | `docker-compose.yml` |
+| **beyond:** no `pip`/`setuptools`/`wheel` and no setuid/setgid binaries in the runtime image | `Dockerfile` |
+| **beyond:** base-image CVEs without an upstream fix are tracked by rebuilding with `--pull` | `Dockerfile` header |
 
 ## Network
 

@@ -83,6 +83,11 @@ class Settings(BaseSettings):
     its own rate-limit bucket."""
 
     max_body_mb: float = 25.0
+    max_header_kb: int = 16
+    """Total size of a request's headers. Larger requests get 431."""
+    max_json_depth: int = 64
+    """Deepest nesting accepted in an MCP message. Real domains are a few
+    levels deep; thousands of levels are only good for exhausting recursion."""
 
     mcp_allowed_origins: ModelSet = frozenset()
     """Browser origins allowed to call /mcp, on top of localhost and the origin
