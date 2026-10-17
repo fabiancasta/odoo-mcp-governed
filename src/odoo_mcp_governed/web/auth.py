@@ -40,7 +40,11 @@ class AuthError(Exception):
     """Authentication failed. The message is safe to return to the client."""
 
 
-def issue_token(settings: Settings, actor: str, *, hours: int | None = None) -> dict[str, Any]:
+def issue_token(
+    settings: Settings, actor: str, *, hours: int | None = None, profile: str | None = None
+) -> dict[str, Any]:
+    """A bearer token for one agent. With ``profile`` the agent is pinned to
+    that Odoo profile whatever the panel has active — one token per client."""
     now = datetime.now(timezone.utc)
     expires = now + timedelta(hours=hours or settings.token_expiry_hours)
     claims = {
@@ -51,9 +55,11 @@ def issue_token(settings: Settings, actor: str, *, hours: int | None = None) -> 
         "jti": uuid.uuid4().hex,
         "scope": "mcp",
     }
+    if profile:
+        claims["profile"] = profile
     token = jwt.encode(claims, settings.jwt_secret, algorithm=ALGORITHM)
     return {"token": token, "actor": actor, "issued_at": now.isoformat(),
-            "expires_at": expires.isoformat(), "jti": claims["jti"]}
+            "expires_at": expires.isoformat(), "jti": claims["jti"], "profile": profile}
 
 
 def verify_token(settings: Settings, token: str) -> dict[str, Any]:
@@ -105,8 +111,8 @@ class TokenStore:
             return None  # secret rotated or token expired: it is dead, say so
         return data
 
-    def regenerate(self, actor: str = "claude") -> dict[str, Any]:
-        data = issue_token(self.settings, actor)
+    def regenerate(self, actor: str = "claude", profile: str | None = None) -> dict[str, Any]:
+        data = issue_token(self.settings, actor, profile=profile)
         write_private_json(self.path, data)
         return data
 

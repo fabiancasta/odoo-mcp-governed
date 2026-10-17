@@ -34,7 +34,10 @@ CREATE TABLE IF NOT EXISTS changes (
     operation  TEXT    NOT NULL,
     record_id  INTEGER NOT NULL,
     before     TEXT,
-    after      TEXT
+    after      TEXT,
+    undone_at  TEXT,
+    undone_by  TEXT,
+    undo_note  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_changes_seq ON changes (audit_seq);
 CREATE INDEX IF NOT EXISTS idx_changes_record ON changes (model, record_id);
@@ -55,6 +58,10 @@ class ChangeJournal:
         if self.path != ":memory:":
             self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        columns = {r["name"] for r in self._conn.execute("PRAGMA table_info(changes)")}
+        for column in ("undone_at", "undone_by", "undo_note"):
+            if column not in columns:
+                self._conn.execute(f"ALTER TABLE changes ADD COLUMN {column} TEXT")
         self._conn.commit()
 
     def add(
@@ -80,6 +87,34 @@ class ChangeJournal:
                 "record_id, before, after) VALUES (?,?,?,?,?,?,?,?,?)",
                 rows,
             )
+            self._conn.commit()
+
+    def get(self, change_id: int) -> dict[str, Any] | None:
+        rows = self._select("WHERE id = ?", (change_id,))
+        return rows[0] if rows else None
+
+    def mark_undone(self, change_id: int, *, by: str, note: str, at: datetime) -> bool:
+        """Mark a change undone. False if it already was — the check and the
+        mark are one statement, so two clicks cannot both undo it."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE changes SET undone_at = ?, undone_by = ?, undo_note = ? "
+                "WHERE id = ? AND undone_at IS NULL",
+                (at.isoformat(), by, note, change_id),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def set_undo_note(self, change_id: int, note: str | None) -> None:
+        """Replace the note of a claimed undo; ``None`` releases the claim."""
+        with self._lock:
+            if note is None:
+                self._conn.execute(
+                    "UPDATE changes SET undone_at = NULL, undone_by = NULL, undo_note = NULL "
+                    "WHERE id = ?", (change_id,))
+            else:
+                self._conn.execute(
+                    "UPDATE changes SET undo_note = ? WHERE id = ?", (note, change_id))
             self._conn.commit()
 
     def for_seq(self, audit_seq: int) -> list[dict[str, Any]]:

@@ -81,17 +81,21 @@ class Dispatcher:
     def __init__(self, runtime: Runtime) -> None:
         self.runtime = runtime
 
-    def handle_payload(self, payload: Any, actor: str) -> Any:
+    def handle_payload(self, payload: Any, actor: str, profile: str | None = None) -> Any:
         """A single message or a batch. Returns ``None`` when nothing is owed
         (notifications only)."""
         if isinstance(payload, list):
             if not payload:
                 return _error(None, INVALID_REQUEST, "empty batch")
-            responses = [r for r in (self.handle(m, actor) for m in payload) if r is not None]
+            responses = [
+                r for r in (self.handle(m, actor, profile) for m in payload) if r is not None
+            ]
             return responses or None
-        return self.handle(payload, actor)
+        return self.handle(payload, actor, profile)
 
-    def handle(self, message: Any, actor: str) -> dict[str, Any] | None:
+    def handle(
+        self, message: Any, actor: str, profile: str | None = None
+    ) -> dict[str, Any] | None:
         if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
             return _error(None, INVALID_REQUEST, "not a JSON-RPC 2.0 message")
         method = message.get("method")
@@ -114,7 +118,7 @@ class Dispatcher:
             elif method == "tools/list":
                 result = self._tools_list()
             elif method == "tools/call":
-                result = self._tools_call(params, actor)
+                result = self._tools_call(params, actor, profile)
             elif method.startswith("notifications/"):
                 return None
             else:
@@ -145,7 +149,9 @@ class Dispatcher:
         disabled = self.runtime.engine.policy.config.disabled_tools
         return {"tools": [t.schema() for name, t in TOOLS.items() if name not in disabled]}
 
-    def _tools_call(self, params: dict[str, Any], actor: str) -> dict[str, Any]:
+    def _tools_call(
+        self, params: dict[str, Any], actor: str, profile: str | None = None
+    ) -> dict[str, Any]:
         name = params.get("name")
         arguments = params.get("arguments") or {}
         if not isinstance(name, str) or name not in TOOLS:
@@ -155,7 +161,7 @@ class Dispatcher:
 
         tool = TOOLS[name]
         try:
-            snapshot = self.runtime.snapshot()
+            snapshot = self.runtime.snapshot_for(profile)
         except NoActiveProfile as exc:
             return _text(str(exc), is_error=True)
 

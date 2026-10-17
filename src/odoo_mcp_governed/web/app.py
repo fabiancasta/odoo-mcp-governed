@@ -29,13 +29,16 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 
 from .. import __version__
 from ..governance import ChainStatus, Decision, Operation, Outcome, ToolCall
-from ..odoo import OdooClient
+from ..odoo import OdooClient, OdooError
 from ..profiles import PROFILE_NAME, Profile, ProfileError
 from ..protocol import INVALID_REQUEST, PARSE_ERROR, Dispatcher, _error
-from ..runtime import Runtime
+from ..runtime import Runtime, UndoError
+from ..storage import read_json, write_private_json
 from ..tools import TOOLS
-from . import views
+from ..tuning import LIMITS, TuningError
+from . import permissions, views
 from .auth import AdminSessions, AuthError, TokenStore, csrf_matches, password_matches, verify_token
+from .metrics import summarise
 from .ratelimit import RateLimiter
 
 log = logging.getLogger(__name__)
@@ -51,7 +54,8 @@ BASE_HEADERS = {
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
 }
 ADMIN_CSP = (
-    "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; "
+    "default-src 'none'; script-src 'self'; connect-src 'self'; "
+    "style-src 'unsafe-inline'; img-src 'self' data:; "
     "form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
 )
 API_CSP = "default-src 'none'; frame-ancestors 'none'"
@@ -67,6 +71,19 @@ FLASH = {
         "ok",
     ),
     "anchor_written": ("Anchor written to anchors.log.", "ok"),
+    "panic_on": ("PANIC: every agent is stopped. Calls are refused until you resume.", "bad"),
+    "panic_off": ("Service resumed. Agents can call again.", "ok"),
+    "panic_confirm": ("Tick 'confirm' to resume service.", "bad"),
+    "actor_blocked": ("Agent blocked. Its next call is refused.", "ok"),
+    "actor_unblocked": ("Agent unblocked.", "ok"),
+    "undone": ("Change undone. The undo is in the audit log.", "ok"),
+    "tuning_applied": ("Thresholds applied to the next call.", "ok"),
+    "permissions_saved": ("Permissions saved and applied to the next call.", "ok"),
+    "approved": ("Approved. The agent may now repeat that exact call once.", "ok"),
+    "denied": ("Denied. The agent is told not to retry.", "ok"),
+    "approval_gone": ("That request is no longer pending.", "bad"),
+    "permissions_error": ("Permissions not saved: the form held an invalid value.", "bad"),
+    "undo_confirm": ("Tick the box next to Undo to confirm.", "bad"),
     "csrf": ("Form expired. Please try again.", "bad"),
 }
 
@@ -340,7 +357,9 @@ def create_app(runtime: Runtime) -> FastAPI:
         if blocked is not None:
             return blocked
 
-        result = await run_in_threadpool(dispatcher.handle_payload, payload, actor)
+        pinned = claims.get("profile")
+        pinned = str(pinned) if isinstance(pinned, str) and pinned else None
+        result = await run_in_threadpool(dispatcher.handle_payload, payload, actor, pinned)
         headers: dict[str, str] = {}
         if any(isinstance(m, dict) and m.get("method") == "initialize" for m in messages):
             headers["Mcp-Session-Id"] = secrets.token_urlsafe(24)
@@ -401,6 +420,18 @@ def create_app(runtime: Runtime) -> FastAPI:
             odoo_ok = OdooClient(snap.url, snap.database, snap.username, "",
                                  ssl_verify=snap.ssl_verify, timeout=3).ping()
         warnings = runtime.engine.policy.config.validate()
+        agents = _agents(runtime)
+        if odoo_ok:
+            try:
+                access = runtime.snapshot().settings_access()
+            except Exception:  # noqa: BLE001 - a warning must never break the panel
+                access = None
+            if access is not False:
+                warnings.append(
+                    f"The Odoo user of profile '{snap.name}' has Settings access (or it could "
+                    "not be verified): if a policy rule is missing, Odoo will not stop the agent. "
+                    "Use a dedicated least-privilege user."
+                )
         if not runtime.audit.keyed:
             warnings.append("AUDIT_HMAC_KEY is not set — the audit chain is unkeyed.")
         html = views.dashboard(
@@ -417,6 +448,12 @@ def create_app(runtime: Runtime) -> FastAPI:
             edit=edit,
             flash=flash,
             flash_kind=kind,
+            panic=runtime.engine.policy.config.panic,
+            agents=agents,
+            summary=_summary(runtime),
+            max_risk=max((a[1] for a in agents), default=0),
+            tuning=runtime.tuning.values,
+            tuning_source=runtime.tuning.source,
         )
         return HTMLResponse(html, status_code=status_code)
 
@@ -478,6 +515,7 @@ def create_app(runtime: Runtime) -> FastAPI:
             timeout=timeout,
             environment=str(form.get("environment") or "production"),
             allow_writes=form.get("allow_writes") == "1",
+            sandbox=form.get("sandbox") == "1",
         )
         try:
             await run_in_threadpool(runtime.save_profile, profile, actor=admin_actor(request))
@@ -515,6 +553,213 @@ def create_app(runtime: Runtime) -> FastAPI:
             return await dashboard_error(session, str(exc))
         return back("profile_deleted")
 
+    # -- admin: live dashboard ---------------------------------------------
+
+    @app.get("/static/panel.js")
+    async def panel_js() -> Response:
+        return Response(views.PANEL_JS, media_type="application/javascript",
+                        headers={"Cache-Control": "no-cache"})
+
+    @app.get("/admin/live", response_class=HTMLResponse)
+    async def live_fragment(request: Request):
+        if session_for(request) is None:
+            return RedirectResponse("/admin", status_code=303)
+
+        def build() -> str:
+            agents = _agents(runtime)
+            return views.charts_fragment(
+                _summary(runtime), max_risk=max((a[1] for a in agents), default=0)
+            )
+
+        return HTMLResponse(await run_in_threadpool(build),
+                            headers={"Cache-Control": "no-store"})
+
+    @app.post("/admin/tuning")
+    async def tuning_update(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf")
+        values = {k: form.get(k) for k in LIMITS}
+        try:
+            changed = await run_in_threadpool(runtime.update_tuning, values,
+                                              actor=admin_actor(request))
+        except TuningError as exc:
+            return await dashboard_error(session, f"Thresholds not applied: {exc}")
+        return back("tuning_applied" if changed else "policy_unchanged")
+
+    # -- admin: permissions table -----------------------------------------
+
+    def odoo_models() -> list[dict[str, Any]]:
+        snap = runtime.snapshot()
+        return runtime.cache.get_or_set(
+            (snap.profile.name, "permissions", "ir.model"),
+            lambda: snap.client.execute(
+                "ir.model", "search_read", [[]], {"fields": ["model", "name", "transient"]}
+            ),
+        )
+
+    def seen_models() -> dict[str, list[str]]:
+        return read_json(settings.data_dir / "models_seen.json", default=None) or {}
+
+    @app.get("/admin/permissions", response_class=HTMLResponse)
+    async def permissions_view(request: Request, q: str = "", m: str | None = None):
+        session = session_for(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        error = None
+        try:
+            models = await run_in_threadpool(odoo_models)
+        except Exception as exc:  # noqa: BLE001 - shown to the admin, not raised
+            models, error = [], f"Could not read the model list from Odoo ({type(exc).__name__})."
+        cfg = runtime.policy_store.config
+        flash, kind = FLASH.get(m or "", (None, "ok"))
+        return HTMLResponse(views.permissions_page(
+            csrf=session.csrf, groups=permissions.group(models if isinstance(models, list)
+                                                        else [], q),
+            policy=runtime.policy_store.as_dict(), denied=cfg.denied_models,
+            seen=set(seen_models().get(runtime.profile_name, [])), query=q[:100],
+            error=error, flash=flash, flash_kind=kind,
+        ))
+
+    @app.post("/admin/permissions")
+    async def permissions_save(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf", "/admin/permissions")
+        cfg = runtime.policy_store.config
+        shown = {str(v) for v in form.getlist("shown")} - cfg.denied_models
+        try:
+            models = await run_in_threadpool(odoo_models)
+        except Exception:  # noqa: BLE001 - whole-app ticks then cover only what was shown
+            models = []
+        by_app: dict[str, set[str]] = {}
+        for name in shown:
+            by_app.setdefault(permissions.app_key(name), set()).add(name)
+        lists = {}
+        for key, field_name in (("r", "allowed_models"), ("w", "writable_models"),
+                                ("d", "deletable_models")):
+            ticked = {str(v) for v in form.getlist(key)}
+            for app_key in form.getlist(f"app_{key}"):
+                ticked |= by_app.get(str(app_key), set())
+            if form.get(f"all_{key}") == "1":
+                lists[field_name] = frozenset({"*"})
+            else:
+                lists[field_name] = permissions.merge(getattr(cfg, field_name), shown, ticked)
+        if "*" not in lists["allowed_models"]:
+            implied = (lists["writable_models"] | lists["deletable_models"]) - {"*"}
+            lists["allowed_models"] = lists["allowed_models"] | implied
+        try:
+            await run_in_threadpool(
+                runtime.update_policy, {k: sorted(v) for k, v in lists.items()},
+                actor=admin_actor(request),
+            )
+        except (ValueError, KeyError):
+            return back("permissions_error", "/admin/permissions")
+        if isinstance(models, list) and models:
+            seen = seen_models()
+            seen[runtime.profile_name] = sorted(
+                str(x.get("model")) for x in models if isinstance(x, dict) and x.get("model"))
+            write_private_json(settings.data_dir / "models_seen.json", seen)
+        return back("permissions_saved", "/admin/permissions")
+
+    # -- admin: activity report --------------------------------------------
+
+    @app.get("/admin/report", response_class=HTMLResponse)
+    async def report_view(request: Request, days: int = 7, profile: str = ""):
+        if session_for(request) is None:
+            return RedirectResponse("/admin", status_code=303)
+        from .. import report
+
+        chosen = profile if profile and runtime.profiles.get(profile) else None
+        data = await run_in_threadpool(report.build, runtime, days=max(1, min(days, 366)),
+                                       profile=chosen)
+        return HTMLResponse(views.report_html(
+            data, profiles=[p["name"] for p in runtime.profiles.public()]))
+
+    # -- admin: approvals --------------------------------------------------
+
+    @app.get("/admin/approvals", response_class=HTMLResponse)
+    async def approvals_view(request: Request, m: str | None = None):
+        session = session_for(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        flash, kind = FLASH.get(m or "", (None, "ok"))
+        return HTMLResponse(views.approvals_page(
+            csrf=session.csrf, pending=runtime.approvals.pending(),
+            recent=runtime.approvals.recent(),
+            enabled=bool(runtime.engine.policy.config.approval_required),
+            notifier=runtime.notifier.enabled,
+            ttl_minutes=int(runtime.approvals.ttl.total_seconds() // 60),
+            flash=flash, flash_kind=kind,
+        ))
+
+    @app.post("/admin/approvals/decide")
+    async def approvals_decide(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf", "/admin/approvals")
+        raw, decision = str(form.get("id") or ""), form.get("decision")
+        if not raw.isdigit() or decision not in ("approve", "deny"):
+            return back("approval_gone", "/admin/approvals")
+        decided = await run_in_threadpool(runtime.decide_approval, int(raw),
+                                          decision == "approve", actor=admin_actor(request))
+        if not decided:
+            return back("approval_gone", "/admin/approvals")
+        return back("approved" if decision == "approve" else "denied", "/admin/approvals")
+
+    # -- admin: emergency controls ----------------------------------------
+
+    @app.post("/admin/panic")
+    async def panic_on(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf")
+        # No confirmation on the way in: an emergency stop that asks "are you
+        # sure?" is slower exactly when speed matters.
+        await run_in_threadpool(runtime.set_panic, True, actor=admin_actor(request))
+        return back("panic_on")
+
+    @app.post("/admin/resume")
+    async def panic_off(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf")
+        if form.get("confirm") != "yes":
+            return back("panic_confirm")
+        await run_in_threadpool(runtime.set_panic, False, actor=admin_actor(request))
+        return back("panic_off")
+
+    async def _set_blocked(request: Request, blocked: bool):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf")
+        try:
+            await run_in_threadpool(runtime.set_actor_blocked, str(form.get("actor") or ""),
+                                    blocked, actor=admin_actor(request))
+        except ValueError as exc:
+            return await dashboard_error(session, str(exc))
+        return back("actor_blocked" if blocked else "actor_unblocked")
+
+    @app.post("/admin/actor/block")
+    async def actor_block(request: Request):
+        return await _set_blocked(request, True)
+
+    @app.post("/admin/actor/unblock")
+    async def actor_unblock(request: Request):
+        return await _set_blocked(request, False)
+
     # -- admin: policy -----------------------------------------------------
 
     @app.post("/admin/policy", response_class=HTMLResponse)
@@ -532,6 +777,8 @@ def create_app(runtime: Runtime) -> FastAPI:
         for key in ("allowed_models", "writable_models", "deletable_models", "denied_models",
                     "execute_method_allowlist", "forbidden_methods", "sensitive_fields"):
             changes[key] = str(form.get(key) or "")
+        changes["approval_required"] = [str(v) for v in form.getlist("approval_required")]
+        changes["approval_bulk_threshold"] = int(form.get("approval_bulk_threshold") or 20)
         try:
             changes["max_records_per_call"] = int(form.get("max_records_per_call") or 500)
             _, changed = await run_in_threadpool(
@@ -553,8 +800,10 @@ def create_app(runtime: Runtime) -> FastAPI:
         session = session_for(request)
         if session is None:
             return RedirectResponse("/admin", status_code=303)
-        return HTMLResponse(views.token_page(csrf=session.csrf, token=tokens.current(),
-                                             mcp_url=mcp_url(request)))
+        return HTMLResponse(views.token_page(
+            csrf=session.csrf, token=tokens.current(), mcp_url=mcp_url(request),
+            profiles=[p["name"] for p in runtime.profiles.public()],
+        ))
 
     @app.post("/admin/token/regenerate")
     async def token_regenerate(request: Request):
@@ -564,10 +813,14 @@ def create_app(runtime: Runtime) -> FastAPI:
         if form is None:
             return back("csrf", "/token")
         actor = str(form.get("actor") or "claude").strip()
+        profile = str(form.get("profile") or "").strip() or None
         if not ACTOR_NAME.match(actor) or form.get("confirm") != "yes":
             return back("csrf", "/token")
-        with runtime.admin_action(admin_actor(request), "admin.token.regenerate", detail=actor):
-            tokens.regenerate(actor)
+        if profile is not None and runtime.profiles.get(profile) is None:
+            return back("csrf", "/token")
+        with runtime.admin_action(admin_actor(request), "admin.token.regenerate",
+                                  detail={"actor": actor, "profile": profile}):
+            tokens.regenerate(actor, profile)
         return back("token_regenerated", "/token")
 
     # -- admin: audit ------------------------------------------------------
@@ -597,18 +850,46 @@ def create_app(runtime: Runtime) -> FastAPI:
 
     @app.get("/admin/changes", response_class=HTMLResponse)
     async def changes_view(request: Request, model: str = "", record_id: str = "",
-                           limit: int = 200):
-        if session_for(request) is None:
+                           limit: int = 200, m: str | None = None, e: str | None = None):
+        session = session_for(request)
+        if session is None:
             return RedirectResponse("/admin", status_code=303)
         rid = int(record_id) if record_id.isdigit() else None
         journal = runtime.journal
         entries = [] if journal is None else await run_in_threadpool(
             journal.search, model=model or None, record_id=rid, limit=max(1, min(limit, 2000))
         )
+        flash, kind = FLASH.get(m or "", (None, "ok"))
+        if e:
+            flash, kind = e[:300], "bad"
         return HTMLResponse(views.changes_page(
             entries=entries, enabled=journal is not None,
             filters={"model": model, "record_id": record_id, "limit": str(limit)},
+            csrf=session.csrf, flash=flash, flash_kind=kind,
         ))
+
+    @app.post("/admin/changes/undo")
+    async def changes_undo(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf", "/admin/changes")
+        if form.get("confirm") != "yes":
+            return back("undo_confirm", "/admin/changes")
+        raw = str(form.get("change_id") or "")
+        if not raw.isdigit():
+            return back("undo_confirm", "/admin/changes")
+        try:
+            await run_in_threadpool(runtime.undo_change, int(raw), actor=admin_actor(request))
+        except UndoError as exc:
+            return RedirectResponse(f"/admin/changes?{urlencode({'e': str(exc)})}",
+                                    status_code=303)
+        except OdooError as exc:
+            return RedirectResponse(
+                f"/admin/changes?{urlencode({'e': f'Odoo refused the undo: {exc.kind}'})}",
+                status_code=303)
+        return back("undone", "/admin/changes")
 
     @app.post("/admin/audit/anchor")
     async def audit_anchor(request: Request):
@@ -622,6 +903,29 @@ def create_app(runtime: Runtime) -> FastAPI:
         return back("anchor_written", "/admin/logs")
 
     return app
+
+
+def _summary(runtime: Runtime) -> dict[str, Any]:
+    from datetime import timedelta
+
+    from ..governance.events import utcnow
+
+    now = utcnow()
+    return summarise(runtime.audit.since(now - timedelta(hours=24)), now=now)
+
+
+def _agents(runtime: Runtime) -> list[tuple[str, int, int, bool]]:
+    """Agents for the dashboard: everyone active in the risk window, plus every
+    blocked agent even if quiet — a block you cannot see is one you forget."""
+    blocked = runtime.engine.policy.config.blocked_actors
+    rows = [
+        (actor, score, count, actor in blocked)
+        for actor, score, count in _actor_risk(runtime)
+        if not actor.startswith(("admin@", "anonymous@")) and actor != "system"
+    ]
+    seen = {r[0] for r in rows}
+    rows += [(actor, 0, 0, True) for actor in sorted(blocked - seen)]
+    return rows
 
 
 def _actor_risk(runtime: Runtime) -> list[tuple[str, int, int]]:

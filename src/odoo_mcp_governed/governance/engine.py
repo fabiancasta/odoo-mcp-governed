@@ -22,9 +22,10 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
+from .approvals import ApprovalStore, needs_approval
 from .audit import AuditLog
 from .detectors import DetectionContext, Detector, DetectorConfig, default_detectors
 from .events import AuditEvent, Decision, Operation, Outcome, Signal, ToolCall, utcnow
@@ -170,8 +171,11 @@ class GovernanceEngine:
         detector_config: DetectorConfig | None = None,
         risk_config: RiskConfig | None = None,
         now_fn: Callable[[], datetime] = utcnow,
+        approvals: ApprovalStore | None = None,
     ) -> None:
         self.audit = audit
+        self.approvals = approvals
+        self.on_approval_request: Callable[[dict], None] | None = None
         self.policy = policy
         self.detectors = detectors if detectors is not None else default_detectors()
         self.detector_config = detector_config or DetectorConfig()
@@ -218,6 +222,19 @@ class GovernanceEngine:
             decision = Decision.ALLOW_FLAGGED
         else:
             decision = Decision.ALLOW
+
+        if (
+            verdict.allowed
+            and call.profile in self.policy.config.sandbox_profiles
+            and decision in (Decision.DENY, Decision.THROTTLE)
+        ):
+            # A sandbox observes risk and records it, but never acts on it.
+            decision = Decision.ALLOW_FLAGGED
+            reasons = [r for r in reasons if not r.startswith(("risk_block", "risk_throttle"))]
+            reasons.append(
+                f"sandbox: risk score {score} observed only — profile {call.profile!r} is a "
+                "sandbox"
+            )
 
         return Judgement(
             call=call,
@@ -321,6 +338,8 @@ class GovernanceEngine:
                 self.record(judgement, outcome=Outcome.DENIED)
                 raise GovernanceDenied(judgement)
 
+            judgement = self._approval_gate(judgement)
+
             if judgement.throttle_seconds:
                 time.sleep(judgement.throttle_seconds)
 
@@ -354,6 +373,48 @@ class GovernanceEngine:
                     except Exception:  # noqa: BLE001 - see above
                         log.exception("post-record callback failed for seq %s",
                                       guarded.event.seq)
+
+    def _approval_gate(self, judgement: Judgement) -> Judgement:
+        """Hold a permitted call that needs a human, unless one approved it.
+
+        Runs after policy and risk, so only calls that would otherwise go
+        through ever wait for approval — and never on a sandbox profile.
+        """
+        call, cfg = judgement.call, self.policy.config
+        if (
+            self.approvals is None
+            or call.profile in cfg.sandbox_profiles
+            or not needs_approval(call, cfg.approval_required, cfg.approval_bulk_threshold)
+            or self.approvals.consume(call)
+        ):
+            return judgement
+        request, created = self.approvals.request(call)
+        minutes = int(self.approvals.ttl.total_seconds() // 60)
+        if request["status"] == "denied":
+            reason = (
+                f"approval_denied: request #{request['id']} for this exact call was denied by "
+                "the operator. Do not retry; tell the user."
+            )
+        else:
+            reason = (
+                f"approval_required: this call needs a human's approval. Request "
+                f"#{request['id']} was sent to the operator; once approved, repeat exactly "
+                f"the same call within {minutes} minutes. Tell the user you are waiting."
+            )
+        held = replace(
+            judgement,
+            decision=Decision.DENY,
+            policy=PolicyVerdict(allowed=False, reasons=(reason,)),
+            reasons=(*judgement.reasons, reason),
+            throttle_seconds=0.0,
+        )
+        self.record(held, outcome=Outcome.DENIED)
+        if created and self.on_approval_request is not None:
+            try:
+                self.on_approval_request(request)
+            except Exception:  # noqa: BLE001 - a notification must never break a call
+                log.exception("approval notification failed")
+        raise GovernanceDenied(held)
 
     def self_check(self) -> list[str]:
         """Startup sanity check. Returns warnings; raises only if unusable.

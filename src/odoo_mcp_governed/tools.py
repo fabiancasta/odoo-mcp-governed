@@ -877,6 +877,12 @@ def _profile_status(profile) -> dict[str, Any]:
         k: v for k, v in profile.public().items() if k not in ("allow_writes", "read_only")
     }
     status["writes_enabled"] = not profile.read_only
+    if profile.sandbox and profile.environment != "production":
+        status["sandbox"] = True
+        status["sandbox_note"] = (
+            "sandbox: model lists and the execute_method allowlist do not apply and risk is "
+            "only observed; the denylist, credential fields and audit still do"
+        )
     if profile.environment == "production":
         status["production_writes_override"] = profile.allow_writes
         status["writes_note"] = (

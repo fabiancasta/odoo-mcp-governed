@@ -12,8 +12,23 @@ instructions changed, because it was prompt-injected, because its token
 leaked — and is built so that when that happens the damage is bounded and the
 evidence survives.
 
-> **Status:** v0.1 — all 18 tools, stdio and HTTP transports, admin panel and
-> Docker deployment work end to end against Odoo 19. 266 tests.
+> **Status:** v0.2 — all 18 tools, stdio and HTTP transports, admin panel and
+> Docker deployment work end to end against Odoo 19. 325 tests.
+
+## What the operator gets
+
+| | |
+|---|---|
+| **Panic switch** | One click refuses every agent call on the next request. The panel and the audit log keep running, and it survives restarts until you resume. |
+| **Block one agent** | Refuse every call from one token; the other agents keep working. |
+| **Undo with one click** | Every create, write and delete is journalled with its old and new values. Undo writes the old values back, deletes what was created, or recreates what was deleted. |
+| **Human approval** | Deletes, bulk changes or `execute_method` can wait for a person. The agent gets a request number; you approve in the panel (and get a webhook or Telegram message); the agent repeats the exact call once. |
+| **Live dashboard** | Calls per hour, blocked attempts by kind, most used models, agent risk meters — refreshed every ten seconds. |
+| **Threshold console** | Faders for throttle and block scores, delete bursts, call rate and risk memory, applied live and audited. |
+| **Permissions by app** | Odoo's own models grouped by app with read/write/delete ticks. Models installed later show as "new — not reviewed" and stay blocked until you tick them. |
+| **Sandbox profiles** | For test databases: model lists off and risk only observed, while the denylist, credential fields and audit stay on. Never on production. |
+| **Activity report** | A printable "what your AI did" page per client and period — counts, refusals, changes — with no record values, ready to send as a PDF. |
+| **Several clients** | Pin each agent's token to its client's Odoo profile; switching the active profile can never send it to another client's database. |
 
 ## How a call is handled
 
@@ -290,7 +305,7 @@ Full mapping, item by item: [`docs/SECURITY_BASELINE.md`](docs/SECURITY_BASELINE
 
 ## Tests
 
-The suite has 266 tests. The ones that matter are not the
+The suite has 325 tests. The ones that matter are not the
 "it records events" kind — they are the adversarial ones:
 
 ```bash
@@ -367,9 +382,13 @@ docker compose exec -T web odoo -d govtest -i base \
 - [x] Production safeguards: read-only by default, protected hosts
 - [x] Hardened Docker image and compose file
 - [x] Change journal with before and after values
-- [ ] One-click undo from the change journal
-- [ ] Panic switch and per-agent block
-- [ ] Human approval for destructive or bulk operations
+- [x] One-click undo from the change journal
+- [x] Panic switch and per-agent block
+- [x] Human approval for destructive or bulk operations (panel, webhook, Telegram)
+- [x] Live dashboard, threshold console, permissions by app, sandbox profiles
+- [x] Activity report per client; tokens pinned to a profile
+- [ ] Per-profile access policy
+- [ ] Approve from the phone (Telegram buttons / WhatsApp reply)
 - [ ] Two-phase audit (intent before the call, outcome after)
 - [ ] Per-token revocation list (today: rotate `JWT_SECRET` to revoke all)
 - [ ] Signed off-box anchoring (today: `audit anchor` writes a file to ship)
