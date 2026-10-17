@@ -21,7 +21,7 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .governance.detectors import DetectorConfig, parse_days, parse_hours
 from .governance.engine import RiskConfig
-from .governance.policy import DEFAULT_DENIED_MODELS
+from .governance.policy import DEFAULT_DENIED_MODELS, SENSITIVE_FIELDS
 
 MIN_JWT_SECRET_LENGTH = 32
 MIN_ADMIN_PASSWORD_LENGTH = 12
@@ -69,7 +69,11 @@ class Settings(BaseSettings):
     to make pointing at production impossible rather than merely unlikely."""
 
     # --- HTTP transport ---
-    mcp_host: str = "0.0.0.0"
+    mcp_host: str = "127.0.0.1"
+    """Loopback by default, so running outside Docker never exposes the server
+    to the LAN by accident. The container image sets 0.0.0.0, because inside a
+    container loopback is unreachable and the port is published on the host's
+    loopback by docker-compose instead."""
     mcp_port: int = 8000
     mcp_public_url: str = ""
     https_mode: bool = False
@@ -79,6 +83,20 @@ class Settings(BaseSettings):
     its own rate-limit bucket."""
 
     max_body_mb: float = 25.0
+    max_header_kb: int = 16
+    """Total size of a request's headers. Larger requests get 431."""
+    max_json_depth: int = 64
+    """Deepest nesting accepted in an MCP message. Real domains are a few
+    levels deep; thousands of levels are only good for exhausting recursion."""
+
+    mcp_allowed_origins: ModelSet = frozenset()
+    """Browser origins allowed to call /mcp, on top of localhost and the origin
+    of MCP_PUBLIC_URL. Requests without an Origin header (CLI and desktop
+    clients) are unaffected; this stops a web page from reaching the server
+    through DNS rebinding."""
+
+    mcp_max_batch: int = 10
+    """Most messages accepted in one JSON-RPC batch."""
 
     jwt_secret: str = Field(
         default="", validation_alias=AliasChoices("jwt_secret", "mcp_jwt_secret")
@@ -93,7 +111,13 @@ class Settings(BaseSettings):
     admin_password: str = ""
     admin_session_hours: float = 8.0
 
-    rate_limit_mcp: str = "60/minute"
+    rate_limit_mcp: str = "120/minute"
+    """Per actor (token subject), and every message in a batch counts."""
+    rate_limit_mcp_ip: str = "600/minute"
+    """Per client IP, before authentication — the ceiling for everything
+    behind one address, such as all containers on a Docker bridge."""
+    rate_limit_auth_fail: str = "10/minute"
+    """Failed MCP authentications per IP before that IP is refused outright."""
     rate_limit_health: str = "30/minute"
     rate_limit_login: str = "5/minute"
 
@@ -104,6 +128,9 @@ class Settings(BaseSettings):
 
     # --- storage ---
     data_dir: Path = Path("./data")
+    change_journal: bool = True
+    """Keep before/after values of every change in data/changes.db (0600).
+    Costs one extra read per write or delete."""
     audit_hmac_key: str = ""
 
     # --- governance: initial policy (policy.json overrides once it exists) ---
@@ -116,6 +143,9 @@ class Settings(BaseSettings):
     )
     disabled_tools: ModelSet = frozenset()
     forbidden_methods: ModelSet = frozenset()
+    sensitive_fields: ModelSet = SENSITIVE_FIELDS
+    """Glob patterns for credential fields, on top of a built-in floor that
+    cannot be removed (*password*, *secret*, *token*, *api_key*...)."""
     allow_execute_method: bool = False
     execute_method_allowlist: ModelSet = frozenset()
     max_records_per_call: int = 500
@@ -143,7 +173,9 @@ class Settings(BaseSettings):
         "disabled_tools",
         "forbidden_methods",
         "execute_method_allowlist",
+        "sensitive_fields",
         "protected_hosts",
+        "mcp_allowed_origins",
         mode="before",
     )
     @classmethod
@@ -163,6 +195,10 @@ class Settings(BaseSettings):
     @property
     def token_file(self) -> Path:
         return self.data_dir / "mcp_token.json"
+
+    @property
+    def journal_db(self) -> Path:
+        return self.data_dir / "changes.db"
 
     @property
     def audit_db(self) -> Path:

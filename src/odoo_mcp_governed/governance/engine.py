@@ -17,6 +17,7 @@ tuning a threshold is a privilege escalation.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -27,7 +28,11 @@ from datetime import datetime, timedelta
 from .audit import AuditLog
 from .detectors import DetectionContext, Detector, DetectorConfig, default_detectors
 from .events import AuditEvent, Decision, Operation, Outcome, Signal, ToolCall, utcnow
-from .policy import PolicyEngine, PolicyVerdict
+from .policy import PolicyEngine, PolicyVerdict, reason_code
+
+RISK_BLOCK = "risk_block"
+
+log = logging.getLogger(__name__)
 
 
 class GovernanceDenied(Exception):
@@ -63,6 +68,17 @@ class RiskConfig:
     """Delay applied per call while an actor is throttled. The point is to
     turn a fast loop into a slow one, buying a human time to notice without
     breaking a correct integration that merely looks unusual."""
+
+    max_score: int = 100
+    """Ceiling on the score. Past the block threshold a bigger number decides
+    nothing, and an unbounded one takes unboundedly long to decay."""
+
+    cumulative_signals: frozenset[str] = frozenset({"delete_burst", "write_amplification"})
+    """Signals where every occurrence is new evidence and must add up: the
+    fifth delete in a burst is worse than the third. Every other signal
+    describes a *state* — off-hours, a high rate, an unfamiliar model — that
+    each call in that state reports again; those count once, at their
+    strongest decayed weight, or ordinary use compounds into a block."""
 
 
 @dataclass
@@ -109,18 +125,37 @@ class RiskScorer:
     def score(
         self, current: Sequence[Signal], history: Sequence[AuditEvent], now: datetime
     ) -> int:
-        total = float(sum(s.weight for s in current))
-        half_life = self.config.half_life.total_seconds()
-        cutoff = now - self.config.window
+        cfg = self.config
+        half_life = cfg.half_life.total_seconds()
+        cutoff = now - cfg.window
+        cumulative = 0.0
+        state: dict[str, float] = {}
+
+        def add(signal: Signal, decay: float) -> None:
+            nonlocal cumulative
+            weight = signal.weight * decay
+            if signal.name in cfg.cumulative_signals:
+                cumulative += weight
+            elif weight > state.get(signal.name, 0.0):
+                state[signal.name] = weight
+
+        for signal in current:
+            add(signal, 1.0)
 
         for event in history:
             if event.ts < cutoff or not event.signals:
                 continue
+            # A call refused *because* of risk is a consequence of the score,
+            # not new evidence. Letting it count would keep an actor that
+            # retries after a block locked out for as long as it retries.
+            if any(reason_code(r) == RISK_BLOCK for r in event.reasons):
+                continue
             age = max((now - event.ts).total_seconds(), 0.0)
             decay = 0.5 ** (age / half_life) if half_life > 0 else 0.0
-            total += sum(s.weight for s in event.signals) * decay
+            for signal in event.signals:
+                add(signal, decay)
 
-        return int(round(total))
+        return min(int(round(cumulative + sum(state.values()))), cfg.max_score)
 
 
 class GovernanceEngine:
@@ -170,7 +205,7 @@ class GovernanceEngine:
         elif score >= cfg.block_threshold:
             decision = Decision.DENY
             reasons.append(
-                f"risk_block: actor risk score {score} is at or above the block "
+                f"{RISK_BLOCK}: actor risk score {score} is at or above the block "
                 f"threshold of {cfg.block_threshold}"
             )
         elif score >= cfg.throttle_threshold:
@@ -240,6 +275,7 @@ class GovernanceEngine:
         affected_count: int | None = None,
         latency_ms: int = 0,
         error_type: str | None = None,
+        record_ids: tuple[int, ...] = (),
     ) -> AuditEvent:
         return self.audit.record(
             judgement.call,
@@ -251,6 +287,7 @@ class GovernanceEngine:
             affected_count=affected_count,
             latency_ms=latency_ms,
             error_type=error_type,
+            record_ids=record_ids,
         )
 
     # -- the wrapper tools actually use ------------------------------------
@@ -298,6 +335,7 @@ class GovernanceEngine:
                     affected_count=guarded.affected_count,
                     latency_ms=int((time.perf_counter() - started) * 1000),
                     error_type=type(exc).__name__,
+                    record_ids=guarded.record_ids,
                 )
                 raise
             else:
@@ -306,7 +344,16 @@ class GovernanceEngine:
                     outcome=Outcome.OK,
                     affected_count=guarded.affected_count,
                     latency_ms=int((time.perf_counter() - started) * 1000),
+                    record_ids=guarded.record_ids,
                 )
+                for callback in guarded.on_recorded:
+                    # The change already happened in Odoo; a follow-up that
+                    # fails (the change journal) must not report it as failed.
+                    try:
+                        callback(guarded.event)
+                    except Exception:  # noqa: BLE001 - see above
+                        log.exception("post-record callback failed for seq %s",
+                                      guarded.event.seq)
 
     def self_check(self) -> list[str]:
         """Startup sanity check. Returns warnings; raises only if unusable.
@@ -347,10 +394,16 @@ class GuardedCall:
 
     judgement: Judgement
     affected_count: int | None = None
+    record_ids: tuple[int, ...] = ()
     event: AuditEvent | None = field(default=None, repr=False)
+    on_recorded: list[Callable[[AuditEvent], None]] = field(default_factory=list, repr=False)
+    """Run once the successful call's event is sealed, with that event."""
 
     def affected(self, count: int | None) -> None:
         self.affected_count = count
+
+    def touched(self, ids: list[int] | tuple[int, ...]) -> None:
+        self.record_ids = tuple(i for i in ids if isinstance(i, int))
 
     @property
     def flagged(self) -> bool:

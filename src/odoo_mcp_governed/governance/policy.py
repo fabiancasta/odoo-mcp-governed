@@ -28,6 +28,7 @@ tools that are actually governed as writes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 
 from .events import Operation, ToolCall
 
@@ -90,14 +91,34 @@ DEFAULT_DENIED_MODELS = frozenset(
         "ir.mail_server",      # SMTP credentials
         "fetchmail.server",    # IMAP/POP credentials
         "auth.oauth.provider", # OAuth client secrets
+        "res.config.settings", # reads and writes ir.config_parameter for you
+        "res.config",          # the base of every settings wizard
+        "ir.module.module",    # install runs module code, uninstall drops tables
+        "base.module.upgrade",   # same, through the upgrade wizard
+        "base.module.uninstall", # same, through the uninstall wizard
     }
 )
 
 # The subset whose removal from the denylist deserves a startup warning even
 # when it was deliberate: these are code execution and credential theft.
 CRITICAL_DENIED_MODELS = frozenset(
-    {"ir.actions.server", "base.automation", "ir.cron", "ir.config_parameter", "res.users.apikeys"}
+    {
+        "ir.actions.server",
+        "base.automation",
+        "ir.cron",
+        "ir.config_parameter",
+        "res.users.apikeys",
+        "res.config.settings",
+        "ir.module.module",
+    }
 )
+
+# Attachment *content* is only served by get_attachment and upload_attachment,
+# which check the record the attachment belongs to. Through the generic tools
+# ir.attachment is one model holding every other model's files, so reading
+# ``datas`` there would skip that check for all of them at once.
+ATTACHMENT_MODEL = "ir.attachment"
+ATTACHMENT_CONTENT_FIELDS = frozenset({"datas", "raw", "db_datas", "store_fname"})
 
 WILDCARD = "*"
 
@@ -108,22 +129,26 @@ def matches(model: str, models: frozenset[str]) -> bool:
 
 
 # Fields whose values must never leave Odoo through this server, on any model.
-# Matched case-insensitively against the field names a call touches.
-SENSITIVE_FIELDS = frozenset(
-    {
-        "password",
-        "password_crypt",
-        "new_password",
-        "api_key",
-        "totp_secret",
-        "oauth_access_token",
-        "google_refresh_token",
-        "access_token",
-        "secret",
-        "private_key",
-        "webhook_secret",
-    }
+# These are glob patterns matched case-insensitively against every field name a
+# call touches. Patterns, not exact names, because modules add credentials
+# under compound names — ``stripe_secret_key``, ``unsplash_access_key`` — and a
+# module installed after the server was configured must not leak through a
+# ``*`` allowlist.
+#
+# The built-in floor applies whatever the configuration says, like
+# :data:`BLOCKED_METHODS`. SENSITIVE_FIELDS can add to it, never remove from it.
+BUILTIN_SENSITIVE_FIELDS = frozenset(
+    {"*password*", "*secret*", "*token*", "*api_key*", "*apikey*", "*private_key*"}
 )
+
+# The configurable part, as shipped. Replacing it through SENSITIVE_FIELDS
+# keeps the floor above.
+SENSITIVE_FIELDS = frozenset({"*_key", "*hmac*", "*credential*", "totp_*", "*_pass"})
+
+
+def is_sensitive(field_name: str, patterns: frozenset[str]) -> bool:
+    name = field_name.lower()
+    return any(fnmatchcase(name, p.lower()) for p in BUILTIN_SENSITIVE_FIELDS | patterns)
 
 
 @dataclass(frozen=True)
@@ -171,6 +196,12 @@ class PolicyConfig:
     """Profiles on which nothing may be created, written, deleted or executed,
     whatever the model lists say. Derived from the profiles themselves
     (production without ``allow_writes``), not edited as policy."""
+
+    privileged_profiles: frozenset[str] = frozenset()
+    """Production profiles whose Odoo user has Settings access (or could not
+    be checked). On these a ``*`` allowlist is refused: if a policy rule were
+    missing, nothing in Odoo's own access control would stop the agent.
+    Derived at runtime, not edited as policy."""
 
     def validate(self) -> list[str]:
         """Config problems worth warning about at startup. Never raises —
@@ -242,6 +273,24 @@ class PolicyEngine:
         # Server introspection touches no Odoo data at all.
         if call.operation is Operation.ADMIN:
             return PolicyVerdict(allowed=True)
+
+        if (
+            call.model
+            and call.profile in cfg.privileged_profiles
+            and WILDCARD in cfg.allowed_models
+        ):
+            return PolicyVerdict(
+                allowed=False,
+                reasons=(
+                    _reason(
+                        "privileged_wildcard",
+                        f"profile {call.profile!r} is production and its Odoo user has "
+                        "Settings access (or it could not be verified), so '*' model lists "
+                        "are refused on it: list the models explicitly, or connect with a "
+                        "dedicated least-privilege Odoo user",
+                    ),
+                ),
+            )
 
         if call.profile in cfg.read_only_profiles and (
             call.operation.mutates or call.operation is Operation.EXECUTE
@@ -349,16 +398,29 @@ class PolicyEngine:
         return reasons
 
     def _evaluate_fields(self, call: ToolCall) -> list[str]:
-        sensitive = {f.lower() for f in self.config.sensitive_fields}
-        hits = sorted({f for f in call.fields_touched if f.lower() in sensitive})
+        hits = sorted(
+            {f for f in call.fields_touched if is_sensitive(f, self.config.sensitive_fields)}
+        )
+        reasons = []
         if hits:
-            return [
+            reasons.append(
                 _reason(
                     "sensitive_field",
                     f"refusing to touch credential fields: {', '.join(hits)}",
                 )
-            ]
-        return []
+            )
+        if call.model == ATTACHMENT_MODEL:
+            content = sorted(set(call.fields_touched) & ATTACHMENT_CONTENT_FIELDS)
+            if content:
+                reasons.append(
+                    _reason(
+                        "attachment_content",
+                        f"{', '.join(content)} on ir.attachment is only available through "
+                        "get_attachment and upload_attachment, which check the record "
+                        "the attachment belongs to",
+                    )
+                )
+        return reasons
 
     def _evaluate_volume(self, call: ToolCall) -> list[str]:
         limit = self.config.max_records_per_call

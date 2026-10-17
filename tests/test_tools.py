@@ -143,7 +143,8 @@ class TestToolBehaviour:
     def test_search_defaults_to_the_ceiling_when_lower(self, env) -> None:
         _, fake, d = env
         call(d, "search_records", model="res.partner")
-        assert fake.calls[0][3]["limit"] == 50
+        [search] = [c for c in fake.calls if c[1] == "search_read"]
+        assert search[3]["limit"] == 50
 
     def test_sensitive_keys_are_stripped_from_results(self, env) -> None:
         _, fake, d = env

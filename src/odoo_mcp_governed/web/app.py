@@ -21,7 +21,7 @@ import re
 import secrets
 import time
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
@@ -31,7 +31,7 @@ from .. import __version__
 from ..governance import ChainStatus, Decision, Operation, Outcome, ToolCall
 from ..odoo import OdooClient
 from ..profiles import PROFILE_NAME, Profile, ProfileError
-from ..protocol import PARSE_ERROR, Dispatcher, _error
+from ..protocol import INVALID_REQUEST, PARSE_ERROR, Dispatcher, _error
 from ..runtime import Runtime
 from ..tools import TOOLS
 from . import views
@@ -69,6 +69,43 @@ FLASH = {
     "anchor_written": ("Anchor written to anchors.log.", "ok"),
     "csrf": ("Form expired. Please try again.", "bad"),
 }
+
+
+class HeaderSizeLimit:
+    """Refuse requests whose headers add up to more than ``max_bytes``."""
+
+    def __init__(self, app, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http":
+            size = sum(len(k) + len(v) for k, v in scope.get("headers") or [])
+            if size > self.max_bytes:
+                body = b'{"error": "request headers too large"}'
+                await send({"type": "http.response.start", "status": 431,
+                            "headers": [(b"content-type", b"application/json"),
+                                        (b"content-length", str(len(body)).encode())]})
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self.app(scope, receive, send)
+
+
+def nesting_depth_exceeds(value: Any, limit: int) -> bool:
+    """Whether ``value`` nests lists and objects deeper than ``limit``.
+
+    Iterative on purpose: the point is to refuse input that would exhaust
+    recursion, so the check itself must not recurse.
+    """
+    stack = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        if isinstance(item, (list, dict)):
+            if depth > limit:
+                return True
+            children = item.values() if isinstance(item, dict) else item
+            stack.extend((child, depth + 1) for child in children)
+    return False
 
 
 class BodySizeLimit:
@@ -140,6 +177,8 @@ def create_app(runtime: Runtime) -> FastAPI:
     tokens = TokenStore(settings)
     limits = {
         "mcp": RateLimiter(settings.rate_limit_mcp),
+        "mcp_ip": RateLimiter(settings.rate_limit_mcp_ip),
+        "auth_fail": RateLimiter(settings.rate_limit_auth_fail),
         "health": RateLimiter(settings.rate_limit_health),
         "login": RateLimiter(settings.rate_limit_login),
     }
@@ -147,6 +186,7 @@ def create_app(runtime: Runtime) -> FastAPI:
     chain_cache: dict[str, Any] = {"at": 0.0, "status": None}
 
     app.add_middleware(BodySizeLimit, max_bytes=int(settings.max_body_mb * 1024 * 1024))
+    app.add_middleware(HeaderSizeLimit, max_bytes=settings.max_header_kb * 1024)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
@@ -171,13 +211,37 @@ def create_app(runtime: Runtime) -> FastAPI:
     def client_ip(request: Request) -> str:
         return request.client.host if request.client else "unknown"
 
-    def limited(bucket: str, request: Request) -> Response | None:
-        allowed, retry = limits[bucket].hit(client_ip(request))
-        if allowed:
-            return None
+    def too_many(retry: int) -> Response:
         return JSONResponse(
             {"error": "rate limit exceeded"}, status_code=429, headers={"Retry-After": str(retry)}
         )
+
+    def limited(bucket: str, request: Request, key: str | None = None,
+                cost: int = 1) -> Response | None:
+        allowed, retry = limits[bucket].hit(key or client_ip(request), cost)
+        return None if allowed else too_many(retry)
+
+    def origin_of(url: str) -> str:
+        parts = urlsplit(url.strip())
+        return f"{parts.scheme}://{parts.netloc}".lower() if parts.scheme else ""
+
+    trusted_origins = {origin_of(o) for o in settings.mcp_allowed_origins} - {""}
+    if settings.mcp_public_url:
+        trusted_origins.add(origin_of(settings.mcp_public_url))
+
+    def origin_allowed(origin: str | None) -> bool:
+        """The DNS-rebinding check the MCP specification asks for.
+
+        A browser always says where a request came from; a web page that got
+        its hostname to resolve to 127.0.0.1 still sends its own Origin. CLI
+        and desktop clients send none, and are not what this defends against.
+        """
+        if origin is None:
+            return True
+        if origin_of(origin) in trusted_origins:
+            return True
+        host = urlsplit(origin).hostname or ""
+        return host in ("localhost", "127.0.0.1", "::1")
 
     def chain_status(force: bool = False) -> ChainStatus:
         # Full verification is linear in the log size; the dashboard refreshes
@@ -210,9 +274,15 @@ def create_app(runtime: Runtime) -> FastAPI:
     # -- MCP ---------------------------------------------------------------
 
     async def mcp_endpoint(request: Request) -> Response:
-        if (blocked := limited("mcp", request)) is not None:
+        if (blocked := limited("mcp_ip", request)) is not None:
             return blocked
         ip = client_ip(request)
+        if not origin_allowed(request.headers.get("origin")):
+            return JSONResponse({"error": "origin not allowed"}, status_code=403)
+        # Checked before verifying, so a stream of bad tokens stops costing
+        # anything once it is clearly not a typo.
+        if retry := limits["auth_fail"].exhausted(ip):
+            return too_many(retry)
 
         header = request.headers.get("authorization", "")
         scheme, _, token = header.partition(" ")
@@ -221,6 +291,7 @@ def create_app(runtime: Runtime) -> FastAPI:
                 raise AuthError("missing bearer token")
             claims = verify_token(settings, token.strip())
         except AuthError as exc:
+            limits["auth_fail"].hit(ip)
             # Failed authentication is recorded: a stream of them is a
             # credential-stuffing attempt, and the audit log should show it.
             runtime.audit.record(
@@ -246,12 +317,31 @@ def create_app(runtime: Runtime) -> FastAPI:
             return JSONResponse({"error": "Content-Type must be application/json"}, status_code=415)
         try:
             payload = json.loads(await request.body())
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            # RecursionError: tens of thousands of nested brackets.
             return JSONResponse(_error(None, PARSE_ERROR, "parse error"), status_code=400)
+        if nesting_depth_exceeds(payload, settings.max_json_depth):
+            return JSONResponse(
+                _error(None, INVALID_REQUEST,
+                       f"message nests deeper than {settings.max_json_depth} levels"),
+                status_code=400,
+            )
+
+        messages = payload if isinstance(payload, list) else [payload]
+        if len(messages) > settings.mcp_max_batch:
+            return JSONResponse(
+                _error(None, INVALID_REQUEST,
+                       f"batch of {len(messages)} exceeds the limit of {settings.mcp_max_batch}"),
+                status_code=400,
+            )
+        # Per actor, not per IP: every client behind a Docker bridge or a
+        # proxy shares one address. Each message in a batch is one request.
+        blocked = limited("mcp", request, key=f"actor:{actor}", cost=max(len(messages), 1))
+        if blocked is not None:
+            return blocked
 
         result = await run_in_threadpool(dispatcher.handle_payload, payload, actor)
         headers: dict[str, str] = {}
-        messages = payload if isinstance(payload, list) else [payload]
         if any(isinstance(m, dict) and m.get("method") == "initialize" for m in messages):
             headers["Mcp-Session-Id"] = secrets.token_urlsafe(24)
         if result is None:
@@ -440,7 +530,7 @@ def create_app(runtime: Runtime) -> FastAPI:
             "allow_execute_method": form.get("allow_execute_method") == "1",
         }
         for key in ("allowed_models", "writable_models", "deletable_models", "denied_models",
-                    "execute_method_allowlist", "forbidden_methods"):
+                    "execute_method_allowlist", "forbidden_methods", "sensitive_fields"):
             changes[key] = str(form.get(key) or "")
         try:
             changes["max_records_per_call"] = int(form.get("max_records_per_call") or 500)
@@ -503,6 +593,21 @@ def create_app(runtime: Runtime) -> FastAPI:
             filters={"actor": actor, "tool": tool, "decision": decision, "q": q,
                      "limit": str(limit)},
             flash=flash,
+        ))
+
+    @app.get("/admin/changes", response_class=HTMLResponse)
+    async def changes_view(request: Request, model: str = "", record_id: str = "",
+                           limit: int = 200):
+        if session_for(request) is None:
+            return RedirectResponse("/admin", status_code=303)
+        rid = int(record_id) if record_id.isdigit() else None
+        journal = runtime.journal
+        entries = [] if journal is None else await run_in_threadpool(
+            journal.search, model=model or None, record_id=rid, limit=max(1, min(limit, 2000))
+        )
+        return HTMLResponse(views.changes_page(
+            entries=entries, enabled=journal is not None,
+            filters={"model": model, "record_id": record_id, "limit": str(limit)},
         ))
 
     @app.post("/admin/audit/anchor")

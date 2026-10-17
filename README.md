@@ -13,7 +13,7 @@ leaked — and is built so that when that happens the damage is bounded and the
 evidence survives.
 
 > **Status:** v0.1 — all 18 tools, stdio and HTTP transports, admin panel and
-> Docker deployment work end to end against Odoo 19. 215 tests.
+> Docker deployment work end to end against Odoo 19. 266 tests.
 
 ## How a call is handled
 
@@ -58,8 +58,20 @@ any Odoo API wrapper — is off by default, takes a method allowlist, and
 refuses the ORM write primitives outright. Calling `unlink` through it would
 otherwise delete records while never touching the delete gate.
 
-Credential fields (`password`, `api_key`, `totp_secret`, …) are refused on
-every model, always.
+Credential fields are matched by pattern, so the ones modules add under
+compound names (`stripe_secret_key`, `unsplash_access_key`, `signup_token`)
+are caught too, including on models installed after the server was
+configured. They are refused on every model, always. `SENSITIVE_FIELDS` adds
+patterns; it cannot remove the built-in floor (`*password*`, `*secret*`,
+`*token*`, `*api_key*`, `*apikey*`, `*private_key*`).
+
+The denylist wins over any allowlist, `*` included. Besides the models that
+run code or hold credentials directly, it covers the indirect routes:
+`res.config.settings`, which reads and writes `ir.config_parameter` on your
+behalf, and module install and uninstall. Attachment *content* is only served
+by `get_attachment`, which checks the record the file belongs to; the generic
+read tools refuse it and leave it out. Reads with no field list also skip
+binary fields, so a contact does not arrive with ten copies of its photo.
 
 ### 2. Detection — the behavioural layer
 
@@ -90,12 +102,22 @@ against real traffic, rather than start silent and hope.
 
 ### 3. Risk — turning signals into a decision
 
-Signal weights are summed, plus the actor's recent signals discounted by an
-exponential half-life (15 minutes by default). Patterns worth catching are
+The score combines the current call's signals with the actor's recent ones,
+discounted by an exponential half-life (15 minutes by default). Patterns worth catching are
 built from individually unremarkable calls — the third delete is only alarming
 because of the first two — so history has to count. It has to decay just as
 much, or an actor that tripped a detector once is permanently degraded and the
 operator switches governance off.
+
+Two kinds of signal are counted differently. A delete burst or an oversized
+write is *new evidence* each time, so those add up: three deletes in a minute
+score 25, the fourth 50, the fifth 75 and is refused. Off-hours, a high call
+rate, an unfamiliar model or a run of errors describe a *state* that every
+call in it reports again; those count once, at their strongest decayed
+weight. Summing them was how an ordinary assistant session used to get
+blocked within minutes. Calls refused because of risk do not feed the score
+that refused them, so an agent that keeps retrying still cools off, and the
+score is capped at 100.
 
 Scoring is per-actor: one misbehaving agent does not raise another's risk.
 
@@ -116,8 +138,19 @@ accumulate a second copy of it. Stored instead are field *names* (useful, not
 sensitive) and a SHA-256 digest of the arguments, which lets you prove two
 calls were identical without being able to read either.
 
+Each event does record the *ids* a call created, changed or deleted, as part
+of the hashed chain — "which record?" is the first question after an
+incident.
+
 Denials are recorded, not dropped. A refusal is evidence, and the probing
 detector is built entirely out of refusals.
+
+The values live somewhere else on purpose: the **change journal**
+(`data/changes.db`, `0600`, `CHANGE_JOURNAL`) keeps the old and new values of
+every create, write and delete, linked to the audit event that sealed it, with
+credential fields stripped. The panel shows it under *Changes*. Keeping it
+separate means the audit log can be handed to an investigator without handing
+over the ERP.
 
 #### Threat model, stated plainly
 
@@ -215,26 +248,49 @@ data, so there are two independent guards:
   pointing at one (or any subdomain) cannot be saved or activated, and if the
   active profile turns out to point at one, the server starts with no profile
   rather than connect.
+- **The policy is not the only barrier.** A production profile whose Odoo user
+  has Settings access — or whose access cannot be verified — refuses `*`
+  model lists: if a policy rule were ever missing, nothing in Odoo would stop
+  the agent. `server_status` warns about such a user on any profile, and
+  reports `writes_enabled` with a plain-language note instead of raw flags.
+
+### A least-privilege production profile
+
+The MCP policy and Odoo's own access control should each be enough on their
+own. For production:
+
+| Layer | Setting |
+|---|---|
+| Odoo user | A dedicated user (for example `mcp_agent`) with an API key, only the groups of the apps the agent works with, and **neither Settings nor Technical** |
+| Models | Explicit `ALLOWED_MODELS` and `WRITABLE_MODELS`; `DELETABLE_MODELS` empty unless needed |
+| Methods | `ALLOW_EXECUTE_METHOD` off, or a closed `EXECUTE_METHOD_ALLOWLIST` such as `action_confirm,message_post` |
+| Denylist | Kept as the floor, not relied on as the main control |
+| Secrets | A fresh `JWT_SECRET` (rotating it revokes every token) and `AUDIT_HMAC_KEY` |
 
 ## Hardening carried over from day one
 
 `/docs` and the OpenAPI schema are not served. Bodies are capped by counting
 bytes, so chunked uploads are capped too. 500s carry no detail. Security
 headers on every response, HSTS in HTTPS mode. `Mcp-Session-Id` is validated,
-never reflected. Rate limits per client IP on `/mcp`, `/health` and login,
-with `X-Forwarded-For` honoured only from configured proxies. Credentials and
+never reflected. `/mcp` is rate-limited per actor, with a per-IP ceiling
+before authentication and a separate limit on failed authentications; batches
+are capped and every message in one counts. A foreign `Origin` header is
+refused (DNS rebinding). `/health` and login are limited per client IP, with
+`X-Forwarded-For` honoured only from configured proxies. Credentials and
 the audit database are written `0600` from the first byte, atomically. TLS to
 Odoo is verified by default. The container runs as a non-root UID on a
 read-only root filesystem with all capabilities dropped, `no-new-privileges`,
 memory/CPU/PID limits and its own network, publishing on `127.0.0.1` only. For
 publishing beyond localhost, `deploy/firewall-docker.sh` restricts the port
-through the `DOCKER-USER` chain, since Docker bypasses UFW.
+through the `DOCKER-USER` chain, since Docker bypasses UFW, and
+`deploy/egress-docker.sh` stops the container from opening connections to
+anything but Odoo — not the internet, not the LAN, not a database on the host.
 
 Full mapping, item by item: [`docs/SECURITY_BASELINE.md`](docs/SECURITY_BASELINE.md).
 
 ## Tests
 
-The suite has 215 tests. The ones that matter are not the
+The suite has 266 tests. The ones that matter are not the
 "it records events" kind — they are the adversarial ones:
 
 ```bash
@@ -310,6 +366,10 @@ docker compose exec -T web odoo -d govtest -i base \
 - [x] Admin panel: profiles, live policy, tokens, audit log with risk view
 - [x] Production safeguards: read-only by default, protected hosts
 - [x] Hardened Docker image and compose file
+- [x] Change journal with before and after values
+- [ ] One-click undo from the change journal
+- [ ] Panic switch and per-agent block
+- [ ] Human approval for destructive or bulk operations
 - [ ] Two-phase audit (intent before the call, outcome after)
 - [ ] Per-token revocation list (today: rotate `JWT_SECRET` to revoke all)
 - [ ] Signed off-box anchoring (today: `audit anchor` writes a file to ship)

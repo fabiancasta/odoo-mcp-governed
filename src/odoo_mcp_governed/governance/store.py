@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
     latency_ms     INTEGER NOT NULL,
     error_type     TEXT,
     prev_hash      TEXT    NOT NULL,
-    hash           TEXT    NOT NULL
+    hash           TEXT    NOT NULL,
+    record_ids     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_actor_ts ON audit_events (actor, ts);
@@ -84,6 +85,7 @@ def _row_to_event(row: sqlite3.Row) -> AuditEvent:
         error_type=row["error_type"],
         prev_hash=row["prev_hash"],
         hash=row["hash"],
+        record_ids=tuple(json.loads(row["record_ids"] or "[]")),
     )
 
 
@@ -120,6 +122,11 @@ class AuditStore:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.executescript(_SCHEMA)
+        columns = {r["name"] for r in self._conn.execute("PRAGMA table_info(audit_events)")}
+        if "record_ids" not in columns:
+            # A log created before record ids existed. The column is nullable
+            # and old rows hash without it, so they keep verifying.
+            self._conn.execute("ALTER TABLE audit_events ADD COLUMN record_ids TEXT")
         self._conn.commit()
 
     @property
@@ -157,8 +164,8 @@ class AuditStore:
                     seq, ts, actor, profile, tool, operation, model, method,
                     fields_touched, arg_digest, decision, reasons, signals,
                     risk_score, outcome, affected_count, latency_ms, error_type,
-                    prev_hash, hash
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    prev_hash, hash, record_ids
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     event.seq,
@@ -181,6 +188,7 @@ class AuditStore:
                     event.error_type,
                     event.prev_hash,
                     event.hash,
+                    json.dumps(list(event.record_ids)) if event.record_ids else None,
                 ),
             )
             self._conn.commit()

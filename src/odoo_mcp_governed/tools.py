@@ -19,6 +19,7 @@ import base64
 import binascii
 import http.cookiejar
 import json
+import logging
 import ssl
 import urllib.parse
 import urllib.request
@@ -27,8 +28,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .governance import GuardedCall, Operation, ToolCall, digest_args
-from .governance.policy import WILDCARD, matches
+from .governance.policy import (
+    ATTACHMENT_CONTENT_FIELDS,
+    ATTACHMENT_MODEL,
+    WILDCARD,
+    is_sensitive,
+    matches,
+)
 from .runtime import Runtime, Snapshot
+
+log = logging.getLogger(__name__)
 
 DEFAULT_SEARCH_LIMIT = 100
 DEFAULT_FIELD_ATTRIBUTES = [
@@ -59,6 +68,12 @@ class ToolContext:
         count: int | None = None,
     ):
         self.guarded = True
+        profile = self.snapshot.profile
+        if model and profile.environment == "production" and WILDCARD in self.policy.allowed_models:
+            # Only asked when it matters: a production profile reached through
+            # a '*' allowlist. Unknown counts as privileged — fail closed.
+            access = self.snapshot.settings_access()
+            self.runtime.note_privilege(profile.name, access is not False)
         call = ToolCall(
             actor=self.actor,
             profile=self.snapshot.profile.name,
@@ -75,6 +90,59 @@ class ToolContext:
     def odoo(self, model: str, method: str, args: list | None = None, kwargs: dict | None = None):
         return self.snapshot.client.execute(model, method, args, kwargs)
 
+    # -- change journal ----------------------------------------------------
+
+    def snapshot_before(
+        self, model: str, ids: list[int], fields: Iterable[str] | None = None
+    ) -> dict[int, dict[str, Any]]:
+        """Current values of ``ids``, for the change journal. Empty when the
+        journal is off. ``fields=None`` means every stored, non-binary field —
+        what a delete would lose."""
+        if self.runtime.journal is None or not ids:
+            return {}
+        wanted = set(fields) if fields is not None else None
+        try:
+            if wanted is None:
+                defs = _fields_get(self, model, ["type", "store"])
+                names = [
+                    n for n, meta in defs.items()
+                    if meta.get("store") and meta.get("type") != "binary"
+                ] if isinstance(defs, dict) else []
+                kwargs = {"fields": names} if names else {}
+            else:
+                kwargs = {"fields": sorted(wanted)}
+            rows = self.odoo(model, "read", [ids], kwargs)
+        except Exception:  # noqa: BLE001 - the journal must not block the change
+            log.exception("change journal: could not read %s %s before the change", model, ids)
+            return {}
+        result: dict[int, dict[str, Any]] = {}
+        for row in self.redact(rows if isinstance(rows, list) else [], model):
+            if not isinstance(row, dict) or not isinstance(row.get("id"), int):
+                continue
+            values = {k: v for k, v in row.items() if k != "id"}
+            if wanted is not None:
+                values = {k: v for k, v in values.items() if k in wanted}
+            result[row["id"]] = values
+        return result
+
+    def journal(
+        self,
+        guarded: GuardedCall,
+        model: str,
+        operation: str,
+        changes: dict[int, tuple[dict[str, Any] | None, dict[str, Any] | None]],
+    ) -> None:
+        """Write ``changes`` once the call's audit event is sealed."""
+        journal = self.runtime.journal
+        if journal is None or not changes:
+            return
+        guarded.on_recorded.append(
+            lambda event: journal.add(
+                audit_seq=event.seq, ts=event.ts, actor=event.actor, profile=event.profile,
+                model=model, operation=operation, changes=changes,
+            )
+        )
+
     def cached(self, key: tuple, factory: Callable[[], Any]) -> Any:
         return self.runtime.cache.get_or_set((self.snapshot.profile.name, *key), factory)
 
@@ -82,18 +150,24 @@ class ToolContext:
     def policy(self):
         return self.runtime.engine.policy.config
 
-    def redact(self, records: Any) -> Any:
+    def redact(self, records: Any, model: str | None = None) -> Any:
         """Drop credential-like keys from returned records, whatever was asked.
 
         The policy refuses calls that *name* a sensitive field. This covers the
         other case: an agent that asks for all fields and would receive one.
+        On ir.attachment the file content goes too, for the same reason.
         """
-        sensitive = {f.lower() for f in self.policy.sensitive_fields}
-        if isinstance(records, list):
-            return [self.redact(r) for r in records]
-        if isinstance(records, dict):
-            return {k: v for k, v in records.items() if k.lower() not in sensitive}
-        return records
+        patterns = self.policy.sensitive_fields
+        content = ATTACHMENT_CONTENT_FIELDS if model == ATTACHMENT_MODEL else frozenset()
+        return _strip(records, lambda key: key in content or is_sensitive(key, patterns))
+
+
+def _strip(records: Any, hidden: Callable[[str], bool]) -> Any:
+    if isinstance(records, list):
+        return [_strip(r, hidden) for r in records]
+    if isinstance(records, dict):
+        return {k: v for k, v in records.items() if not hidden(k)}
+    return records
 
 
 @dataclass(frozen=True)
@@ -252,6 +326,28 @@ DOMAIN = {
 }
 
 
+def _read_fields(ctx: ToolContext, model: str, fields: list[str] | None) -> list[str] | None:
+    """The field list to ask Odoo for. ``None`` means all of them.
+
+    When the agent names no fields, binary fields are left out. A contact
+    read that way used to come back with ten base64 copies of its photo
+    (``image_1920`` … ``avatar_128``): tokens the agent pays for and never
+    uses. Named binary fields are still returned. On ir.attachment this also
+    keeps the file content out — Odoo cannot even serialise ``raw``, and
+    answers HTTP 500 when asked for it.
+    """
+    if fields:
+        return fields
+    defs = _fields_get(ctx, model, ["type"])
+    if not isinstance(defs, dict):
+        return fields
+    content = ATTACHMENT_CONTENT_FIELDS if model == ATTACHMENT_MODEL else frozenset()
+    return sorted(
+        n for n, meta in defs.items()
+        if n not in content and meta.get("type") != "binary"
+    ) or None
+
+
 def get_record(ctx: ToolContext) -> Any:
     model = _arg_str(ctx, "model")
     ids = _arg_ids(ctx)
@@ -259,8 +355,9 @@ def get_record(ctx: ToolContext) -> Any:
     with ctx.guard(
         operation=Operation.READ, model=model, fields=fields or (), count=len(ids)
     ) as g:
-        kwargs = {"fields": fields} if fields else {}
-        records = ctx.redact(ctx.odoo(model, "read", [ids], kwargs))
+        wanted = _read_fields(ctx, model, fields)
+        kwargs = {"fields": wanted} if wanted else {}
+        records = ctx.redact(ctx.odoo(model, "read", [ids], kwargs), model)
         missing = sorted(set(ids) - {r["id"] for r in records})
         result: dict[str, Any] = {"records": records}
         if missing:
@@ -278,11 +375,11 @@ def search_records(ctx: ToolContext) -> Any:
     touched = set(fields or ()) | domain_fields(domain)
     with ctx.guard(operation=Operation.READ, model=model, fields=touched, count=limit) as g:
         kwargs: dict[str, Any] = {"limit": limit, "offset": offset}
-        if fields:
-            kwargs["fields"] = fields
+        if wanted := _read_fields(ctx, model, fields):
+            kwargs["fields"] = wanted
         if order:
             kwargs["order"] = order
-        records = ctx.redact(ctx.odoo(model, "search_read", [domain], kwargs))
+        records = ctx.redact(ctx.odoo(model, "search_read", [domain], kwargs), model)
         return _done(
             g,
             len(records),
@@ -298,6 +395,9 @@ def create_record(ctx: ToolContext) -> Any:
     with ctx.guard(operation=Operation.CREATE, model=model, fields=values, count=1) as g:
         created = ctx.odoo(model, "create", [values])
         new_id = created[0] if isinstance(created, list) else created
+        if isinstance(new_id, int):
+            g.touched([new_id])
+            ctx.journal(g, model, "create", {new_id: (None, ctx.redact(values, model))})
         return _done(g, 1, {"id": new_id, "model": model})
 
 
@@ -310,7 +410,11 @@ def update_record(ctx: ToolContext) -> Any:
     with ctx.guard(
         operation=Operation.WRITE, model=model, fields=values, count=len(ids)
     ) as g:
+        before = ctx.snapshot_before(model, ids, values)
         ctx.odoo(model, "write", [ids, values])
+        g.touched(ids)
+        after = ctx.redact(values, model)
+        ctx.journal(g, model, "write", {i: (before.get(i), after) for i in ids})
         return _done(g, len(ids), {"success": True, "ids": ids, "fields": sorted(values)})
 
 
@@ -318,7 +422,10 @@ def delete_record(ctx: ToolContext) -> Any:
     model = _arg_str(ctx, "model")
     ids = _arg_ids(ctx)
     with ctx.guard(operation=Operation.DELETE, model=model, count=len(ids)) as g:
+        before = ctx.snapshot_before(model, ids)
         ctx.odoo(model, "unlink", [ids])
+        g.touched(ids)
+        ctx.journal(g, model, "unlink", {i: (before.get(i), None) for i in ids})
         return _done(g, len(ids), {"success": True, "deleted_ids": ids})
 
 
@@ -330,20 +437,27 @@ def execute_method(ctx: ToolContext) -> Any:
     if not isinstance(args, list) or not isinstance(kwargs, dict):
         raise ToolInputError("'args' must be a list and 'kwargs' an object")
     # Best-effort description of what the call touches: record ids if the first
-    # argument looks like them, and the keys of any value dicts passed along.
+    # argument looks like them, the keys of any value dicts passed along, and
+    # any list of strings — read(ids, ['password']) and default_get(['x'])
+    # name their fields that way.
     count = None
     if args and isinstance(args[0], list) and all(isinstance(i, int) for i in args[0]):
         count = len(args[0])
     touched: set[str] = set()
     for item in [*args, *kwargs.values()]:
-        if isinstance(item, dict):
+        names_fields = isinstance(item, list) and all(isinstance(i, str) for i in item)
+        if isinstance(item, dict) or names_fields:
             touched |= set(item)
     touched |= domain_fields(kwargs.get("domain"))
     with ctx.guard(
         operation=Operation.EXECUTE, model=model, method=method, fields=touched, count=count
     ) as g:
         result = ctx.odoo(model, method, args, kwargs)
-        return _done(g, count, {"result": ctx.redact(result)})
+        if count is not None:
+            # What a method changes is unknowable from outside; which records
+            # it was called on is not.
+            g.touched(args[0])
+        return _done(g, count, {"result": ctx.redact(result, model)})
 
 
 def call_onchange(ctx: ToolContext) -> Any:
@@ -359,7 +473,7 @@ def call_onchange(ctx: ToolContext) -> Any:
             spec = _default_onchange_spec(ctx, model)
         result = ctx.odoo(model, "onchange", [[], values, changed, spec])
         if isinstance(result, dict) and isinstance(result.get("value"), dict):
-            result["value"] = ctx.redact(result["value"])
+            result["value"] = ctx.redact(result["value"], model)
         return _done(g, 0, result)
 
 
@@ -370,12 +484,12 @@ def _default_onchange_spec(ctx: ToolContext, model: str) -> dict[str, Any]:
     information onchange exists to provide.
     """
     defs = _fields_get(ctx, model, ["type"])
-    sensitive = {f.lower() for f in ctx.policy.sensitive_fields}
+    patterns = ctx.policy.sensitive_fields
     return {
         name: {}
         for name, meta in defs.items()
         if meta.get("type") not in ("one2many", "many2many", "binary")
-        and name.lower() not in sensitive
+        and not is_sensitive(name, patterns)
     }
 
 
@@ -652,6 +766,8 @@ def upload_attachment(ctx: ToolContext) -> Any:
             values["mimetype"] = mimetype
         created = ctx.odoo("ir.attachment", "create", [values])
         new_id = created[0] if isinstance(created, list) else created
+        if isinstance(new_id, int):
+            g.touched([new_id])
         return _done(
             g, 1, {"id": new_id, "filename": filename, "size_bytes": len(raw), "res_model": model}
         )
@@ -718,14 +834,25 @@ def server_status(ctx: ToolContext) -> Any:
             odoo["error"] = exc.kind
         policy = ctx.policy
         audit = ctx.runtime.audit
+        warnings = list(policy.validate())
+        if odoo.get("authenticated"):
+            access = ctx.snapshot.settings_access()
+            odoo["settings_access"] = access
+            if access is not False:
+                warnings.append(
+                    "the profile's Odoo user has Settings access (or it could not be "
+                    "verified): if a policy rule is missing, Odoo's own access control will "
+                    "not stop the agent. Connect with a dedicated least-privilege user."
+                )
         return _done(
             g,
             None,
             {
                 "server": {"name": "odoo-mcp-governed", "version": __version__},
-                "profile": ctx.snapshot.profile.public(),
+                "profile": _profile_status(ctx.snapshot.profile),
                 "odoo": odoo,
                 "governance": {
+                    "warnings": warnings,
                     "audit_events": audit.store.count(),
                     "audit_chain_keyed": audit.keyed,
                     "policy_source": ctx.runtime.policy_store.source,
@@ -738,6 +865,31 @@ def server_status(ctx: ToolContext) -> Any:
                 },
             },
         )
+
+
+def _profile_status(profile) -> dict[str, Any]:
+    """The profile as the agent should read it: what is in effect, not flags.
+
+    ``allow_writes`` only lifts the production default, so showing it raw on a
+    development profile read as "read-only" when it was not.
+    """
+    status = {
+        k: v for k, v in profile.public().items() if k not in ("allow_writes", "read_only")
+    }
+    status["writes_enabled"] = not profile.read_only
+    if profile.environment == "production":
+        status["production_writes_override"] = profile.allow_writes
+        status["writes_note"] = (
+            "production profile with allow_writes: writes are enabled"
+            if profile.allow_writes
+            else "production profile: read-only; set allow_writes on the profile to lift it"
+        )
+    else:
+        status["writes_note"] = (
+            f"{profile.environment} profile: writes are enabled; each model still needs "
+            "WRITABLE_MODELS"
+        )
+    return status
 
 
 # --- registry --------------------------------------------------------------
@@ -959,4 +1111,7 @@ TOOLS: dict[str, Tool] = {
     ]
 }
 
-assert len(TOOLS) == 18, "the tool surface is a contract — 18 tools"
+# The tool surface is a contract with every connected agent. A real check, not
+# an assert: asserts vanish under ``python -O``.
+if len(TOOLS) != 18:
+    raise RuntimeError(f"the tool surface is a contract — 18 tools, found {len(TOOLS)}")

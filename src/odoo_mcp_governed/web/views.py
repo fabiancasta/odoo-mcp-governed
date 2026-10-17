@@ -13,6 +13,7 @@ from :meth:`Profile.public`, which has no secret fields to leak.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
 from datetime import timezone
 from html import escape
@@ -68,6 +69,7 @@ def esc(value: Any) -> str:
 def page(title: str, body: str, *, nav: bool = True) -> str:
     links = (
         '<nav><a href="/admin">Dashboard</a><a href="/admin/logs">Audit log</a>'
+        '<a href="/admin/changes">Changes</a>'
         '<a href="/token">Token</a></nav>'
         if nav
         else ""
@@ -253,6 +255,12 @@ def dashboard(
         + f'min="1" max="100000" value="{esc(policy["max_records_per_call"])}"></div>'
         + area("execute_method_allowlist", "Allowed methods", "empty = any non-blocked")
         + area("forbidden_methods", "Extra forbidden methods", "on top of the built-in list")
+        + '</div><h3>Sensitive fields — never read, written or filtered on</h3>'
+        + '<p><small>Patterns, one per line: <code>*_key</code>, <code>*iban*</code>. '
+        + 'Always on, whatever this list says: <code>*password*</code> <code>*secret*</code> '
+        + '<code>*token*</code> <code>*api_key*</code> <code>*apikey*</code> '
+        + '<code>*private_key*</code>.</small></p><div class="row">'
+        + area("sensitive_fields", "Extra patterns", "SENSITIVE_FIELDS")
         + '</div><p><button type="submit">Apply policy</button></p></form></section>'
     )
     return page(
@@ -305,10 +313,57 @@ def _event_row(e: AuditEvent) -> str:
         f"<td>{esc(e.actor)}</td><td>{esc(e.profile)}</td><td><code>{esc(e.tool)}</code></td>"
         f"<td>{target}</td><td class=\"{decision_cls}\">{esc(e.decision.value)}</td>"
         f'<td class="{outcome_cls}">{esc(e.outcome.value)}</td>'
-        f"<td>{esc(e.affected_count if e.affected_count is not None else '')}</td>"
+        f"<td>{esc(e.affected_count if e.affected_count is not None else '')}"
+        f"{_ids_cell(e.record_ids)}</td>"
         f"<td>{esc(e.risk_score or '')}</td><td>{esc(signals)}</td>"
         f"<td><small>{esc(notes)}</small></td></tr>"
     )
+
+
+def _ids_cell(ids: tuple[int, ...]) -> str:
+    if not ids:
+        return ""
+    shown = ", ".join(str(i) for i in ids[:10])
+    more = f" +{len(ids) - 10}" if len(ids) > 10 else ""
+    return f'<br><small class="mono">ids {esc(shown + more)}</small>'
+
+
+def _values(value: Any) -> str:
+    if value is None:
+        return "<small>—</small>"
+    text = json.dumps(value, ensure_ascii=False, default=str, indent=1)
+    return f'<pre class="mono">{esc(text)}</pre>'
+
+
+def changes_page(*, entries: list[dict[str, Any]], enabled: bool,
+                 filters: dict[str, str]) -> str:
+    """The change journal: old and new values, newest first."""
+    if not enabled:
+        return page("Changes", "<section><h2>Changes</h2><p>The change journal is off "
+                    "(<code>CHANGE_JOURNAL=false</code>).</p></section>")
+    rows = "".join(
+        f'<tr><td class="mono">{esc(c["audit_seq"])}</td>'
+        f'<td class="mono">{esc(c["ts"][:19].replace("T", " "))}</td>'
+        f'<td>{esc(c["actor"])}</td><td>{esc(c["profile"])}</td>'
+        f'<td><code>{esc(c["model"])}</code></td><td>{esc(c["operation"])}</td>'
+        f'<td class="mono">{esc(c["record_id"])}</td>'
+        f"<td>{_values(c['before'])}</td><td>{_values(c['after'])}</td></tr>"
+        for c in entries
+    ) or "<tr><td colspan=9>No changes recorded.</td></tr>"
+    body = (
+        "<section><h2>Changes</h2><p><small>Old and new values of every create, write "
+        "and delete. Credential fields are never stored. <b>#</b> is the audit event "
+        "that sealed the change.</small></p>"
+        '<form method="get" action="/admin/changes"><div class="row">'
+        f'<div><label>Model</label><input type="text" name="model" value="{esc(filters.get("model"))}"></div>'
+        f'<div><label>Record id</label><input type="number" name="record_id" min="1" value="{esc(filters.get("record_id"))}"></div>'
+        f'<div><label>Rows</label><input type="number" name="limit" min="1" max="2000" value="{esc(filters.get("limit") or 200)}"></div>'
+        '</div><p><button type="submit">Filter</button></p></form>'
+        '<div class="wrap"><table><tr><th>#</th><th>Time (UTC)</th><th>Actor</th><th>Profile</th>'
+        "<th>Model</th><th>Operation</th><th>Record</th><th>Before</th><th>After</th></tr>"
+        + rows + "</table></div></section>"
+    )
+    return page("Changes", body)
 
 
 def audit_page(
