@@ -205,6 +205,13 @@ class PolicyConfig:
     """Agents (token subjects) refused outright, whatever they ask for. Other
     agents keep working."""
 
+    sandbox_profiles: frozenset[str] = frozenset()
+    """Non-production profiles marked as sandboxes: model lists and the
+    execute_method switch and allowlist do not apply there, and risk is only
+    observed. The floor — denylist, credential fields, attachment content,
+    blocked methods, panic and blocked agents — still does. Derived from the
+    profiles, not edited as policy."""
+
     privileged_profiles: frozenset[str] = frozenset()
     """Production profiles whose Odoo user has Settings access (or could not
     be checked). On these a ``*`` allowlist is refused: if a policy rule were
@@ -352,7 +359,12 @@ class PolicyEngine:
                 ),
             )
 
-        if call.model is not None and not matches(call.model, cfg.allowed_models):
+        sandbox = call.profile in cfg.sandbox_profiles
+        allowed = frozenset({WILDCARD}) if sandbox else cfg.allowed_models
+        writable = frozenset({WILDCARD}) if sandbox else cfg.writable_models
+        deletable = frozenset({WILDCARD}) if sandbox else cfg.deletable_models
+
+        if call.model is not None and not matches(call.model, allowed):
             # Schema introspection is gated too: field names and relations are
             # a map of the database, and handing that out is how someone finds
             # what to go after next.
@@ -363,7 +375,7 @@ class PolicyEngine:
         if call.operation in (Operation.CREATE, Operation.WRITE):
             if call.model is None:
                 reasons.append(_reason("model_required", f"{call.operation.value} needs a model"))
-            elif not matches(call.model, cfg.writable_models):
+            elif not matches(call.model, writable):
                 reasons.append(
                     _reason("model_not_writable", f"{call.model!r} is not in WRITABLE_MODELS")
                 )
@@ -371,24 +383,24 @@ class PolicyEngine:
         if call.operation is Operation.DELETE:
             if call.model is None:
                 reasons.append(_reason("model_required", "delete needs a model"))
-            elif not matches(call.model, cfg.deletable_models):
+            elif not matches(call.model, deletable):
                 reasons.append(
                     _reason("model_not_deletable", f"{call.model!r} is not in DELETABLE_MODELS")
                 )
 
         if call.operation is Operation.EXECUTE:
-            reasons.extend(self._evaluate_execute(call))
+            reasons.extend(self._evaluate_execute(call, sandbox=sandbox))
 
         reasons.extend(self._evaluate_fields(call))
         reasons.extend(self._evaluate_volume(call))
 
         return PolicyVerdict(allowed=not reasons, reasons=tuple(reasons))
 
-    def _evaluate_execute(self, call: ToolCall) -> list[str]:
+    def _evaluate_execute(self, call: ToolCall, *, sandbox: bool = False) -> list[str]:
         cfg = self.config
         reasons: list[str] = []
 
-        if not cfg.allow_execute_method:
+        if not cfg.allow_execute_method and not sandbox:
             return [
                 _reason(
                     "execute_disabled",
@@ -412,13 +424,17 @@ class PolicyEngine:
                     "dedicated tool for that operation instead",
                 )
             )
-        elif cfg.execute_method_allowlist and method not in cfg.execute_method_allowlist:
+        elif (
+            not sandbox
+            and cfg.execute_method_allowlist
+            and method not in cfg.execute_method_allowlist
+        ):
             reasons.append(
                 _reason("method_not_allowed", f"{method!r} is not in EXECUTE_METHOD_ALLOWLIST")
             )
 
         # An arbitrary method may write, so it needs write permission on the model.
-        if call.model and not matches(call.model, cfg.writable_models):
+        if call.model and not sandbox and not matches(call.model, cfg.writable_models):
             reasons.append(
                 _reason(
                     "model_not_writable",

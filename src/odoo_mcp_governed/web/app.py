@@ -33,9 +33,10 @@ from ..odoo import OdooClient, OdooError
 from ..profiles import PROFILE_NAME, Profile, ProfileError
 from ..protocol import INVALID_REQUEST, PARSE_ERROR, Dispatcher, _error
 from ..runtime import Runtime, UndoError
+from ..storage import read_json, write_private_json
 from ..tools import TOOLS
 from ..tuning import LIMITS, TuningError
-from . import views
+from . import permissions, views
 from .auth import AdminSessions, AuthError, TokenStore, csrf_matches, password_matches, verify_token
 from .metrics import summarise
 from .ratelimit import RateLimiter
@@ -77,6 +78,8 @@ FLASH = {
     "actor_unblocked": ("Agent unblocked.", "ok"),
     "undone": ("Change undone. The undo is in the audit log.", "ok"),
     "tuning_applied": ("Thresholds applied to the next call.", "ok"),
+    "permissions_saved": ("Permissions saved and applied to the next call.", "ok"),
+    "permissions_error": ("Permissions not saved: the form held an invalid value.", "bad"),
     "undo_confirm": ("Tick the box next to Undo to confirm.", "bad"),
     "csrf": ("Form expired. Please try again.", "bad"),
 }
@@ -507,6 +510,7 @@ def create_app(runtime: Runtime) -> FastAPI:
             timeout=timeout,
             environment=str(form.get("environment") or "production"),
             allow_writes=form.get("allow_writes") == "1",
+            sandbox=form.get("sandbox") == "1",
         )
         try:
             await run_in_threadpool(runtime.save_profile, profile, actor=admin_actor(request))
@@ -579,6 +583,83 @@ def create_app(runtime: Runtime) -> FastAPI:
         except TuningError as exc:
             return await dashboard_error(session, f"Thresholds not applied: {exc}")
         return back("tuning_applied" if changed else "policy_unchanged")
+
+    # -- admin: permissions table -----------------------------------------
+
+    def odoo_models() -> list[dict[str, Any]]:
+        snap = runtime.snapshot()
+        return runtime.cache.get_or_set(
+            (snap.profile.name, "permissions", "ir.model"),
+            lambda: snap.client.execute(
+                "ir.model", "search_read", [[]], {"fields": ["model", "name", "transient"]}
+            ),
+        )
+
+    def seen_models() -> dict[str, list[str]]:
+        return read_json(settings.data_dir / "models_seen.json", default=None) or {}
+
+    @app.get("/admin/permissions", response_class=HTMLResponse)
+    async def permissions_view(request: Request, q: str = "", m: str | None = None):
+        session = session_for(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        error = None
+        try:
+            models = await run_in_threadpool(odoo_models)
+        except Exception as exc:  # noqa: BLE001 - shown to the admin, not raised
+            models, error = [], f"Could not read the model list from Odoo ({type(exc).__name__})."
+        cfg = runtime.policy_store.config
+        flash, kind = FLASH.get(m or "", (None, "ok"))
+        return HTMLResponse(views.permissions_page(
+            csrf=session.csrf, groups=permissions.group(models if isinstance(models, list)
+                                                        else [], q),
+            policy=runtime.policy_store.as_dict(), denied=cfg.denied_models,
+            seen=set(seen_models().get(runtime.profile_name, [])), query=q[:100],
+            error=error, flash=flash, flash_kind=kind,
+        ))
+
+    @app.post("/admin/permissions")
+    async def permissions_save(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf", "/admin/permissions")
+        cfg = runtime.policy_store.config
+        shown = {str(v) for v in form.getlist("shown")} - cfg.denied_models
+        try:
+            models = await run_in_threadpool(odoo_models)
+        except Exception:  # noqa: BLE001 - whole-app ticks then cover only what was shown
+            models = []
+        by_app: dict[str, set[str]] = {}
+        for name in shown:
+            by_app.setdefault(permissions.app_key(name), set()).add(name)
+        lists = {}
+        for key, field_name in (("r", "allowed_models"), ("w", "writable_models"),
+                                ("d", "deletable_models")):
+            ticked = {str(v) for v in form.getlist(key)}
+            for app_key in form.getlist(f"app_{key}"):
+                ticked |= by_app.get(str(app_key), set())
+            if form.get(f"all_{key}") == "1":
+                lists[field_name] = frozenset({"*"})
+            else:
+                lists[field_name] = permissions.merge(getattr(cfg, field_name), shown, ticked)
+        if "*" not in lists["allowed_models"]:
+            implied = (lists["writable_models"] | lists["deletable_models"]) - {"*"}
+            lists["allowed_models"] = lists["allowed_models"] | implied
+        try:
+            await run_in_threadpool(
+                runtime.update_policy, {k: sorted(v) for k, v in lists.items()},
+                actor=admin_actor(request),
+            )
+        except (ValueError, KeyError):
+            return back("permissions_error", "/admin/permissions")
+        if isinstance(models, list) and models:
+            seen = seen_models()
+            seen[runtime.profile_name] = sorted(
+                str(x.get("model")) for x in models if isinstance(x, dict) and x.get("model"))
+            write_private_json(settings.data_dir / "models_seen.json", seen)
+        return back("permissions_saved", "/admin/permissions")
 
     # -- admin: emergency controls ----------------------------------------
 

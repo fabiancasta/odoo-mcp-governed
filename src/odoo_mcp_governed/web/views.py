@@ -74,6 +74,11 @@ vertical-align:middle;overflow:hidden}.meter span{display:block;height:100%}
 .hbar .track{height:10px;background:var(--chip);border-radius:5px;overflow:hidden}
 .hbar .track span{display:block;height:100%}.hbar b{text-align:right}
 table.compact td{padding:3px 6px}
+details{border-top:1px solid var(--line);padding:8px 0}summary{cursor:pointer;padding:4px 0}
+.apptoggles{margin:4px 0 6px;display:flex;gap:14px;align-items:center}
+details table{table-layout:fixed}details th:nth-child(1){width:30%}details th:nth-child(2){width:30%}
+details th:nth-child(3),details th:nth-child(4),details th:nth-child(5){width:9%;text-align:center}
+details td:nth-child(3),details td:nth-child(4),details td:nth-child(5){text-align:center}
 .console{display:flex;gap:10px;flex-wrap:wrap;justify-content:space-around;padding:12px 4px;
 background:var(--chip);border-radius:10px}
 .fader{display:flex;flex-direction:column;align-items:center;gap:6px;width:96px;text-align:center}
@@ -96,8 +101,18 @@ PANEL_JS = """(function () {
       fader.addEventListener("input", function () { out.textContent = fader.value; });
     });
   }
+  function bindGroups(root) {
+    root.querySelectorAll("input[data-app-toggle]").forEach(function (box) {
+      box.addEventListener("change", function () {
+        var sel = "input[data-app='" + box.getAttribute("data-app-toggle") +
+          "'][data-gate='" + box.getAttribute("data-gate") + "']";
+        root.querySelectorAll(sel).forEach(function (b) { if (!b.disabled) b.checked = box.checked; });
+      });
+    });
+  }
   document.addEventListener("DOMContentLoaded", function () {
     bindFaders(document);
+    bindGroups(document);
     var live = document.getElementById("live");
     if (!live) return;
     var stamp = document.getElementById("live-stamp");
@@ -183,6 +198,78 @@ def charts_fragment(summary: dict[str, Any], *, max_risk: int) -> str:
     )
 
 
+def permissions_page(
+    *, csrf: str, groups: list[tuple[str, str, list[dict]]], policy: dict[str, Any],
+    denied: frozenset[str], seen: set[str], query: str, error: str | None,
+    flash: str | None, flash_kind: str = "ok",
+) -> str:
+    gates = (("r", "allowed_models", "Read"), ("w", "writable_models", "Write"),
+             ("d", "deletable_models", "Delete"))
+    lists = {key: set(policy[name]) for key, name, _ in gates}
+    switches = "".join(
+        f'<label class="inline"><input type="checkbox" name="all_{key}" value="1" '
+        f'{"checked" if "*" in lists[key] else ""}> <b>{label}: allow every model</b> '
+        f'<small class="warn">(* — includes models installed later)</small></label><br>'
+        for key, _, label in gates
+    )
+    sections = []
+    new_total = 0
+    for app, title, models in groups:
+        rows = []
+        for m in models:
+            name = m["model"]
+            if name in denied:
+                rows.append(
+                    f'<tr class="deny"><td><code>{esc(name)}</code></td><td>{esc(m["name"])}</td>'
+                    '<td colspan=3><span class="chip bad">🔒 always blocked</span> <small>denylist: '
+                    "runs code, holds credentials or controls access</small></td><td></td></tr>"
+                )
+                continue
+            listed = any(name in lists[k] for k in lists)
+            is_new = name not in seen and not listed
+            new_total += is_new
+            cells = "".join(
+                f'<td><input type="checkbox" name="{key}" value="{esc(name)}" data-app="{esc(app)}" '
+                f'data-gate="{key}" aria-label="{label} {esc(name)}" '
+                f'{"checked" if name in lists[key] or "*" in lists[key] else ""}></td>'
+                for key, _, label in gates
+            )
+            flag = '<span class="chip warn">new — not reviewed</span>' if is_new else ""
+            rows.append(
+                f'<tr><td><input type="hidden" name="shown" value="{esc(name)}">'
+                f'<code>{esc(name)}</code></td><td>{esc(m["name"])}</td>{cells}<td>{flag}</td></tr>'
+            )
+        toggles = "".join(
+            f'<label class="inline"><input type="checkbox" name="app_{key}" value="{esc(app)}" '
+            f'data-app-toggle="{esc(app)}" data-gate="{key}"> {label}</label>'
+            for key, _, label in gates
+        )
+        sections.append(
+            f'<details open><summary><b>{esc(title)}</b> <small>({len(models)} models)</small>'
+            f'</summary><p class="apptoggles"><small>Whole app:</small> {toggles}</p>'
+            '<div class="wrap"><table><tr><th>Model</th><th>Name</th><th>Read</th><th>Write</th>'
+            "<th>Delete</th><th></th></tr>" + "".join(rows) + "</table></div></details>"
+        )
+    banner = (
+        f'<p class="msg bad">{esc(new_total)} model(s) are new and not reviewed: they stay '
+        "blocked until you tick them and save.</p>" if new_total else ""
+    )
+    odoo_note = f'<p class="msg bad">{esc(error)}</p>' if error else ""
+    body = (
+        "<section><h2>Permissions by app</h2><p><small>From the active Odoo's own model list. "
+        "Wizards are not shown. Write and delete imply read. The denylist always wins. Saving "
+        "applies to the next call and is sealed into the audit log.</small></p>"
+        f'<form method="get" action="/admin/permissions" class="inline"><input type="text" '
+        f'name="q" value="{esc(query)}" placeholder="res.partner, Contact, pos…">'
+        '<button class="ghost" type="submit">Filter</button></form>'
+        f"{odoo_note}{banner}"
+        f'<form method="post" action="/admin/permissions">{csrf_field(csrf)}'
+        f'<div class="msg">{switches}</div>' + "".join(sections)
+        + '<p><button type="submit">Save permissions</button></p></form></section>'
+    )
+    return page("Permissions", message(flash, flash_kind) + body)
+
+
 def console_section(*, csrf: str, tuning: dict[str, int], source: str) -> str:
     faders = (
         ("risk_throttle_threshold", "Throttle at", 5, 100, 1, "risk score"),
@@ -215,7 +302,7 @@ def esc(value: Any) -> str:
 def page(title: str, body: str, *, nav: bool = True) -> str:
     links = (
         '<nav><a href="/admin">Dashboard</a><a href="/admin/logs">Audit log</a>'
-        '<a href="/admin/changes">Changes</a>'
+        '<a href="/admin/changes">Changes</a><a href="/admin/permissions">Permissions</a>'
         '<a href="/token">Token</a></nav>'
         if nav
         else ""
@@ -378,6 +465,8 @@ def dashboard(
             )
         else:
             env_badge = f'<span class="chip ok">{esc(p["environment"])}</span>'
+            if p.get("sandbox"):
+                env_badge += ' <span class="chip warn">sandbox · unrestricted</span>'
         rows.append(
             f'<tr><td>{"● " if p["active"] else ""}<b>{esc(p["name"])}</b></td>'
             f"<td>{env_badge}</td>"
@@ -416,7 +505,11 @@ def dashboard(
         )
         + '</select><label class="inline"><input type="checkbox" name="allow_writes" value="1" '
         f'{"checked" if e.get("allow_writes") else ""}> allow writes on production '
-        "<small class=bad>(lifts read-only)</small></label></div>"
+        "<small class=bad>(lifts read-only)</small></label>"
+        '<label class="inline"><input type="checkbox" name="sandbox" value="1" '
+        f'{"checked" if e.get("sandbox") else ""}> sandbox: model lists off, risk only observed '
+        "<small>(never on production; denylist, credential fields and audit stay)</small>"
+        "</label></div>"
         '</div><p><button type="submit">Save profile</button> '
         f'{"<a href=/admin>cancel</a>" if editing else ""}</p></form>'
     )

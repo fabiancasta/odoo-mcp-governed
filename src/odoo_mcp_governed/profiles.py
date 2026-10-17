@@ -104,6 +104,9 @@ class Profile:
     allow_writes: bool = False
     """Only meaningful for production: lifts the read-only default. Should be
     rare, deliberate, and visible — the panel shows it in red."""
+    sandbox: bool = False
+    """Test databases and controlled activities: model lists do not apply and
+    risk is only observed. Never allowed on production."""
 
     @property
     def read_only(self) -> bool:
@@ -129,6 +132,7 @@ class Profile:
             "environment": self.environment,
             "allow_writes": self.allow_writes,
             "read_only": self.read_only,
+            "sandbox": self.sandbox,
         }
 
     def validate(self) -> None:
@@ -146,6 +150,8 @@ class Profile:
             raise ProfileError("Timeout must be between 1 and 600 seconds.")
         if self.environment not in ENVIRONMENTS:
             raise ProfileError(f"Environment must be one of: {', '.join(ENVIRONMENTS)}.")
+        if self.sandbox and self.environment == "production":
+            raise ProfileError("A production profile can never be a sandbox.")
 
 
 def _profile_from_dict(name: str, raw: dict[str, Any]) -> Profile:
@@ -161,6 +167,7 @@ def _profile_from_dict(name: str, raw: dict[str, Any]) -> Profile:
         # Missing label: assume the worst. See the module docstring.
         environment=str(raw.get("environment") or "production"),
         allow_writes=bool(raw.get("allow_writes", False)),
+        sandbox=bool(raw.get("sandbox", False)) and raw.get("environment") != "production",
     )
 
 
@@ -221,6 +228,13 @@ class ProfileStore:
             raise ProfileError(
                 f"{url_host(profile.url)} is covered by PROTECTED_HOSTS; this server will "
                 "not connect to it."
+            )
+
+    def sandbox_names(self) -> frozenset[str]:
+        with self._lock:
+            return frozenset(
+                n for n, p in self._profiles.items()
+                if p.sandbox and p.environment != "production"
             )
 
     def read_only_names(self) -> frozenset[str]:

@@ -219,6 +219,19 @@ class GovernanceEngine:
         else:
             decision = Decision.ALLOW
 
+        if (
+            verdict.allowed
+            and call.profile in self.policy.config.sandbox_profiles
+            and decision in (Decision.DENY, Decision.THROTTLE)
+        ):
+            # A sandbox observes risk and records it, but never acts on it.
+            decision = Decision.ALLOW_FLAGGED
+            reasons = [r for r in reasons if not r.startswith(("risk_block", "risk_throttle"))]
+            reasons.append(
+                f"sandbox: risk score {score} observed only — profile {call.profile!r} is a "
+                "sandbox"
+            )
+
         return Judgement(
             call=call,
             decision=decision,
