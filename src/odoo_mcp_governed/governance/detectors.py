@@ -227,6 +227,7 @@ class AllowlistProbingDetector:
             "method_private",
             "method_not_allowed",
             "sensitive_field",
+            "attachment_content",
         }
         denials = [
             e

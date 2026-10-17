@@ -90,14 +90,34 @@ DEFAULT_DENIED_MODELS = frozenset(
         "ir.mail_server",      # SMTP credentials
         "fetchmail.server",    # IMAP/POP credentials
         "auth.oauth.provider", # OAuth client secrets
+        "res.config.settings", # reads and writes ir.config_parameter for you
+        "res.config",          # the base of every settings wizard
+        "ir.module.module",    # install runs module code, uninstall drops tables
+        "base.module.upgrade",   # same, through the upgrade wizard
+        "base.module.uninstall", # same, through the uninstall wizard
     }
 )
 
 # The subset whose removal from the denylist deserves a startup warning even
 # when it was deliberate: these are code execution and credential theft.
 CRITICAL_DENIED_MODELS = frozenset(
-    {"ir.actions.server", "base.automation", "ir.cron", "ir.config_parameter", "res.users.apikeys"}
+    {
+        "ir.actions.server",
+        "base.automation",
+        "ir.cron",
+        "ir.config_parameter",
+        "res.users.apikeys",
+        "res.config.settings",
+        "ir.module.module",
+    }
 )
+
+# Attachment *content* is only served by get_attachment and upload_attachment,
+# which check the record the attachment belongs to. Through the generic tools
+# ir.attachment is one model holding every other model's files, so reading
+# ``datas`` there would skip that check for all of them at once.
+ATTACHMENT_MODEL = "ir.attachment"
+ATTACHMENT_CONTENT_FIELDS = frozenset({"datas", "raw", "db_datas", "store_fname"})
 
 WILDCARD = "*"
 
@@ -351,14 +371,26 @@ class PolicyEngine:
     def _evaluate_fields(self, call: ToolCall) -> list[str]:
         sensitive = {f.lower() for f in self.config.sensitive_fields}
         hits = sorted({f for f in call.fields_touched if f.lower() in sensitive})
+        reasons = []
         if hits:
-            return [
+            reasons.append(
                 _reason(
                     "sensitive_field",
                     f"refusing to touch credential fields: {', '.join(hits)}",
                 )
-            ]
-        return []
+            )
+        if call.model == ATTACHMENT_MODEL:
+            content = sorted(set(call.fields_touched) & ATTACHMENT_CONTENT_FIELDS)
+            if content:
+                reasons.append(
+                    _reason(
+                        "attachment_content",
+                        f"{', '.join(content)} on ir.attachment is only available through "
+                        "get_attachment and upload_attachment, which check the record "
+                        "the attachment belongs to",
+                    )
+                )
+        return reasons
 
     def _evaluate_volume(self, call: ToolCall) -> list[str]:
         limit = self.config.max_records_per_call

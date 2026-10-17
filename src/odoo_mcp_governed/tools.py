@@ -27,7 +27,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .governance import GuardedCall, Operation, ToolCall, digest_args
-from .governance.policy import WILDCARD, matches
+from .governance.policy import (
+    ATTACHMENT_CONTENT_FIELDS,
+    ATTACHMENT_MODEL,
+    WILDCARD,
+    matches,
+)
 from .runtime import Runtime, Snapshot
 
 DEFAULT_SEARCH_LIMIT = 100
@@ -82,18 +87,25 @@ class ToolContext:
     def policy(self):
         return self.runtime.engine.policy.config
 
-    def redact(self, records: Any) -> Any:
+    def redact(self, records: Any, model: str | None = None) -> Any:
         """Drop credential-like keys from returned records, whatever was asked.
 
         The policy refuses calls that *name* a sensitive field. This covers the
         other case: an agent that asks for all fields and would receive one.
+        On ir.attachment the file content goes too, for the same reason.
         """
-        sensitive = {f.lower() for f in self.policy.sensitive_fields}
-        if isinstance(records, list):
-            return [self.redact(r) for r in records]
-        if isinstance(records, dict):
-            return {k: v for k, v in records.items() if k.lower() not in sensitive}
-        return records
+        hidden = {f.lower() for f in self.policy.sensitive_fields}
+        if model == ATTACHMENT_MODEL:
+            hidden |= ATTACHMENT_CONTENT_FIELDS
+        return _strip(records, hidden)
+
+
+def _strip(records: Any, hidden: set[str]) -> Any:
+    if isinstance(records, list):
+        return [_strip(r, hidden) for r in records]
+    if isinstance(records, dict):
+        return {k: v for k, v in records.items() if k.lower() not in hidden}
+    return records
 
 
 @dataclass(frozen=True)
@@ -260,7 +272,7 @@ def get_record(ctx: ToolContext) -> Any:
         operation=Operation.READ, model=model, fields=fields or (), count=len(ids)
     ) as g:
         kwargs = {"fields": fields} if fields else {}
-        records = ctx.redact(ctx.odoo(model, "read", [ids], kwargs))
+        records = ctx.redact(ctx.odoo(model, "read", [ids], kwargs), model)
         missing = sorted(set(ids) - {r["id"] for r in records})
         result: dict[str, Any] = {"records": records}
         if missing:
@@ -282,7 +294,7 @@ def search_records(ctx: ToolContext) -> Any:
             kwargs["fields"] = fields
         if order:
             kwargs["order"] = order
-        records = ctx.redact(ctx.odoo(model, "search_read", [domain], kwargs))
+        records = ctx.redact(ctx.odoo(model, "search_read", [domain], kwargs), model)
         return _done(
             g,
             len(records),
@@ -330,20 +342,23 @@ def execute_method(ctx: ToolContext) -> Any:
     if not isinstance(args, list) or not isinstance(kwargs, dict):
         raise ToolInputError("'args' must be a list and 'kwargs' an object")
     # Best-effort description of what the call touches: record ids if the first
-    # argument looks like them, and the keys of any value dicts passed along.
+    # argument looks like them, the keys of any value dicts passed along, and
+    # any list of strings — read(ids, ['password']) and default_get(['x'])
+    # name their fields that way.
     count = None
     if args and isinstance(args[0], list) and all(isinstance(i, int) for i in args[0]):
         count = len(args[0])
     touched: set[str] = set()
     for item in [*args, *kwargs.values()]:
-        if isinstance(item, dict):
+        names_fields = isinstance(item, list) and all(isinstance(i, str) for i in item)
+        if isinstance(item, dict) or names_fields:
             touched |= set(item)
     touched |= domain_fields(kwargs.get("domain"))
     with ctx.guard(
         operation=Operation.EXECUTE, model=model, method=method, fields=touched, count=count
     ) as g:
         result = ctx.odoo(model, method, args, kwargs)
-        return _done(g, count, {"result": ctx.redact(result)})
+        return _done(g, count, {"result": ctx.redact(result, model)})
 
 
 def call_onchange(ctx: ToolContext) -> Any:
@@ -359,7 +374,7 @@ def call_onchange(ctx: ToolContext) -> Any:
             spec = _default_onchange_spec(ctx, model)
         result = ctx.odoo(model, "onchange", [[], values, changed, spec])
         if isinstance(result, dict) and isinstance(result.get("value"), dict):
-            result["value"] = ctx.redact(result["value"])
+            result["value"] = ctx.redact(result["value"], model)
         return _done(g, 0, result)
 
 
