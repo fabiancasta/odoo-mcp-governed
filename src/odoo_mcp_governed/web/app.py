@@ -67,6 +67,11 @@ FLASH = {
         "ok",
     ),
     "anchor_written": ("Anchor written to anchors.log.", "ok"),
+    "panic_on": ("PANIC: every agent is stopped. Calls are refused until you resume.", "bad"),
+    "panic_off": ("Service resumed. Agents can call again.", "ok"),
+    "panic_confirm": ("Tick 'confirm' to resume service.", "bad"),
+    "actor_blocked": ("Agent blocked. Its next call is refused.", "ok"),
+    "actor_unblocked": ("Agent unblocked.", "ok"),
     "csrf": ("Form expired. Please try again.", "bad"),
 }
 
@@ -428,6 +433,8 @@ def create_app(runtime: Runtime) -> FastAPI:
             edit=edit,
             flash=flash,
             flash_kind=kind,
+            panic=runtime.engine.policy.config.panic,
+            agents=_agents(runtime),
         )
         return HTMLResponse(html, status_code=status_code)
 
@@ -525,6 +532,53 @@ def create_app(runtime: Runtime) -> FastAPI:
         except ProfileError as exc:
             return await dashboard_error(session, str(exc))
         return back("profile_deleted")
+
+    # -- admin: emergency controls ----------------------------------------
+
+    @app.post("/admin/panic")
+    async def panic_on(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf")
+        # No confirmation on the way in: an emergency stop that asks "are you
+        # sure?" is slower exactly when speed matters.
+        await run_in_threadpool(runtime.set_panic, True, actor=admin_actor(request))
+        return back("panic_on")
+
+    @app.post("/admin/resume")
+    async def panic_off(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf")
+        if form.get("confirm") != "yes":
+            return back("panic_confirm")
+        await run_in_threadpool(runtime.set_panic, False, actor=admin_actor(request))
+        return back("panic_off")
+
+    async def _set_blocked(request: Request, blocked: bool):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf")
+        try:
+            await run_in_threadpool(runtime.set_actor_blocked, str(form.get("actor") or ""),
+                                    blocked, actor=admin_actor(request))
+        except ValueError as exc:
+            return await dashboard_error(session, str(exc))
+        return back("actor_blocked" if blocked else "actor_unblocked")
+
+    @app.post("/admin/actor/block")
+    async def actor_block(request: Request):
+        return await _set_blocked(request, True)
+
+    @app.post("/admin/actor/unblock")
+    async def actor_unblock(request: Request):
+        return await _set_blocked(request, False)
 
     # -- admin: policy -----------------------------------------------------
 
@@ -633,6 +687,20 @@ def create_app(runtime: Runtime) -> FastAPI:
         return back("anchor_written", "/admin/logs")
 
     return app
+
+
+def _agents(runtime: Runtime) -> list[tuple[str, int, int, bool]]:
+    """Agents for the dashboard: everyone active in the risk window, plus every
+    blocked agent even if quiet — a block you cannot see is one you forget."""
+    blocked = runtime.engine.policy.config.blocked_actors
+    rows = [
+        (actor, score, count, actor in blocked)
+        for actor, score, count in _actor_risk(runtime)
+        if not actor.startswith(("admin@", "anonymous@")) and actor != "system"
+    ]
+    seen = {r[0] for r in rows}
+    rows += [(actor, 0, 0, True) for actor in sorted(blocked - seen)]
+    return rows
 
 
 def _actor_risk(runtime: Runtime) -> list[tuple[str, int, int]]:

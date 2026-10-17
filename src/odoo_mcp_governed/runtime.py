@@ -16,6 +16,7 @@ privileged actions on the server as the only unaudited ones.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections.abc import Iterator
@@ -42,6 +43,9 @@ from .policy_store import PolicyStore, policy_from_settings
 from .profiles import Profile, ProfileError, ProfileStore
 
 log = logging.getLogger(__name__)
+
+ACTOR_NAME = re.compile(r"^[A-Za-z0-9_.@-]{1,64}$")
+"""The token subjects the panel and the CLI issue."""
 
 
 SETTINGS_GROUP = "base.group_system"
@@ -218,6 +222,29 @@ class Runtime:
         for warning in config.validate():
             log.warning("policy: %s", warning)
         return config, changed
+
+    # -- emergency controls ------------------------------------------------
+
+    def set_panic(self, on: bool, *, actor: str) -> None:
+        """Stop or resume every agent. Takes effect on the next call and is
+        persisted, so a restart does not silently resume service."""
+        with self.admin_action(actor, "admin.panic", detail={"panic": on}) as action:
+            _, changed = self.policy_store.update({"panic": on})
+            self._apply_policy()
+            action.fields = ("panic",) if changed else ()
+        log.warning("panic switch %s by %s", "ENGAGED" if on else "released", actor)
+
+    def set_actor_blocked(self, name: str, blocked: bool, *, actor: str) -> None:
+        name = name.strip()
+        if not ACTOR_NAME.match(name):
+            raise ValueError("agent names may only contain letters, digits and _ . @ -")
+        current = set(self.policy_store.config.blocked_actors)
+        current = current | {name} if blocked else current - {name}
+        tool = "admin.actor.block" if blocked else "admin.actor.unblock"
+        with self.admin_action(actor, tool, detail={"actor": name}) as action:
+            self.policy_store.update({"blocked_actors": sorted(current)})
+            self._apply_policy()
+            action.count = 1
 
     # -- auditing administrative actions -----------------------------------
 

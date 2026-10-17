@@ -59,6 +59,13 @@ button.danger{border-color:var(--bad);background:transparent;color:var(--bad)}
 tr.deny td{background:color-mix(in srgb,var(--bad) 8%,transparent)}
 tr.flag td{background:color-mix(in srgb,var(--warn) 8%,transparent)}
 .login{max-width:360px;margin:12vh auto}
+.spread{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+.panic{border-color:var(--bad)}.panic p{margin:4px 0}
+.panic.on{background:color-mix(in srgb,var(--bad) 12%,var(--card))}
+.panic-btn{background:var(--bad);border-color:var(--bad);font-weight:600;padding:10px 18px}
+.meter{display:inline-block;width:90px;height:8px;border-radius:4px;background:var(--chip);
+vertical-align:middle;overflow:hidden}.meter span{display:block;height:100%}
+.meter .ok{background:var(--ok)}.meter .warn{background:var(--warn)}.meter .bad{background:var(--bad)}
 """
 
 
@@ -129,6 +136,8 @@ def dashboard(
     edit: dict[str, Any] | None,
     flash: str | None,
     flash_kind: str,
+    panic: bool = False,
+    agents: list[tuple[str, int, int, bool]] | None = None,
 ) -> str:
     odoo_badge = (
         '<strong class="ok">reachable</strong>' if odoo_ok
@@ -145,6 +154,49 @@ def dashboard(
         "</div>"
         + "".join(f'<p class="warn">⚠ {esc(w)}</p>' for w in warnings)
         + "</section>"
+    )
+
+    if panic:
+        emergency = (
+            '<section class="panic on"><h2>⛔ Every agent is stopped</h2>'
+            "<p>The panic switch is engaged: every MCP call is refused, and it stays that way "
+            "across restarts until you resume. Audit logging continues.</p>"
+            f'<form method="post" action="/admin/resume" class="inline">{csrf_field(csrf)}'
+            '<label class="inline"><input type="checkbox" name="confirm" value="yes"> confirm</label>'
+            '<button type="submit">Resume service</button></form></section>'
+        )
+    else:
+        emergency = (
+            '<section class="panic"><div class="spread"><div><h2>Emergency stop</h2>'
+            "<p><small>Refuses every agent call on the next request, keeps the panel and the "
+            "audit log running, and survives restarts.</small></p></div>"
+            f'<form method="post" action="/admin/panic" class="inline">{csrf_field(csrf)}'
+            '<button class="panic-btn" type="submit">⛔ Panic: stop every agent</button>'
+            "</form></div></section>"
+        )
+
+    agent_rows = []
+    for actor, score, count, is_blocked in agents or []:
+        level = "bad" if score >= 70 else "warn" if score >= 40 else "ok"
+        action = "unblock" if is_blocked else "block"
+        state = '<span class="chip bad">blocked</span>' if is_blocked else (
+            '<span class="chip ok">active</span>')
+        agent_rows.append(
+            f"<tr><td><code>{esc(actor)}</code></td><td>{state}</td>"
+            f'<td><span class="meter"><span class="{level}" style="width:{min(score, 100)}%">'
+            f"</span></span> {esc(score)}</td><td>{esc(count)}</td>"
+            f'<td><form method="post" action="/admin/actor/{action}" class="inline">'
+            f'{csrf_field(csrf)}<input type="hidden" name="actor" value="{esc(actor)}">'
+            f'<button class="{"ghost" if is_blocked else "danger"}" type="submit">'
+            f'{"Unblock" if is_blocked else "Block agent"}</button></form></td></tr>'
+        )
+    agents_section = (
+        "<section><h2>Agents</h2><p><small>Active in the last hour, plus every blocked agent. "
+        "Blocking refuses that agent's next call; the others keep working.</small></p>"
+        '<div class="wrap"><table><tr><th>Agent</th><th>State</th><th>Risk</th>'
+        "<th>Calls (1h)</th><th></th></tr>"
+        + ("".join(agent_rows) or "<tr><td colspan=5>No agent activity in the last hour.</td></tr>")
+        + "</table></div></section>"
     )
 
     rows = []
@@ -265,7 +317,8 @@ def dashboard(
     )
     return page(
         "Dashboard",
-        message(flash, flash_kind) + status + profiles_section + policy_section,
+        message(flash, flash_kind) + emergency + status + agents_section + profiles_section
+        + policy_section,
     )
 
 

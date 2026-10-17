@@ -30,8 +30,9 @@ _SET_FIELDS = {
     "forbidden_methods",
     "execute_method_allowlist",
     "sensitive_fields",
+    "blocked_actors",
 }
-_EDITABLE = _SET_FIELDS | {"allow_execute_method", "max_records_per_call"}
+_EDITABLE = _SET_FIELDS | {"allow_execute_method", "max_records_per_call", "panic"}
 
 
 def policy_from_settings(settings: Settings) -> PolicyConfig:
@@ -63,7 +64,7 @@ def _coerce(key: str, value: Any) -> Any:
         if isinstance(value, str):
             value = value.replace("\n", ",").split(",")
         return frozenset(str(v).strip() for v in value if str(v).strip())
-    if key == "allow_execute_method":
+    if key in ("allow_execute_method", "panic"):
         return bool(value)
     if key == "max_records_per_call":
         number = int(value)

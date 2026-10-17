@@ -197,6 +197,14 @@ class PolicyConfig:
     whatever the model lists say. Derived from the profiles themselves
     (production without ``allow_writes``), not edited as policy."""
 
+    panic: bool = False
+    """The operator's emergency stop: every call is refused, introspection
+    included, until a human resumes. Checked before anything else."""
+
+    blocked_actors: frozenset[str] = frozenset()
+    """Agents (token subjects) refused outright, whatever they ask for. Other
+    agents keep working."""
+
     privileged_profiles: frozenset[str] = frozenset()
     """Production profiles whose Odoo user has Settings access (or could not
     be checked). On these a ``*`` allowlist is refused: if a policy rule were
@@ -263,6 +271,29 @@ class PolicyEngine:
     def evaluate(self, call: ToolCall) -> PolicyVerdict:
         reasons: list[str] = []
         cfg = self.config
+
+        if cfg.panic:
+            return PolicyVerdict(
+                allowed=False,
+                reasons=(
+                    _reason(
+                        "panic_stop",
+                        "the operator stopped this server with the panic switch: every call "
+                        "is refused until a human resumes it. Do not retry; tell the user.",
+                    ),
+                ),
+            )
+        if call.actor in cfg.blocked_actors:
+            return PolicyVerdict(
+                allowed=False,
+                reasons=(
+                    _reason(
+                        "actor_blocked",
+                        f"the operator blocked agent {call.actor!r}: every call from it is "
+                        "refused. Do not retry; tell the user.",
+                    ),
+                ),
+            )
 
         if call.tool in cfg.disabled_tools:
             return PolicyVerdict(
