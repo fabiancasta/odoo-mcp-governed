@@ -326,9 +326,17 @@ class RateAnomalyDetector:
                 )
             )
 
-        baseline_events = ctx.within(cfg.rate_baseline_window)
+        # The baseline is what came *before* the current window, averaged over
+        # the time this actor has actually been active. Including the current
+        # burst, or dividing by six hours the actor was never around for, made
+        # every new or bursty actor look like a stolen token.
+        window_start = ctx.now - cfg.rate_window
+        baseline_events = [
+            e for e in ctx.within(cfg.rate_baseline_window) if e.ts < window_start
+        ]
         if len(baseline_events) >= cfg.rate_baseline_min_events:
-            windows = max(cfg.rate_baseline_window / cfg.rate_window, 1.0)
+            span = window_start - baseline_events[0].ts
+            windows = max(span / cfg.rate_window, 1.0)
             expected = len(baseline_events) / windows
             if expected > 0 and count > expected * cfg.rate_baseline_multiplier:
                 signals.append(
