@@ -248,6 +248,24 @@ data, so there are two independent guards:
   pointing at one (or any subdomain) cannot be saved or activated, and if the
   active profile turns out to point at one, the server starts with no profile
   rather than connect.
+- **The policy is not the only barrier.** A production profile whose Odoo user
+  has Settings access — or whose access cannot be verified — refuses `*`
+  model lists: if a policy rule were ever missing, nothing in Odoo would stop
+  the agent. `server_status` warns about such a user on any profile, and
+  reports `writes_enabled` with a plain-language note instead of raw flags.
+
+### A least-privilege production profile
+
+The MCP policy and Odoo's own access control should each be enough on their
+own. For production:
+
+| Layer | Setting |
+|---|---|
+| Odoo user | A dedicated user (for example `mcp_agent`) with an API key, only the groups of the apps the agent works with, and **neither Settings nor Technical** |
+| Models | Explicit `ALLOWED_MODELS` and `WRITABLE_MODELS`; `DELETABLE_MODELS` empty unless needed |
+| Methods | `ALLOW_EXECUTE_METHOD` off, or a closed `EXECUTE_METHOD_ALLOWLIST` such as `action_confirm,message_post` |
+| Denylist | Kept as the floor, not relied on as the main control |
+| Secrets | A fresh `JWT_SECRET` (rotating it revokes every token) and `AUDIT_HMAC_KEY` |
 
 ## Hardening carried over from day one
 

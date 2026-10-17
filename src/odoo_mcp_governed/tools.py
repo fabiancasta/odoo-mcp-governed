@@ -68,6 +68,12 @@ class ToolContext:
         count: int | None = None,
     ):
         self.guarded = True
+        profile = self.snapshot.profile
+        if model and profile.environment == "production" and WILDCARD in self.policy.allowed_models:
+            # Only asked when it matters: a production profile reached through
+            # a '*' allowlist. Unknown counts as privileged — fail closed.
+            access = self.snapshot.settings_access()
+            self.runtime.note_privilege(profile.name, access is not False)
         call = ToolCall(
             actor=self.actor,
             profile=self.snapshot.profile.name,
@@ -828,14 +834,25 @@ def server_status(ctx: ToolContext) -> Any:
             odoo["error"] = exc.kind
         policy = ctx.policy
         audit = ctx.runtime.audit
+        warnings = list(policy.validate())
+        if odoo.get("authenticated"):
+            access = ctx.snapshot.settings_access()
+            odoo["settings_access"] = access
+            if access is not False:
+                warnings.append(
+                    "the profile's Odoo user has Settings access (or it could not be "
+                    "verified): if a policy rule is missing, Odoo's own access control will "
+                    "not stop the agent. Connect with a dedicated least-privilege user."
+                )
         return _done(
             g,
             None,
             {
                 "server": {"name": "odoo-mcp-governed", "version": __version__},
-                "profile": ctx.snapshot.profile.public(),
+                "profile": _profile_status(ctx.snapshot.profile),
                 "odoo": odoo,
                 "governance": {
+                    "warnings": warnings,
                     "audit_events": audit.store.count(),
                     "audit_chain_keyed": audit.keyed,
                     "policy_source": ctx.runtime.policy_store.source,
@@ -848,6 +865,31 @@ def server_status(ctx: ToolContext) -> Any:
                 },
             },
         )
+
+
+def _profile_status(profile) -> dict[str, Any]:
+    """The profile as the agent should read it: what is in effect, not flags.
+
+    ``allow_writes`` only lifts the production default, so showing it raw on a
+    development profile read as "read-only" when it was not.
+    """
+    status = {
+        k: v for k, v in profile.public().items() if k not in ("allow_writes", "read_only")
+    }
+    status["writes_enabled"] = not profile.read_only
+    if profile.environment == "production":
+        status["production_writes_override"] = profile.allow_writes
+        status["writes_note"] = (
+            "production profile with allow_writes: writes are enabled"
+            if profile.allow_writes
+            else "production profile: read-only; set allow_writes on the profile to lift it"
+        )
+    else:
+        status["writes_note"] = (
+            f"{profile.environment} profile: writes are enabled; each model still needs "
+            "WRITABLE_MODELS"
+        )
+    return status
 
 
 # --- registry --------------------------------------------------------------

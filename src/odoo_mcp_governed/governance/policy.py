@@ -197,6 +197,12 @@ class PolicyConfig:
     whatever the model lists say. Derived from the profiles themselves
     (production without ``allow_writes``), not edited as policy."""
 
+    privileged_profiles: frozenset[str] = frozenset()
+    """Production profiles whose Odoo user has Settings access (or could not
+    be checked). On these a ``*`` allowlist is refused: if a policy rule were
+    missing, nothing in Odoo's own access control would stop the agent.
+    Derived at runtime, not edited as policy."""
+
     def validate(self) -> list[str]:
         """Config problems worth warning about at startup. Never raises —
         returns warnings so the caller can log them all at once."""
@@ -267,6 +273,24 @@ class PolicyEngine:
         # Server introspection touches no Odoo data at all.
         if call.operation is Operation.ADMIN:
             return PolicyVerdict(allowed=True)
+
+        if (
+            call.model
+            and call.profile in cfg.privileged_profiles
+            and WILDCARD in cfg.allowed_models
+        ):
+            return PolicyVerdict(
+                allowed=False,
+                reasons=(
+                    _reason(
+                        "privileged_wildcard",
+                        f"profile {call.profile!r} is production and its Odoo user has "
+                        "Settings access (or it could not be verified), so '*' model lists "
+                        "are refused on it: list the models explicitly, or connect with a "
+                        "dedicated least-privilege Odoo user",
+                    ),
+                ),
+            )
 
         if call.profile in cfg.read_only_profiles and (
             call.operation.mutates or call.operation is Operation.EXECUTE

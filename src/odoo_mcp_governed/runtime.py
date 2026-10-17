@@ -20,7 +20,7 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .config import Settings
@@ -44,10 +44,30 @@ from .profiles import Profile, ProfileError, ProfileStore
 log = logging.getLogger(__name__)
 
 
+SETTINGS_GROUP = "base.group_system"
+
+
 @dataclass(frozen=True)
 class Snapshot:
     profile: Profile
     client: OdooClient
+    _facts: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
+
+    def settings_access(self) -> bool | None:
+        """Whether the profile's Odoo user has Settings access, or ``None``
+        when Odoo cannot say. A known answer is kept for the life of this
+        snapshot — a profile edit or swap makes a new one; an unknown one is
+        asked again next time, so an Odoo that was down is not held against
+        the profile forever."""
+        if "settings_access" not in self._facts:
+            try:
+                answer = self.client.execute(
+                    "res.users", "has_group", [[self.client.uid], SETTINGS_GROUP]
+                )
+            except Exception:  # noqa: BLE001 - unknown is an answer here
+                return None
+            self._facts["settings_access"] = bool(answer)
+        return self._facts["settings_access"]
 
 
 class NoActiveProfile(RuntimeError):
@@ -93,6 +113,8 @@ class Runtime:
                 log.warning("ODOO_* settings do not form a valid profile: %s", exc)
 
         self.policy_store = PolicyStore(settings.policy_file, policy_from_settings(settings))
+        self._privileged: set[str] = set()
+        self._privileged_lock = threading.Lock()
         self.audit = AuditLog(AuditStore(settings.audit_db), hmac_key=settings.hmac_key())
         self.journal = ChangeJournal(settings.journal_db) if settings.change_journal else None
         self.engine = GovernanceEngine(
@@ -113,8 +135,26 @@ class Runtime:
     # -- profile hot swap --------------------------------------------------
 
     def _effective_policy(self, config: PolicyConfig) -> PolicyConfig:
-        """The edited policy plus what the profiles impose (read-only ones)."""
-        return replace(config, read_only_profiles=self.profiles.read_only_names())
+        """The edited policy plus what the profiles impose: read-only ones, and
+        production ones whose Odoo user turned out to have Settings access."""
+        return replace(
+            config,
+            read_only_profiles=self.profiles.read_only_names(),
+            privileged_profiles=frozenset(self._privileged),
+        )
+
+    def note_privilege(self, profile: str, privileged: bool) -> None:
+        """Record what a production profile's Odoo user can do, and re-apply
+        the policy if that changed which profiles count as privileged."""
+        with self._privileged_lock:
+            before = profile in self._privileged
+            if privileged == before:
+                return
+            if privileged:
+                self._privileged.add(profile)
+            else:
+                self._privileged.discard(profile)
+        self._apply_policy()
 
     def _apply_policy(self) -> None:
         # One attribute assignment, so no call sees half a policy.
