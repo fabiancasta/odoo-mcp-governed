@@ -320,6 +320,24 @@ DOMAIN = {
 }
 
 
+def _read_fields(ctx: ToolContext, model: str, fields: list[str] | None) -> list[str] | None:
+    """The field list to ask Odoo for. ``None`` means all of them.
+
+    On ir.attachment "all fields" would pull every file's content just to
+    strip it again — and Odoo cannot even serialise ``raw``, so it answers
+    HTTP 500. Ask for everything except the content instead.
+    """
+    if fields or model != ATTACHMENT_MODEL:
+        return fields
+    defs = _fields_get(ctx, model, ["type"])
+    if not isinstance(defs, dict):
+        return fields
+    return sorted(
+        n for n, meta in defs.items()
+        if n not in ATTACHMENT_CONTENT_FIELDS and meta.get("type") != "binary"
+    ) or None
+
+
 def get_record(ctx: ToolContext) -> Any:
     model = _arg_str(ctx, "model")
     ids = _arg_ids(ctx)
@@ -327,7 +345,8 @@ def get_record(ctx: ToolContext) -> Any:
     with ctx.guard(
         operation=Operation.READ, model=model, fields=fields or (), count=len(ids)
     ) as g:
-        kwargs = {"fields": fields} if fields else {}
+        wanted = _read_fields(ctx, model, fields)
+        kwargs = {"fields": wanted} if wanted else {}
         records = ctx.redact(ctx.odoo(model, "read", [ids], kwargs), model)
         missing = sorted(set(ids) - {r["id"] for r in records})
         result: dict[str, Any] = {"records": records}
@@ -346,8 +365,8 @@ def search_records(ctx: ToolContext) -> Any:
     touched = set(fields or ()) | domain_fields(domain)
     with ctx.guard(operation=Operation.READ, model=model, fields=touched, count=limit) as g:
         kwargs: dict[str, Any] = {"limit": limit, "offset": offset}
-        if fields:
-            kwargs["fields"] = fields
+        if wanted := _read_fields(ctx, model, fields):
+            kwargs["fields"] = wanted
         if order:
             kwargs["order"] = order
         records = ctx.redact(ctx.odoo(model, "search_read", [domain], kwargs), model)

@@ -156,3 +156,20 @@ class TestExecuteMethodFieldNames:
             args=[[1]], kwargs={"fields": ["api_key"]},
         )[0]
         assert not odoo_saw(fake, "res.partner")
+
+
+def test_all_fields_on_attachments_never_asks_odoo_for_the_content(wide_open) -> None:
+    """Odoo cannot serialise ``raw`` and answers HTTP 500; and pulling every
+    file only to strip it would be wasteful anyway."""
+    _, fake, d = wide_open
+    fake.responses[("ir.attachment", "fields_get")] = {
+        "name": {"type": "char"}, "res_model": {"type": "char"},
+        "datas": {"type": "binary"}, "raw": {"type": "binary"},
+        "db_datas": {"type": "binary"}, "store_fname": {"type": "char"},
+        "image_preview": {"type": "binary"},
+    }
+    assert not call(d, "search_records", model="ir.attachment")[0]
+    assert not call(d, "get_record", model="ir.attachment", record_id=1)[0]
+    for model, method, _args, kwargs in fake.calls:
+        if model == "ir.attachment" and method in ("search_read", "read"):
+            assert kwargs["fields"] == ["name", "res_model"]
