@@ -401,6 +401,17 @@ def create_app(runtime: Runtime) -> FastAPI:
             odoo_ok = OdooClient(snap.url, snap.database, snap.username, "",
                                  ssl_verify=snap.ssl_verify, timeout=3).ping()
         warnings = runtime.engine.policy.config.validate()
+        if odoo_ok:
+            try:
+                access = runtime.snapshot().settings_access()
+            except Exception:  # noqa: BLE001 - a warning must never break the panel
+                access = None
+            if access is not False:
+                warnings.append(
+                    f"The Odoo user of profile '{snap.name}' has Settings access (or it could "
+                    "not be verified): if a policy rule is missing, Odoo will not stop the agent. "
+                    "Use a dedicated least-privilege user."
+                )
         if not runtime.audit.keyed:
             warnings.append("AUDIT_HMAC_KEY is not set — the audit chain is unkeyed.")
         html = views.dashboard(
