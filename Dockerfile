@@ -22,11 +22,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
-# After installing: remove pip, setuptools and wheel (an installer has no
+# Debian security fixes published since the base image was built are applied
+# first. After installing: remove pip, setuptools and wheel (an installer has no
 # business in a runtime image, and pip carried the image's only Python CVEs),
 # and strip setuid/setgid bits so no binary can change identity even if
 # no-new-privileges were ever dropped from the compose file.
-RUN pip install ".[http]" \
+RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
+ && rm -rf /var/lib/apt/lists/* \
+ && pip install ".[http]" \
  && rm -rf /app/src /root/.cache \
  && python -m pip uninstall -y pip setuptools wheel \
  && rm -f /usr/local/bin/pip* \
