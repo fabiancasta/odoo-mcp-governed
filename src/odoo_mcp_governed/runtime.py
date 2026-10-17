@@ -22,6 +22,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from typing import Any
 
 from .config import Settings
@@ -246,6 +247,83 @@ class Runtime:
             self._apply_policy()
             action.count = 1
 
+    # -- undo ----------------------------------------------------------------
+
+    def undo_change(self, change_id: int, *, actor: str) -> dict[str, Any]:
+        """Revert one journalled change on the Odoo it was made on.
+
+        write  → write the old values back
+        create → delete the record that was created
+        unlink → create the record again from its snapshot (it gets a new id)
+        """
+        if self.journal is None:
+            raise UndoError("the change journal is off (CHANGE_JOURNAL=false)")
+        change = self.journal.get(change_id)
+        if change is None:
+            raise UndoError(f"change {change_id} does not exist")
+        if change["undone_at"]:
+            raise UndoError(f"change {change_id} was already undone at {change['undone_at']}")
+        snapshot = self.snapshot()
+        profile = snapshot.profile
+        if change["profile"] != profile.name:
+            raise UndoError(
+                f"change {change_id} was made on profile {change['profile']!r}, but "
+                f"{profile.name!r} is active; activate it first"
+            )
+        if profile.read_only:
+            raise UndoError(f"profile {profile.name!r} is production and read-only")
+
+        client = snapshot.client
+        # Claim first, act second: two clicks racing each other cannot both
+        # reach Odoo. A failed undo releases the claim so it can be retried.
+        if not self.journal.mark_undone(
+            change_id, by=actor, note="undo in progress", at=datetime.now(timezone.utc)
+        ):
+            raise UndoError(f"change {change_id} is already undone or being undone")
+        try:
+            result = self._apply_undo(change, client, actor)
+        except Exception:
+            self.journal.set_undo_note(change_id, None)
+            raise
+        self.journal.set_undo_note(change_id, result["note"])
+        self.cache.clear()
+        return result
+
+    def _apply_undo(self, change: dict[str, Any], client: Any, actor: str) -> dict[str, Any]:
+        model, record_id, operation = change["model"], change["record_id"], change["operation"]
+        change_id = change["id"]
+        detail = {"change_id": change_id, "operation": operation, "model": model}
+        with self.admin_action(actor, "admin.change.undo", detail=detail) as action:
+            action.count = 1
+            action.record_ids = (record_id,)
+            defs = client.execute(model, "fields_get", [], {"attributes": ["type", "readonly"]})
+            result: dict[str, Any] = {"model": model, "record_id": record_id}
+            if operation == "write":
+                values = _restorable(change["before"] or {}, defs, for_create=False)
+                if not values:
+                    raise UndoError("nothing to restore: the old values were not recorded")
+                action.fields = tuple(sorted(values))
+                client.execute(model, "write", [[record_id], values])
+                note = f"restored {', '.join(sorted(values))}"
+            elif operation == "create":
+                client.execute(model, "unlink", [[record_id]])
+                note = "deleted the created record"
+            elif operation == "unlink":
+                values = _restorable(change["before"] or {}, defs, for_create=True)
+                if not values:
+                    raise UndoError("nothing to restore: no snapshot was taken before the delete")
+                action.fields = tuple(sorted(values))
+                created = client.execute(model, "create", [values])
+                new_id = created[0] if isinstance(created, list) else created
+                result["new_id"] = new_id
+                action.record_ids = (record_id, new_id) if isinstance(new_id, int) else (
+                    record_id,)
+                note = f"recreated as id {new_id}"
+            else:
+                raise UndoError(f"cannot undo a {operation!r}")
+        result["note"] = note
+        return result
+
     # -- auditing administrative actions -----------------------------------
 
     def _admin_call(
@@ -292,6 +370,7 @@ class Runtime:
             outcome=Outcome.OK,
             affected_count=action.count,
             latency_ms=int((time.perf_counter() - started) * 1000),
+            record_ids=action.record_ids,
         )
 
     def record_login(self, actor: str, *, success: bool) -> None:
@@ -308,3 +387,32 @@ class Runtime:
 class _AdminAction:
     fields: tuple[str, ...] = ()
     count: int | None = None
+    record_ids: tuple[int, ...] = ()
+
+
+class UndoError(Exception):
+    """An undo that cannot or must not run. The message is for the operator."""
+
+
+def _restorable(values: dict[str, Any], defs: dict[str, Any], *, for_create: bool) -> dict:
+    """Turn values as Odoo *read* them into values Odoo can *write* back.
+
+    A many2one reads as ``[id, name]`` and writes as ``id``; a many2many reads
+    as a list of ids and writes as a replace command. One2many lines belong to
+    their own records and are not restored through the parent. Read-only
+    fields — computed values, create_date — are skipped when recreating.
+    """
+    result: dict[str, Any] = {}
+    for name, value in values.items():
+        meta = defs.get(name) if isinstance(defs, dict) else None
+        kind = (meta or {}).get("type")
+        if kind == "one2many":
+            continue
+        if for_create and (meta is None or meta.get("readonly")):
+            continue
+        if kind == "many2one" and isinstance(value, list):
+            value = value[0] if value else False
+        elif kind == "many2many" and isinstance(value, list):
+            value = [(6, 0, [v for v in value if isinstance(v, int)])]
+        result[name] = value
+    return result

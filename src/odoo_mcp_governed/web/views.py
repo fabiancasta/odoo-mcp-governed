@@ -388,8 +388,25 @@ def _values(value: Any) -> str:
     return f'<pre class="mono">{esc(text)}</pre>'
 
 
+def _undo_cell(c: dict[str, Any], csrf: str) -> str:
+    if c.get("undone_at"):
+        return (f'<span class="chip ok">undone</span><br><small>{esc(c.get("undo_note"))}<br>'
+                f'{esc(str(c["undone_at"])[:19].replace("T", " "))} · {esc(c.get("undone_by"))}'
+                "</small>")
+    what = {"write": "restore old values", "create": "delete the record",
+            "unlink": "recreate the record"}.get(c["operation"], "undo")
+    return (
+        f'<form method="post" action="/admin/changes/undo" class="inline">{csrf_field(csrf)}'
+        f'<input type="hidden" name="change_id" value="{esc(c["id"])}">'
+        '<label class="inline"><input type="checkbox" name="confirm" value="yes" required>'
+        f'<small>{esc(what)}</small></label><button class="danger" type="submit">Undo</button>'
+        "</form>"
+    )
+
+
 def changes_page(*, entries: list[dict[str, Any]], enabled: bool,
-                 filters: dict[str, str]) -> str:
+                 filters: dict[str, str], csrf: str = "", flash: str | None = None,
+                 flash_kind: str = "ok") -> str:
     """The change journal: old and new values, newest first."""
     if not enabled:
         return page("Changes", "<section><h2>Changes</h2><p>The change journal is off "
@@ -400,9 +417,10 @@ def changes_page(*, entries: list[dict[str, Any]], enabled: bool,
         f'<td>{esc(c["actor"])}</td><td>{esc(c["profile"])}</td>'
         f'<td><code>{esc(c["model"])}</code></td><td>{esc(c["operation"])}</td>'
         f'<td class="mono">{esc(c["record_id"])}</td>'
-        f"<td>{_values(c['before'])}</td><td>{_values(c['after'])}</td></tr>"
+        f"<td>{_values(c['before'])}</td><td>{_values(c['after'])}</td>"
+        f"<td>{_undo_cell(c, csrf)}</td></tr>"
         for c in entries
-    ) or "<tr><td colspan=9>No changes recorded.</td></tr>"
+    ) or "<tr><td colspan=10>No changes recorded.</td></tr>"
     body = (
         "<section><h2>Changes</h2><p><small>Old and new values of every create, write "
         "and delete. Credential fields are never stored. <b>#</b> is the audit event "
@@ -413,10 +431,11 @@ def changes_page(*, entries: list[dict[str, Any]], enabled: bool,
         f'<div><label>Rows</label><input type="number" name="limit" min="1" max="2000" value="{esc(filters.get("limit") or 200)}"></div>'
         '</div><p><button type="submit">Filter</button></p></form>'
         '<div class="wrap"><table><tr><th>#</th><th>Time (UTC)</th><th>Actor</th><th>Profile</th>'
-        "<th>Model</th><th>Operation</th><th>Record</th><th>Before</th><th>After</th></tr>"
+        "<th>Model</th><th>Operation</th><th>Record</th><th>Before</th><th>After</th>"
+        "<th></th></tr>"
         + rows + "</table></div></section>"
     )
-    return page("Changes", body)
+    return page("Changes", message(flash, flash_kind) + body)
 
 
 def audit_page(

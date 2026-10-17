@@ -29,10 +29,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 
 from .. import __version__
 from ..governance import ChainStatus, Decision, Operation, Outcome, ToolCall
-from ..odoo import OdooClient
+from ..odoo import OdooClient, OdooError
 from ..profiles import PROFILE_NAME, Profile, ProfileError
 from ..protocol import INVALID_REQUEST, PARSE_ERROR, Dispatcher, _error
-from ..runtime import Runtime
+from ..runtime import Runtime, UndoError
 from ..tools import TOOLS
 from . import views
 from .auth import AdminSessions, AuthError, TokenStore, csrf_matches, password_matches, verify_token
@@ -72,6 +72,8 @@ FLASH = {
     "panic_confirm": ("Tick 'confirm' to resume service.", "bad"),
     "actor_blocked": ("Agent blocked. Its next call is refused.", "ok"),
     "actor_unblocked": ("Agent unblocked.", "ok"),
+    "undone": ("Change undone. The undo is in the audit log.", "ok"),
+    "undo_confirm": ("Tick the box next to Undo to confirm.", "bad"),
     "csrf": ("Form expired. Please try again.", "bad"),
 }
 
@@ -662,18 +664,46 @@ def create_app(runtime: Runtime) -> FastAPI:
 
     @app.get("/admin/changes", response_class=HTMLResponse)
     async def changes_view(request: Request, model: str = "", record_id: str = "",
-                           limit: int = 200):
-        if session_for(request) is None:
+                           limit: int = 200, m: str | None = None, e: str | None = None):
+        session = session_for(request)
+        if session is None:
             return RedirectResponse("/admin", status_code=303)
         rid = int(record_id) if record_id.isdigit() else None
         journal = runtime.journal
         entries = [] if journal is None else await run_in_threadpool(
             journal.search, model=model or None, record_id=rid, limit=max(1, min(limit, 2000))
         )
+        flash, kind = FLASH.get(m or "", (None, "ok"))
+        if e:
+            flash, kind = e[:300], "bad"
         return HTMLResponse(views.changes_page(
             entries=entries, enabled=journal is not None,
             filters={"model": model, "record_id": record_id, "limit": str(limit)},
+            csrf=session.csrf, flash=flash, flash_kind=kind,
         ))
+
+    @app.post("/admin/changes/undo")
+    async def changes_undo(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf", "/admin/changes")
+        if form.get("confirm") != "yes":
+            return back("undo_confirm", "/admin/changes")
+        raw = str(form.get("change_id") or "")
+        if not raw.isdigit():
+            return back("undo_confirm", "/admin/changes")
+        try:
+            await run_in_threadpool(runtime.undo_change, int(raw), actor=admin_actor(request))
+        except UndoError as exc:
+            return RedirectResponse(f"/admin/changes?{urlencode({'e': str(exc)})}",
+                                    status_code=303)
+        except OdooError as exc:
+            return RedirectResponse(
+                f"/admin/changes?{urlencode({'e': f'Odoo refused the undo: {exc.kind}'})}",
+                status_code=303)
+        return back("undone", "/admin/changes")
 
     @app.post("/admin/audit/anchor")
     async def audit_anchor(request: Request):
