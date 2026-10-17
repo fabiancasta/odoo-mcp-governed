@@ -96,6 +96,9 @@ earlier deployment did not have.
 | Requirement | Implementation |
 |---|---|
 | Docker bypasses UFW; restrict via `DOCKER-USER` | `deploy/firewall-docker.sh`, matching on the original published port so other containers listening on the same internal port are unaffected |
+| **beyond:** egress limited to Odoo — no internet, no LAN, no other host services | `deploy/egress-docker.sh` (`DOCKER-USER` for forwarded traffic, `INPUT` for the Docker host itself; `--dry-run` prints the rules) |
+| **beyond:** `/mcp` rejects foreign `Origin` headers (DNS rebinding) | `MCP_ALLOWED_ORIGINS`; localhost and `MCP_PUBLIC_URL` are accepted, clients without `Origin` are unaffected |
+| **beyond:** rate limit per actor, batches capped and counted per message | `RATE_LIMIT_MCP`, `RATE_LIMIT_MCP_IP`, `RATE_LIMIT_AUTH_FAIL`, `MCP_MAX_BATCH` |
 
 ## Admin-managed policy
 

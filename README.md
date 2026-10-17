@@ -221,14 +221,19 @@ data, so there are two independent guards:
 `/docs` and the OpenAPI schema are not served. Bodies are capped by counting
 bytes, so chunked uploads are capped too. 500s carry no detail. Security
 headers on every response, HSTS in HTTPS mode. `Mcp-Session-Id` is validated,
-never reflected. Rate limits per client IP on `/mcp`, `/health` and login,
-with `X-Forwarded-For` honoured only from configured proxies. Credentials and
+never reflected. `/mcp` is rate-limited per actor, with a per-IP ceiling
+before authentication and a separate limit on failed authentications; batches
+are capped and every message in one counts. A foreign `Origin` header is
+refused (DNS rebinding). `/health` and login are limited per client IP, with
+`X-Forwarded-For` honoured only from configured proxies. Credentials and
 the audit database are written `0600` from the first byte, atomically. TLS to
 Odoo is verified by default. The container runs as a non-root UID on a
 read-only root filesystem with all capabilities dropped, `no-new-privileges`,
 memory/CPU/PID limits and its own network, publishing on `127.0.0.1` only. For
 publishing beyond localhost, `deploy/firewall-docker.sh` restricts the port
-through the `DOCKER-USER` chain, since Docker bypasses UFW.
+through the `DOCKER-USER` chain, since Docker bypasses UFW, and
+`deploy/egress-docker.sh` stops the container from opening connections to
+anything but Odoo — not the internet, not the LAN, not a database on the host.
 
 Full mapping, item by item: [`docs/SECURITY_BASELINE.md`](docs/SECURITY_BASELINE.md).
 
