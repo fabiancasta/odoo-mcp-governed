@@ -34,8 +34,10 @@ from ..profiles import PROFILE_NAME, Profile, ProfileError
 from ..protocol import INVALID_REQUEST, PARSE_ERROR, Dispatcher, _error
 from ..runtime import Runtime, UndoError
 from ..tools import TOOLS
+from ..tuning import LIMITS, TuningError
 from . import views
 from .auth import AdminSessions, AuthError, TokenStore, csrf_matches, password_matches, verify_token
+from .metrics import summarise
 from .ratelimit import RateLimiter
 
 log = logging.getLogger(__name__)
@@ -51,7 +53,8 @@ BASE_HEADERS = {
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
 }
 ADMIN_CSP = (
-    "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; "
+    "default-src 'none'; script-src 'self'; connect-src 'self'; "
+    "style-src 'unsafe-inline'; img-src 'self' data:; "
     "form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
 )
 API_CSP = "default-src 'none'; frame-ancestors 'none'"
@@ -73,6 +76,7 @@ FLASH = {
     "actor_blocked": ("Agent blocked. Its next call is refused.", "ok"),
     "actor_unblocked": ("Agent unblocked.", "ok"),
     "undone": ("Change undone. The undo is in the audit log.", "ok"),
+    "tuning_applied": ("Thresholds applied to the next call.", "ok"),
     "undo_confirm": ("Tick the box next to Undo to confirm.", "bad"),
     "csrf": ("Form expired. Please try again.", "bad"),
 }
@@ -408,6 +412,7 @@ def create_app(runtime: Runtime) -> FastAPI:
             odoo_ok = OdooClient(snap.url, snap.database, snap.username, "",
                                  ssl_verify=snap.ssl_verify, timeout=3).ping()
         warnings = runtime.engine.policy.config.validate()
+        agents = _agents(runtime)
         if odoo_ok:
             try:
                 access = runtime.snapshot().settings_access()
@@ -436,7 +441,11 @@ def create_app(runtime: Runtime) -> FastAPI:
             flash=flash,
             flash_kind=kind,
             panic=runtime.engine.policy.config.panic,
-            agents=_agents(runtime),
+            agents=agents,
+            summary=_summary(runtime),
+            max_risk=max((a[1] for a in agents), default=0),
+            tuning=runtime.tuning.values,
+            tuning_source=runtime.tuning.source,
         )
         return HTMLResponse(html, status_code=status_code)
 
@@ -534,6 +543,42 @@ def create_app(runtime: Runtime) -> FastAPI:
         except ProfileError as exc:
             return await dashboard_error(session, str(exc))
         return back("profile_deleted")
+
+    # -- admin: live dashboard ---------------------------------------------
+
+    @app.get("/static/panel.js")
+    async def panel_js() -> Response:
+        return Response(views.PANEL_JS, media_type="application/javascript",
+                        headers={"Cache-Control": "no-cache"})
+
+    @app.get("/admin/live", response_class=HTMLResponse)
+    async def live_fragment(request: Request):
+        if session_for(request) is None:
+            return RedirectResponse("/admin", status_code=303)
+
+        def build() -> str:
+            agents = _agents(runtime)
+            return views.charts_fragment(
+                _summary(runtime), max_risk=max((a[1] for a in agents), default=0)
+            )
+
+        return HTMLResponse(await run_in_threadpool(build),
+                            headers={"Cache-Control": "no-store"})
+
+    @app.post("/admin/tuning")
+    async def tuning_update(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf")
+        values = {k: form.get(k) for k in LIMITS}
+        try:
+            changed = await run_in_threadpool(runtime.update_tuning, values,
+                                              actor=admin_actor(request))
+        except TuningError as exc:
+            return await dashboard_error(session, f"Thresholds not applied: {exc}")
+        return back("tuning_applied" if changed else "policy_unchanged")
 
     # -- admin: emergency controls ----------------------------------------
 
@@ -717,6 +762,15 @@ def create_app(runtime: Runtime) -> FastAPI:
         return back("anchor_written", "/admin/logs")
 
     return app
+
+
+def _summary(runtime: Runtime) -> dict[str, Any]:
+    from datetime import timedelta
+
+    from ..governance.events import utcnow
+
+    now = utcnow()
+    return summarise(runtime.audit.since(now - timedelta(hours=24)), now=now)
 
 
 def _agents(runtime: Runtime) -> list[tuple[str, int, int, bool]]:

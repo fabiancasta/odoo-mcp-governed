@@ -66,7 +66,146 @@ tr.flag td{background:color-mix(in srgb,var(--warn) 8%,transparent)}
 .meter{display:inline-block;width:90px;height:8px;border-radius:4px;background:var(--chip);
 vertical-align:middle;overflow:hidden}.meter span{display:block;height:100%}
 .meter .ok{background:var(--ok)}.meter .warn{background:var(--warn)}.meter .bad{background:var(--bad)}
+.charts{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);gap:18px;margin-top:12px}
+@media (max-width:820px){.charts{grid-template-columns:1fr}}
+.chart{width:100%;height:auto}.chart text{font-size:10px;fill:var(--mute)}
+.chart rect.ok{fill:var(--ok)}.chart rect.warn{fill:var(--warn)}.chart rect.bad{fill:var(--bad)}
+.hbar{display:grid;grid-template-columns:92px 1fr 36px;gap:8px;align-items:center;margin:4px 0;font-size:12px}
+.hbar .track{height:10px;background:var(--chip);border-radius:5px;overflow:hidden}
+.hbar .track span{display:block;height:100%}.hbar b{text-align:right}
+table.compact td{padding:3px 6px}
+.console{display:flex;gap:10px;flex-wrap:wrap;justify-content:space-around;padding:12px 4px;
+background:var(--chip);border-radius:10px}
+.fader{display:flex;flex-direction:column;align-items:center;gap:6px;width:96px;text-align:center}
+.fader input{writing-mode:vertical-lr;direction:rtl;height:150px;width:26px;accent-color:var(--acc)}
+.fader output{font-size:18px;font-weight:600;font-variant-numeric:tabular-nums}
+.fader b{font-size:12px}.fader small{color:var(--mute);font-size:11px}
 """
+
+
+# The panel's only script, served from /static/panel.js under
+# ``script-src 'self'``. It is a convenience layer: it refreshes the live
+# charts and shows fader values as they move. Every control is a plain form
+# and works without it — above all the panic switch.
+PANEL_JS = """(function () {
+  "use strict";
+  function bindFaders(root) {
+    root.querySelectorAll("input[type=range][data-out]").forEach(function (fader) {
+      var out = document.getElementById(fader.getAttribute("data-out"));
+      if (!out) return;
+      fader.addEventListener("input", function () { out.textContent = fader.value; });
+    });
+  }
+  document.addEventListener("DOMContentLoaded", function () {
+    bindFaders(document);
+    var live = document.getElementById("live");
+    if (!live) return;
+    var stamp = document.getElementById("live-stamp");
+    setInterval(function () {
+      fetch("/admin/live", { credentials: "same-origin", cache: "no-store" })
+        .then(function (r) { return r.ok ? r.text() : null; })
+        .then(function (html) {
+          if (html === null) return;
+          live.innerHTML = html;
+          if (stamp) stamp.textContent = "updated " + new Date().toLocaleTimeString();
+        })
+        .catch(function () {});
+    }, 10000);
+  });
+})();
+"""
+
+CATEGORY_COLORS = {
+    "denylist": "#d0453a", "sensitive": "#8a5cd1", "risk": "#c27d0e", "operator": "#b42318",
+    "production": "#2f5bd3", "methods": "#c2410c", "not allowed": "#64748b", "auth": "#0e7490",
+    "volume": "#a16207", "other": "#94a3b8",
+}
+
+
+def _hourly_chart(hours: list[dict[str, Any]]) -> str:
+    width, height, pad = 720, 150, 22
+    peak = max((h["allowed"] + h["flagged"] + h["denied"] for h in hours), default=0) or 1
+    slot = (width - 8) / max(len(hours), 1)
+    bars, labels = [], []
+    for i, h in enumerate(hours):
+        x = 4 + i * slot
+        y = height - pad
+        for key, cls in (("allowed", "ok"), ("flagged", "warn"), ("denied", "bad")):
+            size = (h[key] / peak) * (height - pad - 8)
+            if size <= 0:
+                continue
+            y -= size
+            bars.append(
+                f'<rect class="{cls}" x="{x + 1:.1f}" y="{y:.1f}" width="{slot - 2:.1f}" '
+                f'height="{size:.1f}" rx="2"><title>{esc(h["start"].strftime("%H:00"))} · '
+                f'{esc(key)} {h[key]}</title></rect>'
+            )
+        if i % 3 == 0:
+            labels.append(
+                f'<text x="{x + slot / 2:.1f}" y="{height - 6}" text-anchor="middle">'
+                f'{esc(h["start"].strftime("%H"))}</text>'
+            )
+    return (
+        f'<svg class="chart" viewBox="0 0 {width} {height}" role="img" '
+        'aria-label="Agent calls per hour, last 24 hours">'
+        + "".join(bars) + "".join(labels) + "</svg>"
+    )
+
+
+def charts_fragment(summary: dict[str, Any], *, max_risk: int) -> str:
+    """The part of the dashboard the script refreshes every ten seconds."""
+    categories = summary["by_category"]
+    top = max(categories.values(), default=0) or 1
+    category_rows = "".join(
+        f'<div class="hbar"><span class="lbl">{esc(name)}</span><span class="track">'
+        f'<span style="width:{count / top * 100:.0f}%;background:{CATEGORY_COLORS.get(name, "#94a3b8")}">'
+        f'</span></span><b>{count}</b></div>'
+        for name, count in categories.items()
+    ) or '<p><small class="ok">No blocked attempts in the last 24 hours.</small></p>'
+    models = "".join(
+        f"<tr><td><code>{esc(m)}</code></td><td>{n}</td></tr>" for m, n in summary["top_models"]
+    ) or "<tr><td colspan=2><small>No activity.</small></td></tr>"
+    risk_cls = "bad" if max_risk >= 70 else "warn" if max_risk >= 40 else "ok"
+    return (
+        '<div class="grid">'
+        f'<div class="stat"><small>Agent calls (24h)</small><strong>{summary["total"]}</strong></div>'
+        f'<div class="stat"><small>Blocked (24h)</small><strong class="{"bad" if summary["denied"] else "ok"}">'
+        f'{summary["denied"]}</strong></div>'
+        f'<div class="stat"><small>Flagged or throttled</small><strong class="{"warn" if summary["flagged"] else "ok"}">'
+        f'{summary["flagged"]}</strong></div>'
+        f'<div class="stat"><small>Highest agent risk now</small><strong class="{risk_cls}">{max_risk}</strong></div>'
+        "</div>"
+        '<div class="charts"><div><h3>Calls per hour — <span class="ok">allowed</span> · '
+        '<span class="warn">flagged</span> · <span class="bad">blocked</span></h3>'
+        f"{_hourly_chart(summary['hours'])}</div>"
+        f"<div><h3>Blocked attempts by kind</h3>{category_rows}"
+        f'<h3>Most used models</h3><table class="compact">{models}</table></div></div>'
+    )
+
+
+def console_section(*, csrf: str, tuning: dict[str, int], source: str) -> str:
+    faders = (
+        ("risk_throttle_threshold", "Throttle at", 5, 100, 1, "risk score"),
+        ("risk_block_threshold", "Block at", 10, 100, 1, "risk score"),
+        ("delete_burst_threshold", "Delete burst", 1, 20, 1, "deletes / min"),
+        ("rate_threshold", "Call rate", 10, 600, 10, "calls / min"),
+        ("half_life_minutes", "Memory", 1, 120, 1, "half-life, min"),
+    )
+    columns = "".join(
+        f'<div class="fader"><output id="out-{name}">{tuning[name]}</output>'
+        f'<input type="range" name="{name}" min="{low}" max="{max(high, tuning[name])}" '
+        f'step="{step}" value="{tuning[name]}" data-out="out-{name}" aria-label="{esc(label)}">'
+        f"<b>{esc(label)}</b><small>{esc(unit)}</small></div>"
+        for name, label, low, high, step, unit in faders
+    )
+    return (
+        "<section><h2>Threshold console</h2><p><small>Applies to the next call, survives "
+        f'restarts and is sealed into the audit log. Source: <span class="chip">{esc(source)}</span>'
+        "</small></p>"
+        f'<form method="post" action="/admin/tuning">{csrf_field(csrf)}'
+        f'<div class="console">{columns}</div>'
+        '<p><button type="submit">Apply thresholds</button></p></form></section>'
+    )
 
 
 def esc(value: Any) -> str:
@@ -89,7 +228,8 @@ def page(title: str, body: str, *, nav: bool = True) -> str:
     return (
         "<!doctype html><html lang=en><head><meta charset=utf-8>"
         '<meta name=viewport content="width=device-width,initial-scale=1">'
-        f"<title>{esc(title)} · odoo-mcp-governed</title><style>{STYLE}</style></head><body>"
+        f"<title>{esc(title)} · odoo-mcp-governed</title><style>{STYLE}</style>"
+        '<script src="/static/panel.js" defer></script></head><body>'
         f"<header><div><b>odoo-mcp-governed</b></div>{links}{logout}</header>"
         f"<main>{body}</main></body></html>"
     )
@@ -138,6 +278,10 @@ def dashboard(
     flash_kind: str,
     panic: bool = False,
     agents: list[tuple[str, int, int, bool]] | None = None,
+    summary: dict[str, Any] | None = None,
+    max_risk: int = 0,
+    tuning: dict[str, int] | None = None,
+    tuning_source: str = ".env",
 ) -> str:
     odoo_badge = (
         '<strong class="ok">reachable</strong>' if odoo_ok
@@ -174,6 +318,14 @@ def dashboard(
             '<button class="panic-btn" type="submit">⛔ Panic: stop every agent</button>'
             "</form></div></section>"
         )
+
+    live_section = (
+        '<section><div class="spread"><h2>Live activity — last 24 hours</h2>'
+        '<small id="live-stamp" class="chip">refreshes every 10 s</small></div>'
+        f'<div id="live">{charts_fragment(summary, max_risk=max_risk)}</div></section>'
+        if summary is not None else ""
+    )
+    console = console_section(csrf=csrf, tuning=tuning, source=tuning_source) if tuning else ""
 
     agent_rows = []
     for actor, score, count, is_blocked in agents or []:
@@ -317,8 +469,8 @@ def dashboard(
     )
     return page(
         "Dashboard",
-        message(flash, flash_kind) + emergency + status + agents_section + profiles_section
-        + policy_section,
+        message(flash, flash_kind) + emergency + status + live_section + agents_section
+        + console + profiles_section + policy_section,
     )
 
 

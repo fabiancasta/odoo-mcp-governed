@@ -22,7 +22,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .config import Settings
@@ -38,10 +38,13 @@ from .governance import (
     ToolCall,
     digest_args,
 )
+from .governance.detectors import DetectorConfig
+from .governance.engine import RiskScorer
 from .journal import ChangeJournal
 from .odoo import OdooClient, TTLCache
 from .policy_store import PolicyStore, policy_from_settings
 from .profiles import Profile, ProfileError, ProfileStore
+from .tuning import TuningStore
 
 log = logging.getLogger(__name__)
 
@@ -122,11 +125,19 @@ class Runtime:
         self._privileged_lock = threading.Lock()
         self.audit = AuditLog(AuditStore(settings.audit_db), hmac_key=settings.hmac_key())
         self.journal = ChangeJournal(settings.journal_db) if settings.change_journal else None
+        base_risk, base_detectors = settings.risk_config(), DetectorConfig()
+        self.tuning = TuningStore(settings.data_dir / "tuning.json", {
+            "risk_throttle_threshold": base_risk.throttle_threshold,
+            "risk_block_threshold": base_risk.block_threshold,
+            "delete_burst_threshold": base_detectors.delete_burst_threshold,
+            "rate_threshold": base_detectors.rate_threshold,
+            "half_life_minutes": int(base_risk.half_life.total_seconds() // 60),
+        })
         self.engine = GovernanceEngine(
             self.audit,
             PolicyEngine(self._effective_policy(self.policy_store.config)),
-            detector_config=settings.detector_config(),
-            risk_config=settings.risk_config(),
+            detector_config=self._tuned_detectors(),
+            risk_config=self._tuned_risk(),
         )
         self.cache = TTLCache(
             ttl=settings.cache_ttl,
@@ -223,6 +234,37 @@ class Runtime:
         for warning in config.validate():
             log.warning("policy: %s", warning)
         return config, changed
+
+    # -- live thresholds (the console) ---------------------------------------
+
+    def _tuned_risk(self):
+        v = self.tuning.values
+        return replace(
+            self.settings.risk_config(),
+            throttle_threshold=v["risk_throttle_threshold"],
+            block_threshold=v["risk_block_threshold"],
+            half_life=timedelta(minutes=v["half_life_minutes"]),
+        )
+
+    def _tuned_detectors(self) -> DetectorConfig:
+        v = self.tuning.values
+        return replace(
+            self.settings.detector_config(),
+            delete_burst_threshold=v["delete_burst_threshold"],
+            rate_threshold=v["rate_threshold"],
+        )
+
+    def update_tuning(self, values: dict[str, Any], *, actor: str) -> list[str]:
+        """Move the console's faders. Applies to the next call, persists, and
+        is audited with the names of what changed."""
+        with self.admin_action(actor, "admin.tuning.update", detail=values) as action:
+            changed = self.tuning.update(values)
+            # Attribute swaps: a call in progress finishes on the old values.
+            self.engine.risk = RiskScorer(self._tuned_risk())
+            self.engine.detector_config = self._tuned_detectors()
+            action.fields = tuple(changed)
+            action.count = len(changed)
+        return changed
 
     # -- emergency controls ------------------------------------------------
 

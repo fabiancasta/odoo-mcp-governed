@@ -254,9 +254,10 @@ class TestHardening:
         assert headers["cache-control"] == "no-store"
         assert "content-security-policy" in headers
 
-    def test_admin_pages_allow_no_script(self, client) -> None:
+    def test_admin_pages_allow_only_their_own_script(self, client) -> None:
         csp = client.get("/admin").headers["content-security-policy"]
-        assert "script-src" not in csp and "default-src 'none'" in csp
+        assert "script-src 'self';" in csp and "default-src 'none'" in csp
+        assert "unsafe-inline" not in csp.split("script-src")[1].split(";")[0]
 
     def test_hsts_only_in_https_mode(self, tmp_path) -> None:
         plain = TestClient(create_app(Runtime(make_settings(tmp_path / "a"))))
