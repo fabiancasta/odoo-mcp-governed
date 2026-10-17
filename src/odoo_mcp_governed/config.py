@@ -69,7 +69,11 @@ class Settings(BaseSettings):
     to make pointing at production impossible rather than merely unlikely."""
 
     # --- HTTP transport ---
-    mcp_host: str = "0.0.0.0"
+    mcp_host: str = "127.0.0.1"
+    """Loopback by default, so running outside Docker never exposes the server
+    to the LAN by accident. The container image sets 0.0.0.0, because inside a
+    container loopback is unreachable and the port is published on the host's
+    loopback by docker-compose instead."""
     mcp_port: int = 8000
     mcp_public_url: str = ""
     https_mode: bool = False
@@ -79,6 +83,15 @@ class Settings(BaseSettings):
     its own rate-limit bucket."""
 
     max_body_mb: float = 25.0
+
+    mcp_allowed_origins: ModelSet = frozenset()
+    """Browser origins allowed to call /mcp, on top of localhost and the origin
+    of MCP_PUBLIC_URL. Requests without an Origin header (CLI and desktop
+    clients) are unaffected; this stops a web page from reaching the server
+    through DNS rebinding."""
+
+    mcp_max_batch: int = 10
+    """Most messages accepted in one JSON-RPC batch."""
 
     jwt_secret: str = Field(
         default="", validation_alias=AliasChoices("jwt_secret", "mcp_jwt_secret")
@@ -93,7 +106,13 @@ class Settings(BaseSettings):
     admin_password: str = ""
     admin_session_hours: float = 8.0
 
-    rate_limit_mcp: str = "60/minute"
+    rate_limit_mcp: str = "120/minute"
+    """Per actor (token subject), and every message in a batch counts."""
+    rate_limit_mcp_ip: str = "600/minute"
+    """Per client IP, before authentication — the ceiling for everything
+    behind one address, such as all containers on a Docker bridge."""
+    rate_limit_auth_fail: str = "10/minute"
+    """Failed MCP authentications per IP before that IP is refused outright."""
     rate_limit_health: str = "30/minute"
     rate_limit_login: str = "5/minute"
 
@@ -148,6 +167,7 @@ class Settings(BaseSettings):
         "execute_method_allowlist",
         "sensitive_fields",
         "protected_hosts",
+        "mcp_allowed_origins",
         mode="before",
     )
     @classmethod

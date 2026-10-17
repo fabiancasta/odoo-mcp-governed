@@ -31,8 +31,12 @@ class RateLimiter:
         self._hits: dict[str, deque[float]] = {}
         self._lock = threading.Lock()
 
-    def hit(self, key: str) -> tuple[bool, int]:
-        """Record a request. Returns ``(allowed, retry_after_seconds)``."""
+    def hit(self, key: str, cost: int = 1) -> tuple[bool, int]:
+        """Record ``cost`` requests at once. Returns ``(allowed, retry_after)``.
+
+        All or nothing: a batch that does not fit in what is left is refused
+        whole, rather than half-run.
+        """
         now = time.monotonic()
         cutoff = now - self.window
         with self._lock:
@@ -43,10 +47,24 @@ class RateLimiter:
                 hits = self._hits[key] = deque()
             while hits and hits[0] <= cutoff:
                 hits.popleft()
-            if len(hits) >= self.limit:
-                return False, max(1, int(hits[0] + self.window - now) + 1)
-            hits.append(now)
+            if len(hits) + cost > self.limit:
+                return False, self._retry(hits, now)
+            hits.extend([now] * cost)
             return True, 0
+
+    def exhausted(self, key: str) -> int:
+        """Seconds until ``key`` may try again, or 0 — without recording a hit."""
+        now = time.monotonic()
+        with self._lock:
+            hits = self._hits.get(key)
+            if not hits:
+                return 0
+            while hits and hits[0] <= now - self.window:
+                hits.popleft()
+            return self._retry(hits, now) if len(hits) >= self.limit else 0
+
+    def _retry(self, hits: deque[float], now: float) -> int:
+        return max(1, int(hits[0] + self.window - now) + 1) if hits else 1
 
     def _evict(self, cutoff: float) -> None:
         # Bounded memory under a flood of distinct IPs: drop idle keys first,

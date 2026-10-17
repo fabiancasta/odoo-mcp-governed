@@ -21,7 +21,7 @@ import re
 import secrets
 import time
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
@@ -31,7 +31,7 @@ from .. import __version__
 from ..governance import ChainStatus, Decision, Operation, Outcome, ToolCall
 from ..odoo import OdooClient
 from ..profiles import PROFILE_NAME, Profile, ProfileError
-from ..protocol import PARSE_ERROR, Dispatcher, _error
+from ..protocol import INVALID_REQUEST, PARSE_ERROR, Dispatcher, _error
 from ..runtime import Runtime
 from ..tools import TOOLS
 from . import views
@@ -140,6 +140,8 @@ def create_app(runtime: Runtime) -> FastAPI:
     tokens = TokenStore(settings)
     limits = {
         "mcp": RateLimiter(settings.rate_limit_mcp),
+        "mcp_ip": RateLimiter(settings.rate_limit_mcp_ip),
+        "auth_fail": RateLimiter(settings.rate_limit_auth_fail),
         "health": RateLimiter(settings.rate_limit_health),
         "login": RateLimiter(settings.rate_limit_login),
     }
@@ -171,13 +173,37 @@ def create_app(runtime: Runtime) -> FastAPI:
     def client_ip(request: Request) -> str:
         return request.client.host if request.client else "unknown"
 
-    def limited(bucket: str, request: Request) -> Response | None:
-        allowed, retry = limits[bucket].hit(client_ip(request))
-        if allowed:
-            return None
+    def too_many(retry: int) -> Response:
         return JSONResponse(
             {"error": "rate limit exceeded"}, status_code=429, headers={"Retry-After": str(retry)}
         )
+
+    def limited(bucket: str, request: Request, key: str | None = None,
+                cost: int = 1) -> Response | None:
+        allowed, retry = limits[bucket].hit(key or client_ip(request), cost)
+        return None if allowed else too_many(retry)
+
+    def origin_of(url: str) -> str:
+        parts = urlsplit(url.strip())
+        return f"{parts.scheme}://{parts.netloc}".lower() if parts.scheme else ""
+
+    trusted_origins = {origin_of(o) for o in settings.mcp_allowed_origins} - {""}
+    if settings.mcp_public_url:
+        trusted_origins.add(origin_of(settings.mcp_public_url))
+
+    def origin_allowed(origin: str | None) -> bool:
+        """The DNS-rebinding check the MCP specification asks for.
+
+        A browser always says where a request came from; a web page that got
+        its hostname to resolve to 127.0.0.1 still sends its own Origin. CLI
+        and desktop clients send none, and are not what this defends against.
+        """
+        if origin is None:
+            return True
+        if origin_of(origin) in trusted_origins:
+            return True
+        host = urlsplit(origin).hostname or ""
+        return host in ("localhost", "127.0.0.1", "::1")
 
     def chain_status(force: bool = False) -> ChainStatus:
         # Full verification is linear in the log size; the dashboard refreshes
@@ -210,9 +236,15 @@ def create_app(runtime: Runtime) -> FastAPI:
     # -- MCP ---------------------------------------------------------------
 
     async def mcp_endpoint(request: Request) -> Response:
-        if (blocked := limited("mcp", request)) is not None:
+        if (blocked := limited("mcp_ip", request)) is not None:
             return blocked
         ip = client_ip(request)
+        if not origin_allowed(request.headers.get("origin")):
+            return JSONResponse({"error": "origin not allowed"}, status_code=403)
+        # Checked before verifying, so a stream of bad tokens stops costing
+        # anything once it is clearly not a typo.
+        if retry := limits["auth_fail"].exhausted(ip):
+            return too_many(retry)
 
         header = request.headers.get("authorization", "")
         scheme, _, token = header.partition(" ")
@@ -221,6 +253,7 @@ def create_app(runtime: Runtime) -> FastAPI:
                 raise AuthError("missing bearer token")
             claims = verify_token(settings, token.strip())
         except AuthError as exc:
+            limits["auth_fail"].hit(ip)
             # Failed authentication is recorded: a stream of them is a
             # credential-stuffing attempt, and the audit log should show it.
             runtime.audit.record(
@@ -249,9 +282,21 @@ def create_app(runtime: Runtime) -> FastAPI:
         except (ValueError, UnicodeDecodeError):
             return JSONResponse(_error(None, PARSE_ERROR, "parse error"), status_code=400)
 
+        messages = payload if isinstance(payload, list) else [payload]
+        if len(messages) > settings.mcp_max_batch:
+            return JSONResponse(
+                _error(None, INVALID_REQUEST,
+                       f"batch of {len(messages)} exceeds the limit of {settings.mcp_max_batch}"),
+                status_code=400,
+            )
+        # Per actor, not per IP: every client behind a Docker bridge or a
+        # proxy shares one address. Each message in a batch is one request.
+        blocked = limited("mcp", request, key=f"actor:{actor}", cost=max(len(messages), 1))
+        if blocked is not None:
+            return blocked
+
         result = await run_in_threadpool(dispatcher.handle_payload, payload, actor)
         headers: dict[str, str] = {}
-        messages = payload if isinstance(payload, list) else [payload]
         if any(isinstance(m, dict) and m.get("method") == "initialize" for m in messages):
             headers["Mcp-Session-Id"] = secrets.token_urlsafe(24)
         if result is None:
