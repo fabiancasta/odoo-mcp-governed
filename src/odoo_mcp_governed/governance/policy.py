@@ -197,6 +197,13 @@ class PolicyConfig:
     whatever the model lists say. Derived from the profiles themselves
     (production without ``allow_writes``), not edited as policy."""
 
+    approval_required: frozenset[str] = frozenset()
+    """Operations that wait for a human: any of ``delete``, ``bulk`` (create,
+    write or delete above ``approval_bulk_threshold`` records) and
+    ``execute``. Empty switches approvals off."""
+
+    approval_bulk_threshold: int = 20
+
     panic: bool = False
     """The operator's emergency stop: every call is refused, introspection
     included, until a human resumes. Checked before anything else."""

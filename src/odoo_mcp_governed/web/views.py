@@ -270,6 +270,57 @@ def permissions_page(
     return page("Permissions", message(flash, flash_kind) + body)
 
 
+def _status_cls(r: dict) -> str:
+    return "bad" if r.get("status") == "denied" else "ok"
+
+
+def approvals_page(*, csrf: str, pending: list[dict], recent: list[dict], enabled: bool,
+                   notifier: bool, ttl_minutes: int, flash: str | None,
+                   flash_kind: str = "ok") -> str:
+    def target(r: dict) -> str:
+        count = f" · {esc(r['record_count'])} records" if r.get("record_count") else ""
+        return f"<code>{esc(r['tool'])}</code> on <code>{esc(r.get('model') or '-')}</code>{count}"
+
+    rows = "".join(
+        f'<tr class="flag"><td class="mono">#{esc(r["id"])}</td>'
+        f'<td class="mono">{esc(r["created_at"][:19].replace("T", " "))}</td>'
+        f'<td><code>{esc(r["actor"])}</code></td><td>{esc(r["profile"])}</td><td>{target(r)}</td>'
+        f'<td><form method="post" action="/admin/approvals/decide" class="inline">'
+        f'{csrf_field(csrf)}<input type="hidden" name="id" value="{esc(r["id"])}">'
+        '<button name="decision" value="approve" type="submit">Approve</button> '
+        '<button class="danger" name="decision" value="deny" type="submit">Deny</button>'
+        "</form></td></tr>"
+        for r in pending
+    ) or "<tr><td colspan=6>Nothing is waiting for you.</td></tr>"
+    history = "".join(
+        f'<tr><td class="mono">#{esc(r["id"])}</td><td><code>{esc(r["actor"])}</code></td>'
+        f"<td>{target(r)}</td><td><span class='chip {_status_cls(r)}'>"
+        f'{esc(r["status"])}</span></td><td>{esc(r.get("decided_by") or "")}</td></tr>'
+        for r in recent
+    ) or "<tr><td colspan=5>No decisions yet.</td></tr>"
+    state = (
+        "<p class=\"msg warn\">Approvals are off. Turn them on under <a href=\"/admin\">Access "
+        "policy</a> → Human approval.</p>" if not enabled else ""
+    )
+    channel = (
+        "" if notifier else
+        "<p><small>No notification channel is configured: set APPROVAL_WEBHOOK_URL or "
+        "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to be told when an agent is waiting."
+        "</small></p>"
+    )
+    body = (
+        f"<section><h2>Waiting for approval</h2>{state}{channel}<p><small>Approving lets the "
+        f"agent repeat that exact call once within {ttl_minutes} minutes. Decisions are sealed "
+        "into the audit log.</small></p>"
+        '<div class="wrap"><table><tr><th>#</th><th>Requested (UTC)</th><th>Agent</th>'
+        f"<th>Profile</th><th>Wants to</th><th></th></tr>{rows}</table></div></section>"
+        "<section><h2>Recent decisions</h2><div class=\"wrap\"><table><tr><th>#</th>"
+        f"<th>Agent</th><th>Call</th><th>Status</th><th>By</th></tr>{history}</table></div>"
+        "</section>"
+    )
+    return page("Approvals", message(flash, flash_kind) + body)
+
+
 def console_section(*, csrf: str, tuning: dict[str, int], source: str) -> str:
     faders = (
         ("risk_throttle_threshold", "Throttle at", 5, 100, 1, "risk score"),
@@ -303,6 +354,7 @@ def page(title: str, body: str, *, nav: bool = True) -> str:
     links = (
         '<nav><a href="/admin">Dashboard</a><a href="/admin/logs">Audit log</a>'
         '<a href="/admin/changes">Changes</a><a href="/admin/permissions">Permissions</a>'
+        '<a href="/admin/approvals">Approvals</a>'
         '<a href="/token">Token</a></nav>'
         if nav
         else ""
@@ -552,7 +604,20 @@ def dashboard(
         + f'min="1" max="100000" value="{esc(policy["max_records_per_call"])}"></div>'
         + area("execute_method_allowlist", "Allowed methods", "empty = any non-blocked")
         + area("forbidden_methods", "Extra forbidden methods", "on top of the built-in list")
-        + '</div><h3>Sensitive fields — never read, written or filtered on</h3>'
+        + '</div><h3>Human approval</h3><p><small>Held calls wait in '
+        + '<a href="/admin/approvals">Approvals</a>; the agent repeats the call once approved.'
+        + "</small></p><div class=\"row\"><div>"
+        + "".join(
+            f'<label class="inline"><input type="checkbox" name="approval_required" value="{k}" '
+            f'{"checked" if k in policy["approval_required"] else ""}> {label}</label><br>'
+            for k, label in (("delete", "every delete"),
+                             ("bulk", "bulk create, write or delete"),
+                             ("execute", "every execute_method"))
+        )
+        + '</div><div><label>Bulk means more than (records)</label><input type="number" '
+        + 'name="approval_bulk_threshold" min="1" max="100000" '
+        + f'value="{esc(policy["approval_bulk_threshold"])}"></div></div>'
+        + '<h3>Sensitive fields — never read, written or filtered on</h3>'
         + '<p><small>Patterns, one per line: <code>*_key</code>, <code>*iban*</code>. '
         + 'Always on, whatever this list says: <code>*password*</code> <code>*secret*</code> '
         + '<code>*token*</code> <code>*api_key*</code> <code>*apikey*</code> '

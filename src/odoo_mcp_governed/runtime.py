@@ -38,9 +38,11 @@ from .governance import (
     ToolCall,
     digest_args,
 )
+from .governance.approvals import ApprovalStore
 from .governance.detectors import DetectorConfig
 from .governance.engine import RiskScorer
 from .journal import ChangeJournal
+from .notify import Notifier
 from .odoo import OdooClient, TTLCache
 from .policy_store import PolicyStore, policy_from_settings
 from .profiles import Profile, ProfileError, ProfileStore
@@ -133,12 +135,24 @@ class Runtime:
             "rate_threshold": base_detectors.rate_threshold,
             "half_life_minutes": int(base_risk.half_life.total_seconds() // 60),
         })
+        self.approvals = ApprovalStore(
+            settings.data_dir / "approvals.db",
+            ttl=timedelta(minutes=max(1, settings.approval_ttl_minutes)),
+        )
+        self.notifier = Notifier(
+            webhook_url=settings.approval_webhook_url,
+            telegram_token=settings.telegram_bot_token,
+            telegram_chat_id=settings.telegram_chat_id,
+            panel_url=settings.mcp_public_url,
+        )
         self.engine = GovernanceEngine(
             self.audit,
             PolicyEngine(self._effective_policy(self.policy_store.config)),
             detector_config=self._tuned_detectors(),
             risk_config=self._tuned_risk(),
+            approvals=self.approvals,
         )
+        self.engine.on_approval_request = self.notifier.approval_requested
         self.cache = TTLCache(
             ttl=settings.cache_ttl,
             max_size=settings.cache_max_size,
@@ -266,6 +280,15 @@ class Runtime:
             action.fields = tuple(changed)
             action.count = len(changed)
         return changed
+
+    # -- approvals -----------------------------------------------------------
+
+    def decide_approval(self, request_id: int, approve: bool, *, actor: str) -> bool:
+        tool = "admin.approval.approve" if approve else "admin.approval.deny"
+        with self.admin_action(actor, tool, detail={"request_id": request_id}) as action:
+            decided = self.approvals.decide(request_id, approve=approve, by=actor)
+            action.count = 1 if decided else 0
+        return decided
 
     # -- emergency controls ------------------------------------------------
 

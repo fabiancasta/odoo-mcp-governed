@@ -143,6 +143,15 @@ class Settings(BaseSettings):
     )
     disabled_tools: ModelSet = frozenset()
     forbidden_methods: ModelSet = frozenset()
+    approval_required: ModelSet = frozenset()
+    """Operations that wait for a human approval: delete, bulk, execute."""
+    approval_bulk_threshold: int = 20
+    approval_ttl_minutes: int = 30
+    approval_webhook_url: str = ""
+    """JSON POST on every new approval request (n8n, a WhatsApp flow...)."""
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+
     sensitive_fields: ModelSet = SENSITIVE_FIELDS
     """Glob patterns for credential fields, on top of a built-in floor that
     cannot be removed (*password*, *secret*, *token*, *api_key*...)."""
@@ -174,6 +183,7 @@ class Settings(BaseSettings):
         "forbidden_methods",
         "execute_method_allowlist",
         "sensitive_fields",
+        "approval_required",
         "protected_hosts",
         "mcp_allowed_origins",
         mode="before",

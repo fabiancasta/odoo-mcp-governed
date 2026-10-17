@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
+from .governance.approvals import KINDS as APPROVAL_KINDS
 from .governance.policy import PolicyConfig
 from .storage import read_json, write_private_json
 
@@ -31,8 +32,11 @@ _SET_FIELDS = {
     "execute_method_allowlist",
     "sensitive_fields",
     "blocked_actors",
+    "approval_required",
 }
-_EDITABLE = _SET_FIELDS | {"allow_execute_method", "max_records_per_call", "panic"}
+_EDITABLE = _SET_FIELDS | {
+    "allow_execute_method", "max_records_per_call", "panic", "approval_bulk_threshold",
+}
 
 
 def policy_from_settings(settings: Settings) -> PolicyConfig:
@@ -46,6 +50,8 @@ def policy_from_settings(settings: Settings) -> PolicyConfig:
         allow_execute_method=settings.allow_execute_method,
         execute_method_allowlist=settings.execute_method_allowlist,
         sensitive_fields=settings.sensitive_fields,
+        approval_required=settings.approval_required,
+        approval_bulk_threshold=settings.approval_bulk_threshold,
         max_records_per_call=settings.max_records_per_call,
     )
 
@@ -63,9 +69,17 @@ def _coerce(key: str, value: Any) -> Any:
     if key in _SET_FIELDS:
         if isinstance(value, str):
             value = value.replace("\n", ",").split(",")
-        return frozenset(str(v).strip() for v in value if str(v).strip())
+        items = frozenset(str(v).strip() for v in value if str(v).strip())
+        if key == "approval_required" and not items <= set(APPROVAL_KINDS):
+            raise ValueError(f"approval_required may only hold {', '.join(APPROVAL_KINDS)}")
+        return items
     if key in ("allow_execute_method", "panic"):
         return bool(value)
+    if key == "approval_bulk_threshold":
+        number = int(value)
+        if not 1 <= number <= 100_000:
+            raise ValueError("approval_bulk_threshold must be between 1 and 100000")
+        return number
     if key == "max_records_per_call":
         number = int(value)
         if not 1 <= number <= 100_000:

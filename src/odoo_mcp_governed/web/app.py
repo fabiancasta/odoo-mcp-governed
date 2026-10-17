@@ -79,6 +79,9 @@ FLASH = {
     "undone": ("Change undone. The undo is in the audit log.", "ok"),
     "tuning_applied": ("Thresholds applied to the next call.", "ok"),
     "permissions_saved": ("Permissions saved and applied to the next call.", "ok"),
+    "approved": ("Approved. The agent may now repeat that exact call once.", "ok"),
+    "denied": ("Denied. The agent is told not to retry.", "ok"),
+    "approval_gone": ("That request is no longer pending.", "bad"),
     "permissions_error": ("Permissions not saved: the form held an invalid value.", "bad"),
     "undo_confirm": ("Tick the box next to Undo to confirm.", "bad"),
     "csrf": ("Form expired. Please try again.", "bad"),
@@ -661,6 +664,39 @@ def create_app(runtime: Runtime) -> FastAPI:
             write_private_json(settings.data_dir / "models_seen.json", seen)
         return back("permissions_saved", "/admin/permissions")
 
+    # -- admin: approvals --------------------------------------------------
+
+    @app.get("/admin/approvals", response_class=HTMLResponse)
+    async def approvals_view(request: Request, m: str | None = None):
+        session = session_for(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        flash, kind = FLASH.get(m or "", (None, "ok"))
+        return HTMLResponse(views.approvals_page(
+            csrf=session.csrf, pending=runtime.approvals.pending(),
+            recent=runtime.approvals.recent(),
+            enabled=bool(runtime.engine.policy.config.approval_required),
+            notifier=runtime.notifier.enabled,
+            ttl_minutes=int(runtime.approvals.ttl.total_seconds() // 60),
+            flash=flash, flash_kind=kind,
+        ))
+
+    @app.post("/admin/approvals/decide")
+    async def approvals_decide(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf", "/admin/approvals")
+        raw, decision = str(form.get("id") or ""), form.get("decision")
+        if not raw.isdigit() or decision not in ("approve", "deny"):
+            return back("approval_gone", "/admin/approvals")
+        decided = await run_in_threadpool(runtime.decide_approval, int(raw),
+                                          decision == "approve", actor=admin_actor(request))
+        if not decided:
+            return back("approval_gone", "/admin/approvals")
+        return back("approved" if decision == "approve" else "denied", "/admin/approvals")
+
     # -- admin: emergency controls ----------------------------------------
 
     @app.post("/admin/panic")
@@ -725,6 +761,8 @@ def create_app(runtime: Runtime) -> FastAPI:
         for key in ("allowed_models", "writable_models", "deletable_models", "denied_models",
                     "execute_method_allowlist", "forbidden_methods", "sensitive_fields"):
             changes[key] = str(form.get(key) or "")
+        changes["approval_required"] = [str(v) for v in form.getlist("approval_required")]
+        changes["approval_bulk_threshold"] = int(form.get("approval_bulk_threshold") or 20)
         try:
             changes["max_records_per_call"] = int(form.get("max_records_per_call") or 500)
             _, changed = await run_in_threadpool(
