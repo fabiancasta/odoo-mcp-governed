@@ -323,18 +323,22 @@ DOMAIN = {
 def _read_fields(ctx: ToolContext, model: str, fields: list[str] | None) -> list[str] | None:
     """The field list to ask Odoo for. ``None`` means all of them.
 
-    On ir.attachment "all fields" would pull every file's content just to
-    strip it again — and Odoo cannot even serialise ``raw``, so it answers
-    HTTP 500. Ask for everything except the content instead.
+    When the agent names no fields, binary fields are left out. A contact
+    read that way used to come back with ten base64 copies of its photo
+    (``image_1920`` … ``avatar_128``): tokens the agent pays for and never
+    uses. Named binary fields are still returned. On ir.attachment this also
+    keeps the file content out — Odoo cannot even serialise ``raw``, and
+    answers HTTP 500 when asked for it.
     """
-    if fields or model != ATTACHMENT_MODEL:
+    if fields:
         return fields
     defs = _fields_get(ctx, model, ["type"])
     if not isinstance(defs, dict):
         return fields
+    content = ATTACHMENT_CONTENT_FIELDS if model == ATTACHMENT_MODEL else frozenset()
     return sorted(
         n for n, meta in defs.items()
-        if n not in ATTACHMENT_CONTENT_FIELDS and meta.get("type") != "binary"
+        if n not in content and meta.get("type") != "binary"
     ) or None
 
 

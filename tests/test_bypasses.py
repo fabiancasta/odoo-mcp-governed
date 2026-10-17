@@ -173,3 +173,18 @@ def test_all_fields_on_attachments_never_asks_odoo_for_the_content(wide_open) ->
     for model, method, _args, kwargs in fake.calls:
         if model == "ir.attachment" and method in ("search_read", "read"):
             assert kwargs["fields"] == ["name", "res_model"]
+
+
+def test_unnamed_binary_fields_are_not_fetched_on_any_model(wide_open) -> None:
+    """A contact read with no field list used to return ten base64 copies of
+    its photo. Asked for by name, they still come back."""
+    _, fake, d = wide_open
+    fake.responses[("res.partner", "fields_get")] = {
+        "name": {"type": "char"}, "image_1920": {"type": "binary"},
+        "avatar_128": {"type": "binary"},
+    }
+    call(d, "get_record", model="res.partner", record_id=3)
+    call(d, "get_record", model="res.partner", record_id=3, fields=["image_1920"])
+    reads = [kw for m, meth, _a, kw in fake.calls if m == "res.partner" and meth == "read"]
+    assert reads[0]["fields"] == ["name"]
+    assert reads[1]["fields"] == ["image_1920"]
