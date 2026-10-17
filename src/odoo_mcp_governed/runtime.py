@@ -160,6 +160,7 @@ class Runtime:
         )
         self._lock = threading.Lock()
         self._snapshot: Snapshot | None = None
+        self._pinned: dict[str, Snapshot] = {}
         self._rebuild_snapshot()
 
     # -- profile hot swap --------------------------------------------------
@@ -191,11 +192,38 @@ class Runtime:
         # One attribute assignment, so no call sees half a policy.
         self.engine.policy = PolicyEngine(self._effective_policy(self.policy_store.config))
 
+    def _snapshot_factory(self, profile: Profile) -> Snapshot:
+        return Snapshot(profile, _client_for(profile))
+
     def _rebuild_snapshot(self) -> None:
         profile = self.profiles.active()
         with self._lock:
-            self._snapshot = Snapshot(profile, _client_for(profile)) if profile else None
+            self._snapshot = self._snapshot_factory(profile) if profile else None
+            self._pinned.clear()
         self.cache.clear()
+
+    def snapshot_for(self, profile_name: str | None) -> Snapshot:
+        """The snapshot a call runs on: the active profile, or — for a token
+        pinned to a profile — that profile, whatever is active. A pin to a
+        profile that is gone or protected is refused, never rerouted: sending
+        one client's agent to another client's Odoo is the failure this
+        exists to prevent."""
+        if not profile_name:
+            return self.snapshot()
+        active = self._snapshot
+        if active is not None and active.profile.name == profile_name:
+            return active
+        with self._lock:
+            snap = self._pinned.get(profile_name)
+            if snap is None:
+                profile = self.profiles.get(profile_name)
+                if profile is None or self.profiles.is_protected(profile):
+                    raise NoActiveProfile(
+                        f"This agent's token is pinned to profile {profile_name!r}, which does "
+                        "not exist or cannot be used. Ask the administrator for a new token."
+                    )
+                snap = self._pinned[profile_name] = self._snapshot_factory(profile)
+            return snap
 
     def snapshot(self) -> Snapshot:
         snap = self._snapshot
@@ -224,6 +252,8 @@ class Runtime:
         ):
             saved = self.profiles.save(profile)
             self._apply_policy()
+            with self._lock:
+                self._pinned.pop(saved.name, None)
             if saved.name == self.profiles.active_name:
                 # Editing the active profile is also a swap: new credentials or
                 # a new URL must take effect on the next call.
@@ -234,6 +264,8 @@ class Runtime:
         with self.admin_action(actor, "admin.profile.delete", detail=name):
             self.profiles.delete(name)
             self._apply_policy()
+            with self._lock:
+                self._pinned.pop(name, None)
 
     # -- live policy -------------------------------------------------------
 

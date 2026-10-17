@@ -44,9 +44,11 @@ def main(argv: list[str] | None = None) -> int:
     token = sub.add_parser("token", help="issue a bearer token for one agent")
     token.add_argument("--actor", required=True, help="identity recorded in the audit log")
     token.add_argument("--hours", type=int, help="lifetime (default TOKEN_EXPIRY_HOURS)")
+    token.add_argument("--profile", help="pin the agent to this Odoo profile (one per client)")
     report = sub.add_parser("report", help="write the activity report as HTML")
     report.add_argument("--days", type=int, default=7)
     report.add_argument("--out", required=True, help="file to write (print it to PDF)")
+    report.add_argument("--profile", help="only this profile (one client)")
     audit = sub.add_parser("audit", help="audit log maintenance")
     audit.add_argument("action", choices=["verify", "anchor"])
 
@@ -90,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
             if not ACTOR_NAME.match(args.actor):
                 print("actor may contain only A-Z a-z 0-9 _ . @ -", file=sys.stderr)
                 return 2
-            data = issue_token(settings, args.actor, hours=args.hours)
+            data = issue_token(settings, args.actor, hours=args.hours, profile=args.profile)
             print(data["token"])
             print(f"# actor={data['actor']} expires={data['expires_at']}", file=sys.stderr)
             return 0
@@ -101,7 +103,8 @@ def main(argv: list[str] | None = None) -> int:
             from . import report as activity
             from .web.views import report_html
 
-            html = report_html(activity.build(_runtime(settings), days=max(1, args.days)))
+            html = report_html(activity.build(_runtime(settings), days=max(1, args.days),
+                                              profile=args.profile))
             fd = os.open(args.out, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(html)

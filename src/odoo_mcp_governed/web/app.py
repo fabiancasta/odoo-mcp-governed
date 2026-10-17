@@ -357,7 +357,9 @@ def create_app(runtime: Runtime) -> FastAPI:
         if blocked is not None:
             return blocked
 
-        result = await run_in_threadpool(dispatcher.handle_payload, payload, actor)
+        pinned = claims.get("profile")
+        pinned = str(pinned) if isinstance(pinned, str) and pinned else None
+        result = await run_in_threadpool(dispatcher.handle_payload, payload, actor, pinned)
         headers: dict[str, str] = {}
         if any(isinstance(m, dict) and m.get("method") == "initialize" for m in messages):
             headers["Mcp-Session-Id"] = secrets.token_urlsafe(24)
@@ -667,13 +669,16 @@ def create_app(runtime: Runtime) -> FastAPI:
     # -- admin: activity report --------------------------------------------
 
     @app.get("/admin/report", response_class=HTMLResponse)
-    async def report_view(request: Request, days: int = 7):
+    async def report_view(request: Request, days: int = 7, profile: str = ""):
         if session_for(request) is None:
             return RedirectResponse("/admin", status_code=303)
         from .. import report
 
-        data = await run_in_threadpool(report.build, runtime, days=max(1, min(days, 366)))
-        return HTMLResponse(views.report_html(data))
+        chosen = profile if profile and runtime.profiles.get(profile) else None
+        data = await run_in_threadpool(report.build, runtime, days=max(1, min(days, 366)),
+                                       profile=chosen)
+        return HTMLResponse(views.report_html(
+            data, profiles=[p["name"] for p in runtime.profiles.public()]))
 
     # -- admin: approvals --------------------------------------------------
 
@@ -795,8 +800,10 @@ def create_app(runtime: Runtime) -> FastAPI:
         session = session_for(request)
         if session is None:
             return RedirectResponse("/admin", status_code=303)
-        return HTMLResponse(views.token_page(csrf=session.csrf, token=tokens.current(),
-                                             mcp_url=mcp_url(request)))
+        return HTMLResponse(views.token_page(
+            csrf=session.csrf, token=tokens.current(), mcp_url=mcp_url(request),
+            profiles=[p["name"] for p in runtime.profiles.public()],
+        ))
 
     @app.post("/admin/token/regenerate")
     async def token_regenerate(request: Request):
@@ -806,10 +813,14 @@ def create_app(runtime: Runtime) -> FastAPI:
         if form is None:
             return back("csrf", "/token")
         actor = str(form.get("actor") or "claude").strip()
+        profile = str(form.get("profile") or "").strip() or None
         if not ACTOR_NAME.match(actor) or form.get("confirm") != "yes":
             return back("csrf", "/token")
-        with runtime.admin_action(admin_actor(request), "admin.token.regenerate", detail=actor):
-            tokens.regenerate(actor)
+        if profile is not None and runtime.profiles.get(profile) is None:
+            return back("csrf", "/token")
+        with runtime.admin_action(admin_actor(request), "admin.token.regenerate",
+                                  detail={"actor": actor, "profile": profile}):
+            tokens.regenerate(actor, profile)
         return back("token_regenerated", "/token")
 
     # -- admin: audit ------------------------------------------------------

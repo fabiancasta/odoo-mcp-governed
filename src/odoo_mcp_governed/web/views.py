@@ -328,7 +328,7 @@ section{break-inside:avoid;border-color:#bbb}main{max-width:none;padding:0}}
 """
 
 
-def report_html(r: dict[str, Any]) -> str:
+def report_html(r: dict[str, Any], profiles: list[str] | None = None) -> str:
     """A self-contained, printable activity report. Counts only, no values."""
     def fmt(d: datetime) -> str:
         return d.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -376,7 +376,11 @@ def report_html(r: dict[str, Any]) -> str:
         f'{esc(fmt(r["generated_at"]))} · {r["days"]} days · counts and metadata only, no record '
         "values</small></p>"
         f'<div class="grid">{kpi_html}</div>'
-        '<p class="noprint"><small>Print this page and choose "Save as PDF" to send it.</small></p>'
+        '<p class="noprint"><small>Print this page and choose "Save as PDF" to send it. '
+        "Per client: "
+        + " · ".join(f'<a href="/admin/report?profile={esc(p)}">{esc(p)}</a>'
+                     for p in profiles or [])
+        + "</small></p>"
         "</section>"
         "<section><h2>What each agent did</h2><div class=\"wrap\"><table><tr><th>Agent</th>"
         "<th>Calls</th><th>Records read</th><th>Records created or changed</th>"
@@ -710,11 +714,14 @@ def dashboard(
     )
 
 
-def token_page(*, csrf: str, token: dict[str, Any] | None, mcp_url: str) -> str:
+def token_page(*, csrf: str, token: dict[str, Any] | None, mcp_url: str,
+               profiles: list[str] | None = None) -> str:
     if token:
+        pin = (f' · pinned to profile <b>{esc(token["profile"])}</b>' if token.get("profile")
+               else " · follows the active profile")
         body = (
             '<section><h2>MCP access token</h2>'
-            f'<p>Actor: <b>{esc(token["actor"])}</b> · expires {esc(token["expires_at"][:10])}</p>'
+            f'<p>Actor: <b>{esc(token["actor"])}</b>{pin} · expires {esc(token["expires_at"][:10])}</p>'
             f'<label>Bearer token</label><textarea readonly class="mono">{esc(token["token"])}</textarea>'
             f'<label>MCP endpoint</label><input type="text" readonly value="{esc(mcp_url)}">'
             '<p><small>Every request made with this token is attributed to this actor in the '
@@ -727,7 +734,11 @@ def token_page(*, csrf: str, token: dict[str, Any] | None, mcp_url: str) -> str:
         '<form method="post" action="/admin/token/regenerate">'
         f"{csrf_field(csrf)}<div class=row><div><label>Actor name</label>"
         '<input type="text" name="actor" value="claude" pattern="[A-Za-z0-9_.@\\-]{1,64}" required>'
-        "</div></div><p>"
+        "</div><div><label>Odoo profile</label><select name=\"profile\">"
+        '<option value="">follow the active profile</option>'
+        + "".join(f'<option value="{esc(p)}">pinned to {esc(p)}</option>' for p in profiles or [])
+        + "</select><small>Pin one token per client: that agent then always works on that "
+        "Odoo, whatever is active here.</small></div></div><p>"
         '<label class="inline"><input type="checkbox" name="confirm" value="yes" required> '
         "I understand the stored token will be replaced</label> "
         '<button type="submit">Generate new token</button></p></form></section>'

@@ -17,10 +17,15 @@ from .governance import Decision, Operation, Outcome
 from .web.metrics import CATEGORY_ORDER, categorise
 
 
-def build(runtime: Any, *, days: int = 7, now: datetime | None = None) -> dict[str, Any]:
+def build(
+    runtime: Any, *, days: int = 7, now: datetime | None = None, profile: str | None = None
+) -> dict[str, Any]:
+    """The report for a period, for one profile (one client) or for all."""
     now = now or datetime.now(timezone.utc)
     start = now - timedelta(days=days)
     events = runtime.audit.since(start)
+    if profile:
+        events = [e for e in events if e.profile == profile]
     agents: dict[str, Counter] = defaultdict(Counter)
     models: Counter[str] = Counter()
     refusals: Counter[str] = Counter()
@@ -48,13 +53,17 @@ def build(runtime: Any, *, days: int = 7, now: datetime | None = None) -> dict[s
         if e.model:
             models[e.model] += 1
 
+    def mine(row: dict) -> bool:
+        return not profile or row.get("profile") == profile
+
     changes = []
     if runtime.journal is not None:
-        changes = [c for c in runtime.journal.tail(5000) if c["ts"] >= start.isoformat()]
-    approvals = [a for a in runtime.approvals.recent(5000) if a["created_at"] >= start.isoformat()]
-    approvals += [a for a in runtime.approvals.pending() if a["created_at"] >= start.isoformat()]
+        changes = [c for c in runtime.journal.tail(5000)
+                   if c["ts"] >= start.isoformat() and mine(c)]
+    approvals = [a for a in runtime.approvals.recent(5000) + runtime.approvals.pending()
+                 if a["created_at"] >= start.isoformat() and mine(a)]
     status = runtime.audit.verify()
-    profile = runtime.profiles.active()
+    profile = runtime.profiles.get(profile) if profile else runtime.profiles.active()
     return {
         "generated_at": now,
         "start": start,
