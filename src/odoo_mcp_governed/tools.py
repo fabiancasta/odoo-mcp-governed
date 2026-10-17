@@ -31,6 +31,7 @@ from .governance.policy import (
     ATTACHMENT_CONTENT_FIELDS,
     ATTACHMENT_MODEL,
     WILDCARD,
+    is_sensitive,
     matches,
 )
 from .runtime import Runtime, Snapshot
@@ -94,17 +95,16 @@ class ToolContext:
         other case: an agent that asks for all fields and would receive one.
         On ir.attachment the file content goes too, for the same reason.
         """
-        hidden = {f.lower() for f in self.policy.sensitive_fields}
-        if model == ATTACHMENT_MODEL:
-            hidden |= ATTACHMENT_CONTENT_FIELDS
-        return _strip(records, hidden)
+        patterns = self.policy.sensitive_fields
+        content = ATTACHMENT_CONTENT_FIELDS if model == ATTACHMENT_MODEL else frozenset()
+        return _strip(records, lambda key: key in content or is_sensitive(key, patterns))
 
 
-def _strip(records: Any, hidden: set[str]) -> Any:
+def _strip(records: Any, hidden: Callable[[str], bool]) -> Any:
     if isinstance(records, list):
         return [_strip(r, hidden) for r in records]
     if isinstance(records, dict):
-        return {k: v for k, v in records.items() if k.lower() not in hidden}
+        return {k: v for k, v in records.items() if not hidden(k)}
     return records
 
 
@@ -385,12 +385,12 @@ def _default_onchange_spec(ctx: ToolContext, model: str) -> dict[str, Any]:
     information onchange exists to provide.
     """
     defs = _fields_get(ctx, model, ["type"])
-    sensitive = {f.lower() for f in ctx.policy.sensitive_fields}
+    patterns = ctx.policy.sensitive_fields
     return {
         name: {}
         for name, meta in defs.items()
         if meta.get("type") not in ("one2many", "many2many", "binary")
-        and name.lower() not in sensitive
+        and not is_sensitive(name, patterns)
     }
 
 

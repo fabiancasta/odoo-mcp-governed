@@ -440,7 +440,7 @@ def create_app(runtime: Runtime) -> FastAPI:
             "allow_execute_method": form.get("allow_execute_method") == "1",
         }
         for key in ("allowed_models", "writable_models", "deletable_models", "denied_models",
-                    "execute_method_allowlist", "forbidden_methods"):
+                    "execute_method_allowlist", "forbidden_methods", "sensitive_fields"):
             changes[key] = str(form.get(key) or "")
         try:
             changes["max_records_per_call"] = int(form.get("max_records_per_call") or 500)

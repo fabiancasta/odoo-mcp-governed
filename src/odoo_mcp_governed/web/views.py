@@ -253,6 +253,12 @@ def dashboard(
         + f'min="1" max="100000" value="{esc(policy["max_records_per_call"])}"></div>'
         + area("execute_method_allowlist", "Allowed methods", "empty = any non-blocked")
         + area("forbidden_methods", "Extra forbidden methods", "on top of the built-in list")
+        + '</div><h3>Sensitive fields — never read, written or filtered on</h3>'
+        + '<p><small>Patterns, one per line: <code>*_key</code>, <code>*iban*</code>. '
+        + 'Always on, whatever this list says: <code>*password*</code> <code>*secret*</code> '
+        + '<code>*token*</code> <code>*api_key*</code> <code>*apikey*</code> '
+        + '<code>*private_key*</code>.</small></p><div class="row">'
+        + area("sensitive_fields", "Extra patterns", "SENSITIVE_FIELDS")
         + '</div><p><button type="submit">Apply policy</button></p></form></section>'
     )
     return page(

@@ -21,7 +21,7 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .governance.detectors import DetectorConfig, parse_days, parse_hours
 from .governance.engine import RiskConfig
-from .governance.policy import DEFAULT_DENIED_MODELS
+from .governance.policy import DEFAULT_DENIED_MODELS, SENSITIVE_FIELDS
 
 MIN_JWT_SECRET_LENGTH = 32
 MIN_ADMIN_PASSWORD_LENGTH = 12
@@ -116,6 +116,9 @@ class Settings(BaseSettings):
     )
     disabled_tools: ModelSet = frozenset()
     forbidden_methods: ModelSet = frozenset()
+    sensitive_fields: ModelSet = SENSITIVE_FIELDS
+    """Glob patterns for credential fields, on top of a built-in floor that
+    cannot be removed (*password*, *secret*, *token*, *api_key*...)."""
     allow_execute_method: bool = False
     execute_method_allowlist: ModelSet = frozenset()
     max_records_per_call: int = 500
@@ -143,6 +146,7 @@ class Settings(BaseSettings):
         "disabled_tools",
         "forbidden_methods",
         "execute_method_allowlist",
+        "sensitive_fields",
         "protected_hosts",
         mode="before",
     )

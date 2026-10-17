@@ -28,6 +28,7 @@ tools that are actually governed as writes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 
 from .events import Operation, ToolCall
 
@@ -128,22 +129,26 @@ def matches(model: str, models: frozenset[str]) -> bool:
 
 
 # Fields whose values must never leave Odoo through this server, on any model.
-# Matched case-insensitively against the field names a call touches.
-SENSITIVE_FIELDS = frozenset(
-    {
-        "password",
-        "password_crypt",
-        "new_password",
-        "api_key",
-        "totp_secret",
-        "oauth_access_token",
-        "google_refresh_token",
-        "access_token",
-        "secret",
-        "private_key",
-        "webhook_secret",
-    }
+# These are glob patterns matched case-insensitively against every field name a
+# call touches. Patterns, not exact names, because modules add credentials
+# under compound names — ``stripe_secret_key``, ``unsplash_access_key`` — and a
+# module installed after the server was configured must not leak through a
+# ``*`` allowlist.
+#
+# The built-in floor applies whatever the configuration says, like
+# :data:`BLOCKED_METHODS`. SENSITIVE_FIELDS can add to it, never remove from it.
+BUILTIN_SENSITIVE_FIELDS = frozenset(
+    {"*password*", "*secret*", "*token*", "*api_key*", "*apikey*", "*private_key*"}
 )
+
+# The configurable part, as shipped. Replacing it through SENSITIVE_FIELDS
+# keeps the floor above.
+SENSITIVE_FIELDS = frozenset({"*_key", "*hmac*", "*credential*", "totp_*", "*_pass"})
+
+
+def is_sensitive(field_name: str, patterns: frozenset[str]) -> bool:
+    name = field_name.lower()
+    return any(fnmatchcase(name, p.lower()) for p in BUILTIN_SENSITIVE_FIELDS | patterns)
 
 
 @dataclass(frozen=True)
@@ -369,8 +374,9 @@ class PolicyEngine:
         return reasons
 
     def _evaluate_fields(self, call: ToolCall) -> list[str]:
-        sensitive = {f.lower() for f in self.config.sensitive_fields}
-        hits = sorted({f for f in call.fields_touched if f.lower() in sensitive})
+        hits = sorted(
+            {f for f in call.fields_touched if is_sensitive(f, self.config.sensitive_fields)}
+        )
         reasons = []
         if hits:
             reasons.append(

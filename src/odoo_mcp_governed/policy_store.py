@@ -29,6 +29,7 @@ _SET_FIELDS = {
     "disabled_tools",
     "forbidden_methods",
     "execute_method_allowlist",
+    "sensitive_fields",
 }
 _EDITABLE = _SET_FIELDS | {"allow_execute_method", "max_records_per_call"}
 
@@ -43,6 +44,7 @@ def policy_from_settings(settings: Settings) -> PolicyConfig:
         forbidden_methods=settings.forbidden_methods,
         allow_execute_method=settings.allow_execute_method,
         execute_method_allowlist=settings.execute_method_allowlist,
+        sensitive_fields=settings.sensitive_fields,
         max_records_per_call=settings.max_records_per_call,
     )
 
