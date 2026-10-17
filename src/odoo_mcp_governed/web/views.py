@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from datetime import timezone
+from datetime import datetime, timezone
 from html import escape
 from typing import Any
 
@@ -321,6 +321,84 @@ def approvals_page(*, csrf: str, pending: list[dict], recent: list[dict], enable
     return page("Approvals", message(flash, flash_kind) + body)
 
 
+REPORT_STYLE = """
+@media print{header,nav,.noprint{display:none!important}body{background:#fff;color:#000}
+section{break-inside:avoid;border-color:#bbb}main{max-width:none;padding:0}}
+.kpi strong{font-size:22px}.lead{font-size:15px;margin:4px 0 0}
+"""
+
+
+def report_html(r: dict[str, Any]) -> str:
+    """A self-contained, printable activity report. Counts only, no values."""
+    def fmt(d: datetime) -> str:
+        return d.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    kpis = (
+        ("Agent calls", r["total_calls"], ""), ("Refused", r["total_refused"],
+                                                 "bad" if r["total_refused"] else "ok"),
+        ("Records changed", r["changes"]["total"], ""),
+        ("Undone", r["changes"]["undone"], ""),
+        ("Peak risk", r["peak_risk"], "bad" if r["peak_risk"] >= 70 else
+         "warn" if r["peak_risk"] >= 40 else "ok"),
+        ("Audit chain", "intact" if r["chain_intact"] else "BROKEN",
+         "ok" if r["chain_intact"] else "bad"),
+    )
+    kpi_html = "".join(
+        f'<div class="stat kpi"><small>{esc(label)}</small><strong class="{cls}">{esc(value)}'
+        "</strong></div>" for label, value, cls in kpis
+    )
+    agent_rows = "".join(
+        f"<tr><td><code>{esc(a)}</code></td><td>{c.get('calls', 0)}</td>"
+        f"<td>{c.get('records_read', 0)}</td><td>{c.get('records_written', 0)}</td>"
+        f"<td>{c.get('records_deleted', 0)}</td><td>{c.get('refused', 0)}</td>"
+        f"<td>{c.get('errors', 0)}</td></tr>"
+        for a, c in r["agents"]
+    ) or "<tr><td colspan=7>No agent activity in this period.</td></tr>"
+    model_rows = "".join(
+        f"<tr><td><code>{esc(m)}</code></td><td>{n}</td></tr>" for m, n in r["models"]
+    ) or "<tr><td colspan=2>—</td></tr>"
+    refusal_rows = "".join(
+        f"<tr><td>{esc(k)}</td><td>{v}</td></tr>" for k, v in r["refusals"].items()
+    ) or "<tr><td colspan=2 class=ok>Nothing was refused.</td></tr>"
+    change_rows = "".join(
+        f'<tr><td class="mono">{esc(c["ts"][:16].replace("T", " "))}</td>'
+        f'<td><code>{esc(c["actor"])}</code></td><td>{esc(c["operation"])}</td>'
+        f'<td><code>{esc(c["model"])}</code></td><td class="mono">{esc(c["record_id"])}</td>'
+        f'<td>{"undone" if c.get("undone_at") else ""}</td></tr>'
+        for c in r["changes"]["latest"]
+    ) or "<tr><td colspan=6>No changes.</td></tr>"
+    ops = ", ".join(f"{k} {v}" for k, v in r["changes"]["by_operation"].items()) or "none"
+    appr = ", ".join(f"{k} {v}" for k, v in r["approvals"].items()) or "none"
+    body = (
+        "<section><h2>AI activity report</h2>"
+        f'<p class="lead">Odoo <b>{esc(r["database"])}</b> · profile <b>{esc(r["profile"])}</b> '
+        f'({esc(r["environment"])})</p><p><small>{esc(fmt(r["start"]))} → '
+        f'{esc(fmt(r["generated_at"]))} · {r["days"]} days · counts and metadata only, no record '
+        "values</small></p>"
+        f'<div class="grid">{kpi_html}</div>'
+        '<p class="noprint"><small>Print this page and choose "Save as PDF" to send it.</small></p>'
+        "</section>"
+        "<section><h2>What each agent did</h2><div class=\"wrap\"><table><tr><th>Agent</th>"
+        "<th>Calls</th><th>Records read</th><th>Records created or changed</th>"
+        f"<th>Records deleted</th><th>Refused</th><th>Errors</th></tr>{agent_rows}</table></div>"
+        "</section>"
+        '<section><div class="row"><div><h2>Most used models</h2>'
+        f"<table>{model_rows}</table></div><div><h2>What governance refused</h2>"
+        f"<table>{refusal_rows}</table><p><small>Approvals: {esc(appr)}. Panic stops: "
+        f'{r["panic_events"]}. Agents blocked: {r["blocks"]}.</small></p></div></div></section>'
+        f"<section><h2>Changes to records</h2><p><small>{esc(ops)}. Every change can be "
+        "reverted from the panel's Changes page.</small></p><div class=\"wrap\"><table><tr>"
+        "<th>When (UTC)</th><th>Agent</th><th>Operation</th><th>Model</th><th>Record</th><th></th>"
+        f"</tr>{change_rows}</table></div></section>"
+        f'<section><h2>Integrity</h2><p class="{"ok" if r["chain_intact"] else "bad"}">'
+        f'{esc(r["chain_summary"])}</p><p><small>Every agent call and every administrator '
+        "action is sealed into a hash-chained audit log; any edit or deletion of a past "
+        "entry breaks the chain.</small></p></section>"
+    )
+    html = page("AI activity report", body)
+    return html.replace("</style>", REPORT_STYLE + "</style>", 1)
+
+
 def console_section(*, csrf: str, tuning: dict[str, int], source: str) -> str:
     faders = (
         ("risk_throttle_threshold", "Throttle at", 5, 100, 1, "risk score"),
@@ -354,7 +432,7 @@ def page(title: str, body: str, *, nav: bool = True) -> str:
     links = (
         '<nav><a href="/admin">Dashboard</a><a href="/admin/logs">Audit log</a>'
         '<a href="/admin/changes">Changes</a><a href="/admin/permissions">Permissions</a>'
-        '<a href="/admin/approvals">Approvals</a>'
+        '<a href="/admin/approvals">Approvals</a><a href="/admin/report">Report</a>'
         '<a href="/token">Token</a></nav>'
         if nav
         else ""

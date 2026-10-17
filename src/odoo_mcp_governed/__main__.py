@@ -44,6 +44,9 @@ def main(argv: list[str] | None = None) -> int:
     token = sub.add_parser("token", help="issue a bearer token for one agent")
     token.add_argument("--actor", required=True, help="identity recorded in the audit log")
     token.add_argument("--hours", type=int, help="lifetime (default TOKEN_EXPIRY_HOURS)")
+    report = sub.add_parser("report", help="write the activity report as HTML")
+    report.add_argument("--days", type=int, default=7)
+    report.add_argument("--out", required=True, help="file to write (print it to PDF)")
     audit = sub.add_parser("audit", help="audit log maintenance")
     audit.add_argument("action", choices=["verify", "anchor"])
 
@@ -90,6 +93,19 @@ def main(argv: list[str] | None = None) -> int:
             data = issue_token(settings, args.actor, hours=args.hours)
             print(data["token"])
             print(f"# actor={data['actor']} expires={data['expires_at']}", file=sys.stderr)
+            return 0
+
+        if command == "report":
+            import os
+
+            from . import report as activity
+            from .web.views import report_html
+
+            html = report_html(activity.build(_runtime(settings), days=max(1, args.days)))
+            fd = os.open(args.out, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(html)
+            print(f"report written to {args.out}")
             return 0
 
         if command == "audit":

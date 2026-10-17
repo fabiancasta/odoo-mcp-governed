@@ -664,6 +664,17 @@ def create_app(runtime: Runtime) -> FastAPI:
             write_private_json(settings.data_dir / "models_seen.json", seen)
         return back("permissions_saved", "/admin/permissions")
 
+    # -- admin: activity report --------------------------------------------
+
+    @app.get("/admin/report", response_class=HTMLResponse)
+    async def report_view(request: Request, days: int = 7):
+        if session_for(request) is None:
+            return RedirectResponse("/admin", status_code=303)
+        from .. import report
+
+        data = await run_in_threadpool(report.build, runtime, days=max(1, min(days, 366)))
+        return HTMLResponse(views.report_html(data))
+
     # -- admin: approvals --------------------------------------------------
 
     @app.get("/admin/approvals", response_class=HTMLResponse)
