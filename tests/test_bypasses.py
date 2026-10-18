@@ -9,6 +9,8 @@ these must hold under.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from odoo_mcp_governed.config import Settings
@@ -188,3 +190,39 @@ def test_unnamed_binary_fields_are_not_fetched_on_any_model(wide_open) -> None:
     reads = [kw for m, meth, _a, kw in fake.calls if m == "res.partner" and meth == "read"]
     assert reads[0]["fields"] == ["name"]
     assert reads[1]["fields"] == ["image_1920"]
+
+
+class TestNestedStructures:
+    """Found in the 2026-10-18 self-review: field names were collected from
+    the top level of execute_method and onchange arguments only, and results
+    were redacted only at the top level, so nested specifications (Odoo's
+    web_search_read / web_read / onchange) reached and returned credential
+    fields of related records. Sorting by a field was not checked at all."""
+
+    def test_nested_specification_naming_a_secret_is_refused(self, wide_open) -> None:
+        _, fake, d = wide_open
+        spec = {"name": {}, "user_ids": {"fields": {"login": {}, "password": {}}}}
+        assert call(d, "execute_method", model="res.partner", method="web_search_read",
+                    kwargs={"domain": [], "specification": spec})[0]
+        assert not odoo_saw(fake, "res.partner")
+
+    def test_nested_onchange_spec_naming_a_secret_is_refused(self, wide_open) -> None:
+        _, fake, d = wide_open
+        assert call(d, "call_onchange", model="res.partner", values={"name": "x"},
+                    fields_spec={"user_ids": {"fields": {"api_key": {}}}})[0]
+        assert not odoo_saw(fake, "res.partner")
+
+    def test_nested_results_are_redacted(self, wide_open) -> None:
+        _, fake, d = wide_open
+        fake.responses[("res.partner", "web_search_read")] = {"records": [
+            {"id": 1, "name": "Acme", "user_ids": [{"id": 2, "login": "a", "signup_token": "t"}]}
+        ]}
+        is_error, body = call(d, "execute_method", model="res.partner",
+                              method="web_search_read", kwargs={"domain": []})
+        assert not is_error
+        assert "signup_token" not in json.dumps(body)
+
+    def test_sorting_by_a_secret_is_refused(self, wide_open) -> None:
+        _, fake, d = wide_open
+        assert call(d, "search_records", model="res.users", order="password desc")[0]
+        assert not odoo_saw(fake, "res.users")

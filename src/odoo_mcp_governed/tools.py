@@ -164,11 +164,56 @@ class ToolContext:
 
 
 def _strip(records: Any, hidden: Callable[[str], bool]) -> Any:
+    """Drop hidden keys at every depth: web_read and onchange return related
+    records nested inside the parent, and those carry fields too."""
     if isinstance(records, list):
         return [_strip(r, hidden) for r in records]
     if isinstance(records, dict):
-        return {k: v for k, v in records.items() if not hidden(k)}
+        return {k: _strip(v, hidden) for k, v in records.items()
+                if not (isinstance(k, str) and hidden(k))}
     return records
+
+
+def collect_field_names(value: Any) -> set[str]:
+    """Every field name an argument structure can carry, at any depth.
+
+    Dict keys (value dicts, and the nested ``specification`` of web_read /
+    web_search_read / onchange), lists of strings (field lists), and each hop
+    of a dotted path. Iterative, so depth is bounded by the request's own
+    nesting limit rather than Python's recursion limit.
+    """
+    found: set[str] = set()
+    stack = [value]
+
+    def add(name: str) -> None:
+        found.add(name)
+        found.update(part for part in name.split(".") if part)
+
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            for key, inner in item.items():
+                if isinstance(key, str):
+                    add(key)
+                stack.append(inner)
+        elif isinstance(item, (list, tuple)):
+            if item and all(isinstance(i, str) for i in item):
+                for name in item:
+                    add(name)
+            else:
+                stack.extend(item)
+    return found
+
+
+def order_fields(order: str | None) -> set[str]:
+    """Field names in an ``order`` clause — sorting by a field leaks it too."""
+    names: set[str] = set()
+    for part in (order or "").split(","):
+        token = part.strip().split(" ", 1)[0]
+        if token:
+            names.add(token)
+            names.update(seg for seg in token.split(".") if seg)
+    return names
 
 
 @dataclass(frozen=True)
@@ -373,7 +418,7 @@ def search_records(ctx: ToolContext) -> Any:
     limit = _limit(ctx)
     offset = _arg_int(ctx, "offset", 0)
     order = _arg_str(ctx, "order", required=False) or None
-    touched = set(fields or ()) | domain_fields(domain)
+    touched = set(fields or ()) | domain_fields(domain) | order_fields(order)
     with ctx.guard(operation=Operation.READ, model=model, fields=touched, count=limit) as g:
         kwargs: dict[str, Any] = {"limit": limit, "offset": offset}
         if wanted := _read_fields(ctx, model, fields):
@@ -444,12 +489,9 @@ def execute_method(ctx: ToolContext) -> Any:
     count = None
     if args and isinstance(args[0], list) and all(isinstance(i, int) for i in args[0]):
         count = len(args[0])
-    touched: set[str] = set()
+    touched = collect_field_names([args, kwargs])
     for item in [*args, *kwargs.values()]:
-        names_fields = isinstance(item, list) and all(isinstance(i, str) for i in item)
-        if isinstance(item, dict) or names_fields:
-            touched |= set(item)
-    touched |= domain_fields(kwargs.get("domain"))
+        touched |= domain_fields(item)
     with ctx.guard(
         operation=Operation.EXECUTE, model=model, method=method, fields=touched, count=count
     ) as g:
@@ -468,7 +510,7 @@ def call_onchange(ctx: ToolContext) -> Any:
     spec = ctx.arguments.get("fields_spec")
     if spec is not None and not isinstance(spec, dict):
         raise ToolInputError("'fields_spec' must be an object")
-    touched = set(values) | set(changed) | set(spec or ())
+    touched = set(changed) | collect_field_names(values) | collect_field_names(spec or {})
     with ctx.guard(operation=Operation.READ, model=model, fields=touched, count=1) as g:
         if spec is None:
             spec = _default_onchange_spec(ctx, model)
