@@ -686,6 +686,7 @@ def dashboard(
         + f'min="1" max="100000" value="{esc(policy["max_records_per_call"])}"></div>'
         + area("execute_method_allowlist", "Allowed methods", "empty = any non-blocked")
         + area("forbidden_methods", "Extra forbidden methods", "on top of the built-in list")
+        + area("transient_allowlist", "Allowed wizards", "TRANSIENT_ALLOWLIST — all others refused")
         + '</div><h3>Human approval</h3><p><small>Held calls wait in '
         + '<a href="/admin/approvals">Approvals</a>; the agent repeats the call once approved.'
         + "</small></p><div class=\"row\"><div>"

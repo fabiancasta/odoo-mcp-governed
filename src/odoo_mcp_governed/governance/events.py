@@ -119,6 +119,9 @@ class ToolCall:
 
     arg_digest: str = ""
     ts: datetime = field(default_factory=utcnow)
+    model_transient: bool = False
+    """Whether ``model`` is a wizard (transient model) in the target Odoo.
+    Looked up by the tool layer; not part of the audit record."""
 
     def describe(self) -> str:
         target = self.model or "-"

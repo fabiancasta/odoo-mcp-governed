@@ -212,6 +212,11 @@ class PolicyConfig:
     """Agents (token subjects) refused outright, whatever they ask for. Other
     agents keep working."""
 
+    transient_allowlist: frozenset[str] = frozenset()
+    """Wizards (transient models) agents may use. Every other wizard is
+    refused: a wizard acts on other models — a merge wizard rewrites and
+    deletes partners — without going through their write and delete gates."""
+
     sandbox_profiles: frozenset[str] = frozenset()
     """Non-production profiles marked as sandboxes: model lists and the
     execute_method switch and allowlist do not apply there, and risk is only
@@ -367,6 +372,23 @@ class PolicyEngine:
             )
 
         sandbox = call.profile in cfg.sandbox_profiles
+        if (
+            call.model is not None
+            and call.model_transient
+            and not sandbox
+            and call.model not in cfg.transient_allowlist
+        ):
+            return PolicyVerdict(
+                allowed=False,
+                reasons=(
+                    _reason(
+                        "transient_model",
+                        f"{call.model!r} is a wizard (transient model): wizards change other "
+                        "models' records without those models' own permissions, so they are "
+                        "refused unless listed in TRANSIENT_ALLOWLIST",
+                    ),
+                ),
+            )
         allowed = frozenset({WILDCARD}) if sandbox else cfg.allowed_models
         writable = frozenset({WILDCARD}) if sandbox else cfg.writable_models
         deletable = frozenset({WILDCARD}) if sandbox else cfg.deletable_models

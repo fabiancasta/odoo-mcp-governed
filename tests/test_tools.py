@@ -40,6 +40,13 @@ class FakeOdoo:
         return 2
 
 
+def data_calls(fake: FakeOdoo) -> list:
+    """Calls that touched data. The registry lookup that tells wizards apart
+    (``ir.model`` search for transient models) is metadata, not data."""
+    return [c for c in fake.calls
+            if not (c[0] == "ir.model" and c[2] == [[["transient", "=", True]]])]
+
+
 @pytest.fixture
 def env(tmp_path):
     settings = Settings(
@@ -100,50 +107,50 @@ class TestNeverReachesOdoo:
         is_error, body = call(d, "search_count", model="res.partner",
                               domain=[["user_ids.password", "=", "hunter2"]])
         assert is_error and "credential" in body
-        assert fake.calls == []
+        assert data_calls(fake) == []
 
     def test_password_oracle_through_name_search(self, env) -> None:
         _, fake, d = env
         is_error, _ = call(d, "name_search", model="res.partner", name="a",
                            domain=[["api_key", "!=", False]])
-        assert is_error and fake.calls == []
+        assert is_error and data_calls(fake) == []
 
     def test_denylisted_model(self, env) -> None:
         _, fake, d = env
         is_error, body = call(d, "search_records", model="ir.config_parameter")
-        assert is_error and "denylist" in body and fake.calls == []
+        assert is_error and "denylist" in body and data_calls(fake) == []
 
     def test_limit_above_the_ceiling_is_refused_not_truncated(self, env) -> None:
         """Silently capping to 50 would let the agent believe it saw
         everything. Refusing tells it to paginate."""
         _, fake, d = env
         is_error, body = call(d, "search_records", model="res.partner", limit=51)
-        assert is_error and "limit is 50" in body and fake.calls == []
+        assert is_error and "limit is 50" in body and data_calls(fake) == []
 
     def test_write_to_read_only_model(self, env) -> None:
         _, fake, d = env
         is_error, _ = call(d, "update_record", model="product.template", record_id=1,
                            values={"name": "x"})
-        assert is_error and fake.calls == []
+        assert is_error and data_calls(fake) == []
 
     def test_execute_method_is_off_by_default(self, env) -> None:
         _, fake, d = env
         is_error, body = call(d, "execute_method", model="res.partner", method="action_archive",
                               args=[[1]])
-        assert is_error and "disabled" in body and fake.calls == []
+        assert is_error and "disabled" in body and data_calls(fake) == []
 
     def test_upload_to_a_read_only_model(self, env) -> None:
         _, fake, d = env
         is_error, _ = call(d, "upload_attachment", model="product.template", record_id=1,
                            filename="a.txt", data_base64=base64.b64encode(b"x").decode())
-        assert is_error and fake.calls == []
+        assert is_error and data_calls(fake) == []
 
 
 class TestToolBehaviour:
     def test_search_defaults_to_the_ceiling_when_lower(self, env) -> None:
         _, fake, d = env
         call(d, "search_records", model="res.partner")
-        [search] = [c for c in fake.calls if c[1] == "search_read"]
+        [search] = [c for c in data_calls(fake) if c[1] == "search_read"]
         assert search[3]["limit"] == 50
 
     def test_sensitive_keys_are_stripped_from_results(self, env) -> None:
@@ -183,7 +190,7 @@ class TestToolBehaviour:
         is_error, body = call(d, "get_attachment", attachment_id=9)
         assert is_error and "hr.employee" in body
         # Only the metadata lookup happened — never the file content.
-        assert [c[3].get("fields") for c in fake.calls] == [
+        assert [c[3].get("fields") for c in data_calls(fake)] == [
             ["name", "mimetype", "file_size", "res_model", "res_id"]]
 
     def test_list_models_hides_unreachable_models(self, env) -> None:
@@ -200,13 +207,13 @@ class TestToolBehaviour:
         too_big = base64.b64encode(b"x" * (11 * 1024 * 1024)).decode()
         is_error, body = call(d, "upload_attachment", model="res.partner", record_id=1,
                               filename="big.bin", data_base64=too_big)
-        assert is_error and "MB limit" in body and fake.calls == []
+        assert is_error and "MB limit" in body and data_calls(fake) == []
 
     def test_invalid_base64_is_rejected(self, env) -> None:
         _, fake, d = env
         is_error, body = call(d, "upload_attachment", model="res.partner", record_id=1,
                               filename="a", data_base64="@@@not base64@@@")
-        assert is_error and "base64" in body and fake.calls == []
+        assert is_error and "base64" in body and data_calls(fake) == []
 
     def test_argument_errors_are_audited(self, env) -> None:
         """Malformed calls feed the repeated-errors detector, so they must be

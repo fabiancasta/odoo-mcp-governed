@@ -228,6 +228,7 @@ class AllowlistProbingDetector:
             "method_not_allowed",
             "sensitive_field",
             "attachment_content",
+            "transient_model",
         }
         denials = [
             e

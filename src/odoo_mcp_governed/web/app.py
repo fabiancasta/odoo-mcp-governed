@@ -775,7 +775,8 @@ def create_app(runtime: Runtime) -> FastAPI:
             "allow_execute_method": form.get("allow_execute_method") == "1",
         }
         for key in ("allowed_models", "writable_models", "deletable_models", "denied_models",
-                    "execute_method_allowlist", "forbidden_methods", "sensitive_fields"):
+                    "execute_method_allowlist", "forbidden_methods", "sensitive_fields",
+                    "transient_allowlist"):
             changes[key] = str(form.get(key) or "")
         changes["approval_required"] = [str(v) for v in form.getlist("approval_required")]
         changes["approval_bulk_threshold"] = int(form.get("approval_bulk_threshold") or 20)

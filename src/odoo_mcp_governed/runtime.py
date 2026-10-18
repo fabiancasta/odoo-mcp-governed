@@ -63,6 +63,25 @@ class Snapshot:
     client: OdooClient
     _facts: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
+    def is_transient(self, model: str) -> bool:
+        """Whether ``model`` is a wizard in this Odoo. The list is read once
+        per snapshot; if the registry cannot be read, a name containing
+        "wizard" still counts as one — when unsure, err towards refusing."""
+        names = self._facts.get("transient_models")
+        if names is None:
+            try:
+                rows = self.client.execute(
+                    "ir.model", "search_read", [[["transient", "=", True]]], {"fields": ["model"]}
+                )
+                names = frozenset(
+                    r["model"] for r in rows
+                    if isinstance(r, dict) and r.get("transient", True) and r.get("model")
+                ) if isinstance(rows, list) else frozenset()
+                self._facts["transient_models"] = names
+            except Exception:  # noqa: BLE001 - see docstring
+                return "wizard" in model
+        return model in names
+
     def settings_access(self) -> bool | None:
         """Whether the profile's Odoo user has Settings access, or ``None``
         when Odoo cannot say. A known answer is kept for the life of this

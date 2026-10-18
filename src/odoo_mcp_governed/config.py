@@ -152,6 +152,9 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
 
+    transient_allowlist: ModelSet = frozenset()
+    """Wizards (transient models) agents may use; all others are refused."""
+
     sensitive_fields: ModelSet = SENSITIVE_FIELDS
     """Glob patterns for credential fields, on top of a built-in floor that
     cannot be removed (*password*, *secret*, *token*, *api_key*...)."""
@@ -183,6 +186,7 @@ class Settings(BaseSettings):
         "forbidden_methods",
         "execute_method_allowlist",
         "sensitive_fields",
+        "transient_allowlist",
         "approval_required",
         "protected_hosts",
         "mcp_allowed_origins",

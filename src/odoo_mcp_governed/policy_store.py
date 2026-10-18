@@ -33,6 +33,7 @@ _SET_FIELDS = {
     "sensitive_fields",
     "blocked_actors",
     "approval_required",
+    "transient_allowlist",
 }
 _EDITABLE = _SET_FIELDS | {
     "allow_execute_method", "max_records_per_call", "panic", "approval_bulk_threshold",
@@ -50,6 +51,7 @@ def policy_from_settings(settings: Settings) -> PolicyConfig:
         allow_execute_method=settings.allow_execute_method,
         execute_method_allowlist=settings.execute_method_allowlist,
         sensitive_fields=settings.sensitive_fields,
+        transient_allowlist=settings.transient_allowlist,
         approval_required=settings.approval_required,
         approval_bulk_threshold=settings.approval_bulk_threshold,
         max_records_per_call=settings.max_records_per_call,

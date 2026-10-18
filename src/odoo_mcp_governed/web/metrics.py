@@ -19,6 +19,7 @@ _CATEGORIES = {
     "model_not_writable": "not allowed",
     "model_not_deletable": "not allowed",
     "tool_disabled": "not allowed",
+    "transient_model": "not allowed",
     "execute_disabled": "not allowed",
     "method_not_allowed": "not allowed",
     "method_blocked": "methods",

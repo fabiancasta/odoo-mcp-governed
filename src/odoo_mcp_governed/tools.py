@@ -84,6 +84,7 @@ class ToolContext:
             fields_touched=tuple(sorted(set(fields))),
             record_count=count,
             arg_digest=digest_args(self.arguments),
+            model_transient=bool(model) and self.snapshot.is_transient(model),
         )
         return self.runtime.engine.guard(call)
 
@@ -547,7 +548,8 @@ def model_info(ctx: ToolContext) -> Any:
             {
                 "model": info["model"],
                 "name": info["name"],
-                "description": info.get("info") or "",
+                # ir.model.info is the Python class docstring, often a mixin's.
+                "description": info["name"],
                 "transient": info.get("transient", False),
                 "modules": info.get("modules", ""),
                 "field_count": len(defs),
@@ -591,11 +593,14 @@ def list_models(ctx: ToolContext) -> Any:
         policy = ctx.policy
         # Only what this server would actually let the agent read: listing
         # unreachable models just invites calls that will be refused.
+        sandbox = ctx.snapshot.profile.name in policy.sandbox_profiles
         visible = [
             {**row, "writable": matches(row["model"], policy.writable_models)}
             for row in rows
             if row["model"] not in policy.denied_models
             and matches(row["model"], policy.allowed_models)
+            and (not row.get("transient") or sandbox
+                 or row["model"] in policy.transient_allowlist)
         ]
         return _done(
             g,

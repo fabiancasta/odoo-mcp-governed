@@ -101,7 +101,9 @@ class TestEndToEnd:
             is_error, body = call(d, tool, **args)
             assert is_error and "read-only" in body, tool
         # Only the read-only Settings-access check may reach Odoo; no write may.
-        assert [(m, meth) for m, meth, *_ in fake.calls] in ([], [("res.users", "has_group")])
+        # Only metadata lookups — Settings access, the wizard registry — may
+        # reach Odoo; no write may.
+        assert not [c for c in fake.calls if c[1] in ("create", "write", "unlink")]
         assert call(d, "search_count", model="res.partner")[0] is False
 
     def test_relabelling_takes_effect_on_the_next_call(self, runtime) -> None:
