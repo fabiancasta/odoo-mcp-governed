@@ -148,3 +148,16 @@ class TestMalformedInput:
         response = client.post("/mcp", json=rpc("ping"),
                                headers={**bearer(runtime), "X-Trace": "a" * 2_000})
         assert response.status_code == 200
+
+
+def test_a_flood_of_bad_tokens_does_not_lock_out_valid_agents(tmp_path) -> None:
+    """Found by the red-team harness: the failed-auth limit was checked before
+    verifying, so once an IP was exhausted every request from it got 429 —
+    including valid agents sharing that IP (every container behind a Docker
+    bridge). Ten bad tokens a minute were a denial of service."""
+    runtime, client = app_with(tmp_path, rate_limit_auth_fail="3/minute")
+    bad = {"Authorization": "Bearer not-a-token"}
+    for _ in range(5):
+        client.post("/mcp", json=rpc("ping"), headers=bad)
+    assert client.post("/mcp", json=rpc("ping"), headers=bad).status_code == 429
+    assert client.post("/mcp", json=rpc("ping"), headers=bearer(runtime)).status_code == 200

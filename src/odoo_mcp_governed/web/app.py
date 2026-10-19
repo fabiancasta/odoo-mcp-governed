@@ -296,11 +296,6 @@ def create_app(runtime: Runtime) -> FastAPI:
         ip = client_ip(request)
         if not origin_allowed(request.headers.get("origin")):
             return JSONResponse({"error": "origin not allowed"}, status_code=403)
-        # Checked before verifying, so a stream of bad tokens stops costing
-        # anything once it is clearly not a typo.
-        if retry := limits["auth_fail"].exhausted(ip):
-            return too_many(retry)
-
         header = request.headers.get("authorization", "")
         scheme, _, token = header.partition(" ")
         try:
@@ -308,6 +303,13 @@ def create_app(runtime: Runtime) -> FastAPI:
                 raise AuthError("missing bearer token")
             claims = verify_token(settings, token.strip())
         except AuthError as exc:
+            # Limited per IP, but only ever applied to failures: a valid token
+            # from the same IP — another container on the same Docker bridge —
+            # must keep working while someone floods bad ones. Once an IP is
+            # over the limit its failures are no longer audited one by one,
+            # so a flood cannot flood the audit log either.
+            if retry := limits["auth_fail"].exhausted(ip):
+                return too_many(retry)
             limits["auth_fail"].hit(ip)
             # Failed authentication is recorded: a stream of them is a
             # credential-stuffing attempt, and the audit log should show it.
