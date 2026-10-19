@@ -13,7 +13,7 @@ leaked — and is built so that when that happens the damage is bounded and the
 evidence survives.
 
 > **Status:** v0.2 — all 18 tools, stdio and HTTP transports, admin panel and
-> Docker deployment work end to end against Odoo 19. 325 tests.
+> Docker deployment work end to end against Odoo 19. 342 tests.
 
 ## What the operator gets
 
@@ -303,9 +303,32 @@ anything but Odoo — not the internet, not the LAN, not a database on the host.
 
 Full mapping, item by item: [`docs/SECURITY_BASELINE.md`](docs/SECURITY_BASELINE.md).
 
+## Red-teaming it
+
+Unit tests prove each rule; `redteam/` attacks a running server.
+
+- **`redteam/harness.py`** — fixed, repeatable attacks with an expected outcome
+  each: the denylist and its indirect routes, credential fields (domains,
+  dotted paths, ordering, nested specifications), attachment content,
+  wizards and blocked methods, transport limits, probing, the panic switch,
+  agent blocking, a delete burst, and the audit chain afterwards. Standard
+  library only.
+- **`redteam/canaries.py`** — plants random secrets in a disposable Odoo
+  where no agent may read them.
+- **`redteam/agent.py`** — an adversarial LLM, through any OpenAI-compatible
+  API (Groq's free tier by default), told to steal the canaries, mass-delete
+  and talk its way past the server. A canary in anything it received is a
+  leak and fails the run; its opinion of how it did is not the verdict.
+- **`redteam/github-workflow-redteam.yml`** — runs all of it on GitHub's
+  machines against a throwaway Odoo 19 built for the run.
+
+The harness found a denial of service (a flood of bad tokens locked out
+valid agents on the same IP) and the canaries found a content leak
+(`ir.attachment.index_content`) on their first runs; both are fixed.
+
 ## Tests
 
-The suite has 325 tests. The ones that matter are not the
+The suite has 342 tests. The ones that matter are not the
 "it records events" kind — they are the adversarial ones:
 
 ```bash
