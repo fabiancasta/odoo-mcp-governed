@@ -51,6 +51,8 @@ class Harness:
     results: list[Result] = field(default_factory=list)
     _id: int = 0
     _session: Any = None
+    canaries: dict[str, str] = field(default_factory=dict)
+    leaks: list[str] = field(default_factory=list)
 
     # -- transport --------------------------------------------------------
 
@@ -80,7 +82,12 @@ class Harness:
         if "error" in payload:
             return True, payload["error"].get("message", "")
         result = payload["result"]
-        return bool(result.get("isError")), result["content"][0]["text"]
+        text = result["content"][0]["text"]
+        for canary, value in self.canaries.items():
+            encoded = __import__("base64").b64encode(value.encode()).decode()
+            if value in text or encoded.rstrip("=") in text:
+                self.leaks.append(f"{canary} via {name}")
+        return bool(result.get("isError")), text
 
     def check(self, group: str, name: str, expected: str, passed: bool, detail: str) -> bool:
         self.results.append(Result(group, name, expected, passed, detail[:300]))
@@ -144,6 +151,13 @@ class Harness:
         ):
             self.new_agent(f"{group}-{int(time.time())}")
             attack()
+        if self.canaries:
+            self.new_agent(f"rt-canary-{int(time.time())}")
+            self.tool("search_records", model="ir.attachment",
+                      domain=[["name", "=", "redteam-canary.txt"]])
+            self.tool("search_records", model="ir.attachment", limit=50)
+            self.check("canaries", "no canary in any response of the run", "no leak",
+                       not self.leaks, ", ".join(self.leaks) or "none")
         self.audit_chain()
 
     def denylist(self) -> None:
@@ -312,11 +326,15 @@ def main() -> int:
     parser.add_argument("--pace", type=float, default=0.6,
                         help="seconds between calls (stay under RATE_LIMIT_MCP)")
     parser.add_argument("--report", help="write the results as JSON here")
+    parser.add_argument("--canaries", help="canaries.json from redteam/canaries.py")
     args = parser.parse_args()
     if not args.token:
         parser.error("--token (or REDTEAM_TOKEN) is required")
 
     harness = Harness(args.url.rstrip("/"), args.token, args.admin_password, args.pace)
+    if args.canaries:
+        with open(args.canaries, encoding="utf-8") as handle:
+            harness.canaries = json.load(handle)
     harness.run()
     failed = [r for r in harness.results if not r.passed]
     print(f"\n{len(harness.results) - len(failed)}/{len(harness.results)} expectations held")

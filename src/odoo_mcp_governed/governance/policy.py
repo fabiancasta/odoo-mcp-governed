@@ -118,7 +118,9 @@ CRITICAL_DENIED_MODELS = frozenset(
 # ir.attachment is one model holding every other model's files, so reading
 # ``datas`` there would skip that check for all of them at once.
 ATTACHMENT_MODEL = "ir.attachment"
-ATTACHMENT_CONTENT_FIELDS = frozenset({"datas", "raw", "db_datas", "store_fname"})
+# index_content is the text Odoo extracts from a file for its own search:
+# reading it, or filtering on it, reveals the file as surely as datas does.
+ATTACHMENT_CONTENT_FIELDS = frozenset({"datas", "raw", "db_datas", "store_fname", "index_content"})
 
 WILDCARD = "*"
 

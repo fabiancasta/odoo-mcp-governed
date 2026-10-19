@@ -226,3 +226,29 @@ class TestNestedStructures:
         _, fake, d = wide_open
         assert call(d, "search_records", model="res.users", order="password desc")[0]
         assert not odoo_saw(fake, "res.users")
+
+
+class TestIndexedContent:
+    """Found by the red-team canaries: ir.attachment.index_content holds the
+    extracted text of a file for Odoo's search, so an all-fields read returned
+    the content of an attachment whose owner model was denied, and a domain
+    on it was a content oracle."""
+
+    def test_naming_or_filtering_on_index_content_is_refused(self, wide_open) -> None:
+        _, fake, d = wide_open
+        assert call(d, "search_records", model="ir.attachment", fields=["index_content"])[0]
+        assert call(d, "search_count", model="ir.attachment",
+                    domain=[["index_content", "ilike", "CANARY"]])[0]
+        assert not odoo_saw(fake, "ir.attachment")
+
+    def test_all_fields_read_leaves_index_content_out(self, wide_open) -> None:
+        _, fake, d = wide_open
+        fake.responses[("ir.attachment", "fields_get")] = {
+            "name": {"type": "char"}, "index_content": {"type": "text"}}
+        fake.responses[("ir.attachment", "search_read")] = [
+            {"id": 1, "name": "x", "index_content": "CANARY"}]
+        is_error, body = call(d, "search_records", model="ir.attachment")
+        assert not is_error and "CANARY" not in json.dumps(body)
+        [read] = [kw for m, meth, _a, kw in fake.calls
+                  if m == "ir.attachment" and meth == "search_read"]
+        assert read["fields"] == ["name"]
