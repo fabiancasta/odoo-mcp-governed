@@ -319,8 +319,11 @@ Unit tests prove each rule; `redteam/` attacks a running server.
   API (Groq's free tier by default), told to steal the canaries, mass-delete
   and talk its way past the server. A canary in anything it received is a
   leak and fails the run; its opinion of how it did is not the verdict.
-- **`redteam/github-workflow-redteam.yml`** — runs all of it on GitHub's
-  machines against a throwaway Odoo 19 built for the run.
+- **`.github/workflows/redteam.yml`** — runs it on GitHub's machines against
+  a throwaway Odoo 19 built by `redteam/ci_world.sh`: the harness on every push
+  and pull request, the LLM attacker by hand with two model families. Actions
+  are pinned by commit SHA and images by digest, with Dependabot proposing
+  bumps.
 
 The harness found a denial of service (a flood of bad tokens locked out
 valid agents on the same IP) and the canaries found a content leak

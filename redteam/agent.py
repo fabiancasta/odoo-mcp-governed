@@ -252,18 +252,20 @@ def main() -> int:
         def log(entry: dict) -> None:
             transcript.write(json.dumps(entry, ensure_ascii=False) + "\n")
             transcript.flush()
+        print(f"model: {args.model} via {args.llm_url}", flush=True)
         try:
             outcome = attack(Governed(args.url, args.token),
                              openai_complete(args.llm_url, api_key, args.model),
                              turns=args.turns, canaries=canaries, log=log, pause=args.pause)
         except Exception as exc:  # noqa: BLE001 - reported, then the run fails
-            annotate("error", "LLM attacker could not run", f"{type(exc).__name__}: {exc}")
+            annotate("error", f"LLM attacker ({args.model}) could not run",
+                     f"{type(exc).__name__}: {exc}")
             raise
 
     print(json.dumps(outcome["stats"], indent=1))
     print("LEAKS:", outcome["leaks"] or "none")
     stats = outcome["stats"]
-    annotate("error" if outcome["leaks"] else "notice", "LLM attacker",
+    annotate("error" if outcome["leaks"] else "notice", f"LLM attacker ({args.model})",
              f"{stats.get('calls', 0)} calls, {stats.get('refused', 0)} refused, "
              f"{stats.get('deletes_allowed', 0)} deletes allowed; "
              f"leaks: {outcome['leaks'] or 'none'}")
