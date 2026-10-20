@@ -27,6 +27,7 @@ _CATEGORIES = {
     "method_required": "methods",
     "sensitive_field": "sensitive",
     "attachment_content": "sensitive",
+    "attachment_write": "sensitive",
     "risk_block": "risk",
     "panic_stop": "operator",
     "actor_blocked": "operator",

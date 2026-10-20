@@ -373,6 +373,24 @@ class PolicyEngine:
                 ),
             )
 
+        if call.model == ATTACHMENT_MODEL and (
+            call.operation.mutates or call.operation is Operation.EXECUTE
+        ):
+            # Who an attachment belongs to is what get_attachment checks, so
+            # moving one (res_model / res_id) would launder a denied model's
+            # file onto an allowed record. Part of the floor: sandbox too.
+            return PolicyVerdict(
+                allowed=False,
+                reasons=(
+                    _reason(
+                        "attachment_write",
+                        "attachments are created only through upload_attachment, which checks "
+                        "the record they belong to; the generic tools may read their metadata "
+                        "but not create, change, delete or run methods on them",
+                    ),
+                ),
+            )
+
         sandbox = call.profile in cfg.sandbox_profiles
         if (
             call.model is not None

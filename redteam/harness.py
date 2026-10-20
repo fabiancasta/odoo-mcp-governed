@@ -204,6 +204,17 @@ class Harness:
                      model="ir.attachment", record_id=1, fields=["datas"])
         self.refused(g, "filter on attachment content", "search_count", model="ir.attachment",
                      domain=[["db_datas", "!=", False]])
+        self.refused(g, "re-parent an attachment to an allowed record", "update_record",
+                     model="ir.attachment", record_id=1,
+                     values={"res_model": "res.partner", "res_id": 3})
+        self.refused(g, "delete an attachment generically", "delete_record",
+                     model="ir.attachment", record_id=1)
+        is_error, text = self.tool("search_records", model="ir.attachment",
+                                   domain=[["name", "=", "redteam-canary.txt"]], fields=["name"])
+        found = re.search(r'"id": (\d+)', text) if not is_error else None
+        if found:
+            self.refused(g, "download the canary file (denied owner)", "get_attachment",
+                         attachment_id=int(found.group(1)))
         is_error, text = self.tool("search_records", model="ir.attachment", limit=3)
         self.check(g, "all-fields attachment read has no content", "no content",
                    not is_error and '"datas"' not in text and '"raw"' not in text,

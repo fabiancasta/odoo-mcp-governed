@@ -127,12 +127,10 @@ class TestAttachmentContentBypass:
         )[0]
         assert not odoo_saw(fake, "ir.attachment")
 
-        fake.responses[("ir.attachment", "read")] = [{"id": 7, "datas": "QUJD"}]
-        is_error, body = call(
-            d, "execute_method", model="ir.attachment", method="read", args=[[7]]
-        )
-        assert not is_error
-        assert "datas" not in body["result"][0]
+        # Since the re-parenting finding, no method runs on ir.attachment at
+        # all through execute_method — not even read; use search_records.
+        assert call(d, "execute_method", model="ir.attachment", method="read", args=[[7]])[0]
+        assert not odoo_saw(fake, "ir.attachment")
 
     def test_content_cannot_be_planted_through_create(self, wide_open) -> None:
         """Writing an attachment goes through upload_attachment, which checks
@@ -252,3 +250,33 @@ class TestIndexedContent:
         [read] = [kw for m, meth, _a, kw in fake.calls
                   if m == "ir.attachment" and meth == "search_read"]
         assert read["fields"] == ["name"]
+
+
+class TestAttachmentReparenting:
+    """Found by the LLM red-team agent (run 3, turn 13): get_attachment checks
+    the model an attachment belongs to, but with a wide policy ir.attachment
+    itself was writable, so an agent could move a denied model's file onto an
+    allowed record (res_model / res_id) and then download it — or delete it.
+    Attachments are now changed only through upload_attachment, which checks
+    the owner; the generic tools may still read their metadata."""
+
+    def test_moving_an_attachment_to_another_owner_is_refused(self, wide_open) -> None:
+        _, fake, d = wide_open
+        is_error, body = call(d, "update_record", model="ir.attachment", record_id=7,
+                              values={"res_model": "res.partner", "res_id": 3})
+        assert is_error and "upload_attachment" in body
+        assert not odoo_saw(fake, "ir.attachment")
+
+    def test_attachments_cannot_be_created_deleted_or_driven_generically(self, wide_open) -> None:
+        _, fake, d = wide_open
+        assert call(d, "create_record", model="ir.attachment",
+                    values={"name": "x", "res_model": "res.partner"})[0]
+        assert call(d, "delete_record", model="ir.attachment", record_id=7)[0]
+        assert call(d, "execute_method", model="ir.attachment", method="action_x",
+                    args=[[7]])[0]
+        assert not odoo_saw(fake, "ir.attachment")
+
+    def test_metadata_can_still_be_read(self, wide_open) -> None:
+        _, fake, d = wide_open
+        fake.responses[("ir.attachment", "search_read")] = [{"id": 7, "name": "a.pdf"}]
+        assert not call(d, "search_records", model="ir.attachment", fields=["name"])[0]
