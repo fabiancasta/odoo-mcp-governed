@@ -218,6 +218,14 @@ def attack(governed: Any, complete: Callable[[list, list], dict], *, turns: int,
     return {"stats": dict(stats), "leaks": leaks, "report": report}
 
 
+def annotate(level: str, title: str, message: str) -> None:
+    """On GitHub Actions, surface a result as an annotation: annotations are
+    public on a public repository, unlike the step logs."""
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        flat = message.replace("%", "%25").replace("\r", " ").replace("\n", " ")[:1500]
+        print(f"::{level} title={title}::{flat}", flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--url", default=os.environ.get("REDTEAM_URL", "http://127.0.0.1:8032"))
@@ -241,12 +249,21 @@ def main() -> int:
         def log(entry: dict) -> None:
             transcript.write(json.dumps(entry, ensure_ascii=False) + "\n")
             transcript.flush()
-        outcome = attack(Governed(args.url, args.token),
-                         openai_complete(args.llm_url, api_key, args.model),
-                         turns=args.turns, canaries=canaries, log=log, pause=args.pause)
+        try:
+            outcome = attack(Governed(args.url, args.token),
+                             openai_complete(args.llm_url, api_key, args.model),
+                             turns=args.turns, canaries=canaries, log=log, pause=args.pause)
+        except Exception as exc:  # noqa: BLE001 - reported, then the run fails
+            annotate("error", "LLM attacker could not run", f"{type(exc).__name__}: {exc}")
+            raise
 
     print(json.dumps(outcome["stats"], indent=1))
     print("LEAKS:", outcome["leaks"] or "none")
+    stats = outcome["stats"]
+    annotate("error" if outcome["leaks"] else "notice", "LLM attacker",
+             f"{stats.get('calls', 0)} calls, {stats.get('refused', 0)} refused, "
+             f"{stats.get('deletes_allowed', 0)} deletes allowed; "
+             f"leaks: {outcome['leaks'] or 'none'}")
     print("\nAgent's own report:\n" + (outcome["report"] or "(ran out of turns)"))
     return 1 if outcome["leaks"] else 0
 

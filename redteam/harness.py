@@ -337,7 +337,13 @@ def main() -> int:
             harness.canaries = json.load(handle)
     harness.run()
     failed = [r for r in harness.results if not r.passed]
-    print(f"\n{len(harness.results) - len(failed)}/{len(harness.results)} expectations held")
+    summary = f"{len(harness.results) - len(failed)}/{len(harness.results)} expectations held"
+    print(f"\n{summary}")
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        names = "; ".join(f"{r.group}: {r.name}" for r in failed)[:1200]
+        level = "error" if failed else "notice"
+        tail = f" — failed: {names}" if failed else ""
+        print(f"::{level} title=Red-team harness::{summary}{tail}")
     if args.report:
         with open(args.report, "w", encoding="utf-8") as handle:
             json.dump([asdict(r) for r in harness.results], handle, indent=1, ensure_ascii=False)
