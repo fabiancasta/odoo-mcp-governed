@@ -29,6 +29,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 
 from .. import __version__
 from ..governance import ChainStatus, Decision, Operation, Outcome, ToolCall
+from ..governance.agents import AgentError, AgentRule, parse_vars
+from ..governance.approvals import GRANT_MINUTES
 from ..odoo import OdooClient, OdooError
 from ..profiles import PROFILE_NAME, Profile, ProfileError
 from ..protocol import INVALID_REQUEST, PARSE_ERROR, Dispatcher, _error
@@ -40,6 +42,7 @@ from . import permissions, views
 from .auth import AdminSessions, AuthError, TokenStore, csrf_matches, password_matches, verify_token
 from .metrics import summarise
 from .ratelimit import RateLimiter
+from .totp import TotpVerifier
 
 log = logging.getLogger(__name__)
 
@@ -67,9 +70,14 @@ FLASH = {
     "policy_applied": ("Policy applied to the next call.", "ok"),
     "policy_unchanged": ("Nothing changed.", "ok"),
     "token_regenerated": (
-        "New token generated. The previous one still works until JWT_SECRET is rotated.",
+        "New token generated. Revoke the previous one on the Agents page if it is no "
+        "longer needed.",
         "ok",
     ),
+    "agent_saved": ("Agent saved. Its rule applies to its next call.", "ok"),
+    "agent_deleted": ("Agent rule deleted. Its tokens still follow the server policy.", "ok"),
+    "token_revoked": ("Revoked. The token is refused from its next request.", "ok"),
+    "grant_revoked": ("Standing approval withdrawn.", "ok"),
     "anchor_written": ("Anchor written to anchors.log.", "ok"),
     "panic_on": ("PANIC: every agent is stopped. Calls are refused until you resume.", "bad"),
     "panic_off": ("Service resumed. Agents can call again.", "ok"),
@@ -199,6 +207,7 @@ def create_app(runtime: Runtime) -> FastAPI:
         "health": RateLimiter(settings.rate_limit_health),
         "login": RateLimiter(settings.rate_limit_login),
     }
+    totp = TotpVerifier(settings.admin_totp_secret) if settings.admin_totp_secret else None
     cookie_name = "__Host-gov_admin" if settings.https_mode else "gov_admin"
     chain_cache: dict[str, Any] = {"at": 0.0, "status": None}
 
@@ -302,6 +311,10 @@ def create_app(runtime: Runtime) -> FastAPI:
             if scheme.lower() != "bearer" or not token.strip():
                 raise AuthError("missing bearer token")
             claims = verify_token(settings, token.strip())
+            refusal = runtime.agents.refusal(
+                claims, require_registered=settings.require_registered_tokens)
+            if refusal:
+                raise AuthError(refusal)
         except AuthError as exc:
             # Limited per IP, but only ever applied to failures: a valid token
             # from the same IP — another container on the same Docker bridge —
@@ -364,7 +377,18 @@ def create_app(runtime: Runtime) -> FastAPI:
 
         pinned = claims.get("profile")
         pinned = str(pinned) if isinstance(pinned, str) and pinned else None
-        result = await run_in_threadpool(dispatcher.handle_payload, payload, actor, pinned)
+        rule = runtime.engine.policy.config.agent_rules.get(actor)
+        if rule is not None and rule.profile:
+            # The registry pins the agent; a token claiming another profile
+            # is refused by policy rather than quietly rerouted.
+            pinned = pinned or rule.profile
+        try:
+            variables = parse_vars(claims.get("vars") if isinstance(claims.get("vars"), dict)
+                                   else None)
+        except AgentError:
+            variables = {}
+        result = await run_in_threadpool(dispatcher.handle_payload, payload, actor, pinned,
+                                         variables)
         headers: dict[str, str] = {}
         if any(isinstance(m, dict) and m.get("method") == "initialize" for m in messages):
             headers["Mcp-Session-Id"] = secrets.token_urlsafe(24)
@@ -407,7 +431,7 @@ def create_app(runtime: Runtime) -> FastAPI:
     async def admin_home(request: Request, edit: str | None = None, m: str | None = None):
         session = session_for(request)
         if session is None:
-            return HTMLResponse(views.login_page())
+            return HTMLResponse(views.login_page(totp=totp is not None))
         return await run_in_threadpool(render_dashboard, session, edit_name=edit, flash_code=m)
 
     def render_dashboard(session, *, edit_name=None, flash_code=None, error=None,
@@ -472,15 +496,21 @@ def create_app(runtime: Runtime) -> FastAPI:
         allowed, retry = limits["login"].hit(client_ip(request))
         if not allowed:
             return HTMLResponse(
-                views.login_page(f"Too many attempts. Try again in {retry}s."),
+                views.login_page(f"Too many attempts. Try again in {retry}s.",
+                                 totp=totp is not None),
                 status_code=429, headers={"Retry-After": str(retry)},
             )
         form = await request.form()
         supplied = str(form.get("password") or "")
         ok = password_matches(settings.admin_password, supplied)
+        if totp is not None:
+            # Both checked every time, so the answer never says which was wrong.
+            ok = totp.verify(str(form.get("totp") or "")) and ok
         await run_in_threadpool(runtime.record_login, admin_actor(request), success=ok)
         if not ok:
-            return HTMLResponse(views.login_page("Wrong password."), status_code=401)
+            error = "Wrong password or code." if totp is not None else "Wrong password."
+            return HTMLResponse(views.login_page(error, totp=totp is not None),
+                                status_code=401)
         sid, _ = sessions.create(client_ip(request))
         response = RedirectResponse("/admin", status_code=303)
         response.set_cookie(
@@ -696,7 +726,7 @@ def create_app(runtime: Runtime) -> FastAPI:
         flash, kind = FLASH.get(m or "", (None, "ok"))
         return HTMLResponse(views.approvals_page(
             csrf=session.csrf, pending=runtime.approvals.pending(),
-            recent=runtime.approvals.recent(),
+            recent=runtime.approvals.recent(), grants=runtime.approvals.grants(),
             enabled=bool(runtime.engine.policy.config.approval_required),
             notifier=runtime.notifier.enabled,
             ttl_minutes=int(runtime.approvals.ttl.total_seconds() // 60),
@@ -711,13 +741,122 @@ def create_app(runtime: Runtime) -> FastAPI:
         if form is None:
             return back("csrf", "/admin/approvals")
         raw, decision = str(form.get("id") or ""), form.get("decision")
-        if not raw.isdigit() or decision not in ("approve", "deny"):
+        if not raw.isdigit() or decision not in ("approve", "deny", "approve_similar",
+                                                 "approve_group", "deny_group"):
             return back("approval_gone", "/admin/approvals")
-        decided = await run_in_threadpool(runtime.decide_approval, int(raw),
-                                          decision == "approve", actor=admin_actor(request))
+        minutes = str(form.get("minutes") or "30")
+        grant = int(minutes) if decision == "approve_similar" and minutes.isdigit() else 0
+        if decision == "approve_similar" and grant not in GRANT_MINUTES:
+            return back("approval_gone", "/admin/approvals")
+        decided = await run_in_threadpool(
+            lambda: runtime.decide_approval(
+                int(raw), decision.startswith("approve"), actor=admin_actor(request),
+                grant_minutes=grant, group=decision.endswith(("_group", "_similar"))))
+        decision = "approve" if decision.startswith("approve") else "deny"
         if not decided:
             return back("approval_gone", "/admin/approvals")
         return back("approved" if decision == "approve" else "denied", "/admin/approvals")
+
+    @app.post("/admin/approvals/grant/revoke")
+    async def grant_revoke(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        raw = str(form.get("id") or "") if form is not None else ""
+        if not raw.isdigit():
+            return back("csrf", "/admin/approvals")
+        with runtime.admin_action(admin_actor(request), "admin.approval.grant_revoke",
+                                  detail={"grant": int(raw)}):
+            runtime.approvals.revoke_grant(int(raw))
+        return back("grant_revoked", "/admin/approvals")
+
+    # -- admin: agent registry -----------------------------------------------
+
+    def agents_page(session, *, flash=None, kind="ok", issued=None, edit=None):
+        rules = runtime.agents.rules()
+        return HTMLResponse(views.agents_page(
+            csrf=session.csrf, rules=rules, tokens=runtime.agents.tokens(),
+            profiles=[p["name"] for p in runtime.profiles.public()],
+            tools=sorted(TOOLS), issued=issued, edit=rules.get(edit) if edit else None,
+            flash=flash, flash_kind=kind, require_registered=settings.require_registered_tokens,
+        ))
+
+    @app.get("/admin/agents", response_class=HTMLResponse)
+    async def agents_view(request: Request, m: str | None = None, edit: str | None = None):
+        session = session_for(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        flash, kind = FLASH.get(m or "", (None, "ok"))
+        return agents_page(session, flash=flash, kind=kind, edit=edit)
+
+    @app.post("/admin/agents/save", response_class=HTMLResponse)
+    async def agents_save(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf", "/admin/agents")
+        name = str(form.get("name") or "").strip()
+        try:
+            rule = AgentRule.from_dict(name, {
+                "models": str(form.get("models") or ""), "tools": form.getlist("tools"),
+                "read_only": form.get("read_only") == "yes",
+                "daily_quota": str(form.get("daily_quota") or "0"),
+                "profile": str(form.get("profile") or ""), "scope": str(form.get("scope") or ""),
+                "note": str(form.get("note") or ""),
+            })
+            await run_in_threadpool(runtime.save_agent, rule, actor=admin_actor(request))
+        except (AgentError, ValueError) as exc:
+            return agents_page(session, flash=f"Agent not saved: {exc}", kind="bad")
+        return back("agent_saved", "/admin/agents")
+
+    @app.post("/admin/agents/delete")
+    async def agents_delete(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None or form.get("confirm") != "yes":
+            return back("csrf", "/admin/agents")
+        await run_in_threadpool(runtime.delete_agent, str(form.get("name") or ""),
+                                actor=admin_actor(request))
+        return back("agent_deleted", "/admin/agents")
+
+    @app.post("/admin/agents/token", response_class=HTMLResponse)
+    async def agents_token(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf", "/admin/agents")
+        name = str(form.get("name") or "").strip()
+        hours = str(form.get("hours") or "").strip()
+        try:
+            variables = parse_vars([v for v in str(form.get("vars") or "").split(",")
+                                    if v.strip()])
+            issued = await run_in_threadpool(lambda: runtime.issue_agent_token(
+                name, actor=admin_actor(request), hours=int(hours) if hours.isdigit() else None,
+                variables=variables, label=str(form.get("label") or "")))
+        except (AgentError, ValueError) as exc:
+            return agents_page(session, flash=f"No token issued: {exc}", kind="bad")
+        # Shown once, in this response only: it is not stored to be shown again.
+        return agents_page(session, issued=issued)
+
+    @app.post("/admin/agents/revoke")
+    async def agents_revoke(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf", "/admin/agents")
+        if form.get("jti"):
+            await run_in_threadpool(runtime.revoke_token, str(form.get("jti")),
+                                    actor=admin_actor(request))
+        elif form.get("name") and form.get("confirm") == "yes":
+            await run_in_threadpool(runtime.revoke_agent_tokens, str(form.get("name")),
+                                    actor=admin_actor(request))
+        else:
+            return back("csrf", "/admin/agents")
+        return back("token_revoked", "/admin/agents")
 
     # -- admin: emergency controls ----------------------------------------
 
@@ -827,7 +966,7 @@ def create_app(runtime: Runtime) -> FastAPI:
             return back("csrf", "/token")
         with runtime.admin_action(admin_actor(request), "admin.token.regenerate",
                                   detail={"actor": actor, "profile": profile}):
-            tokens.regenerate(actor, profile)
+            tokens.regenerate(actor, profile, registry=runtime.agents)
         return back("token_regenerated", "/token")
 
     # -- admin: audit ------------------------------------------------------

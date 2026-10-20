@@ -29,7 +29,7 @@ from .approvals import ApprovalStore, needs_approval, needs_configurator_approva
 from .audit import AuditLog
 from .detectors import DetectionContext, Detector, DetectorConfig, default_detectors
 from .events import AuditEvent, Decision, Operation, Outcome, Signal, ToolCall, utcnow
-from .policy import PolicyEngine, PolicyVerdict, reason_code
+from .policy import REASON_SEPARATOR, PolicyEngine, PolicyVerdict, reason_code
 
 RISK_BLOCK = "risk_block"
 
@@ -196,7 +196,7 @@ class GovernanceEngine:
     def review(self, call: ToolCall) -> Judgement:
         """Decide what happens to ``call``. Performs no Odoo access and no writes."""
         now = self._now()
-        verdict = self.policy.evaluate(call)
+        verdict = self._quota(self.policy.evaluate(call), call, now)
         signals = self._collect_signals(call, now)
         history = self._history(call.actor, now, self.risk.config.window)
         score = self.risk.score(signals, history, now)
@@ -246,6 +246,20 @@ class GovernanceEngine:
             reasons=tuple(reasons),
             throttle_seconds=cfg.throttle_seconds if decision is Decision.THROTTLE else 0.0,
         )
+
+    def _quota(self, verdict: PolicyVerdict, call: ToolCall, now: datetime) -> PolicyVerdict:
+        """An agent's daily call quota, counted from the audit log (UTC day)."""
+        rule = self.policy.config.agent_rules.get(call.actor)
+        if not verdict.allowed or rule is None or not rule.daily_quota:
+            return verdict
+        if call.operation is Operation.ADMIN:
+            return verdict
+        day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        if self.audit.count_since(call.actor, day) < rule.daily_quota:
+            return verdict
+        return PolicyVerdict(allowed=False, reasons=(
+            f"agent_quota{REASON_SEPARATOR}agent {call.actor!r} has used its "
+            f"{rule.daily_quota} calls for today; it resumes at 00:00 UTC. Tell the user.",))
 
     def _collect_signals(self, call: ToolCall, now: datetime) -> list[Signal]:
         widest = max(
@@ -390,6 +404,7 @@ class GovernanceEngine:
         )
         if not required or self.approvals.consume(call):
             return judgement
+        already_waiting = self.approvals.pending_like(call)
         request, created = self.approvals.request(call)
         minutes = int(self.approvals.ttl.total_seconds() // 60)
         if request["status"] == "denied":
@@ -411,7 +426,7 @@ class GovernanceEngine:
             throttle_seconds=0.0,
         )
         self.record(held, outcome=Outcome.DENIED)
-        if created and self.on_approval_request is not None:
+        if created and not already_waiting and self.on_approval_request is not None:
             try:
                 self.on_approval_request(request)
             except Exception:  # noqa: BLE001 - a notification must never break a call

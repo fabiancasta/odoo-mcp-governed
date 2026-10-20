@@ -2,7 +2,10 @@
 
     odoo-mcp-governed stdio                 # MCP over stdio (Claude Desktop)
     odoo-mcp-governed http                  # MCP over HTTP + admin panel
-    odoo-mcp-governed token --actor NAME    # mint a token for one agent
+    odoo-mcp-governed token --actor NAME    # mint a token for one agent (registered)
+    odoo-mcp-governed token --actor bot --var partner=42 --hours 2
+    odoo-mcp-governed revoke --actor NAME   # refuse every token of one agent
+    odoo-mcp-governed totp-setup            # a secret for the panel's second factor
     odoo-mcp-governed audit verify          # verify the hash chain, exit 1 if broken
     odoo-mcp-governed audit anchor          # append the chain head to anchors.log
 """
@@ -45,6 +48,12 @@ def main(argv: list[str] | None = None) -> int:
     token.add_argument("--actor", required=True, help="identity recorded in the audit log")
     token.add_argument("--hours", type=int, help="lifetime (default TOKEN_EXPIRY_HOURS)")
     token.add_argument("--profile", help="pin the agent to this Odoo profile (one per client)")
+    token.add_argument("--var", action="append", default=[], metavar="NAME=VALUE",
+                       help="signed value for the agent's record scope, e.g. partner=42")
+    token.add_argument("--label", default="cli", help="note shown on the Agents page")
+    revoke = sub.add_parser("revoke", help="refuse every token issued to one agent until now")
+    revoke.add_argument("--actor", required=True)
+    sub.add_parser("totp-setup", help="print a new ADMIN_TOTP_SECRET and its otpauth:// URI")
     report = sub.add_parser("report", help="write the activity report as HTML")
     report.add_argument("--days", type=int, default=7)
     report.add_argument("--out", required=True, help="file to write (print it to PDF)")
@@ -92,9 +101,38 @@ def main(argv: list[str] | None = None) -> int:
             if not ACTOR_NAME.match(args.actor):
                 print("actor may contain only A-Z a-z 0-9 _ . @ -", file=sys.stderr)
                 return 2
-            data = issue_token(settings, args.actor, hours=args.hours, profile=args.profile)
+            from .governance.agents import AgentError, AgentStore, parse_vars
+
+            try:
+                variables = parse_vars(args.var)
+            except AgentError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            store = AgentStore(settings.data_dir / "agents.json")
+            rule = store.rule(args.actor)
+            profile = args.profile or (rule.profile if rule and rule.profile else None)
+            data = issue_token(settings, args.actor, hours=args.hours, profile=profile,
+                               variables=variables)
+            store.register(data, label=args.label, variables=variables)
             print(data["token"])
             print(f"# actor={data['actor']} expires={data['expires_at']}", file=sys.stderr)
+            return 0
+
+        if command == "revoke":
+            from .governance.agents import AgentStore
+
+            count = AgentStore(settings.data_dir / "agents.json").revoke_all(args.actor)
+            print(f"every token of {args.actor} issued until now is refused "
+                  f"({count} registered)")
+            return 0
+
+        if command == "totp-setup":
+            from .web.totp import new_secret, provisioning_uri
+
+            secret = new_secret()
+            print(f"ADMIN_TOTP_SECRET={secret}")
+            print(f"# add it to .env, restart, and scan this in an authenticator app:\n"
+                  f"# {provisioning_uri(secret)}", file=sys.stderr)
             return 0
 
         if command == "report":

@@ -110,6 +110,13 @@ class Settings(BaseSettings):
 
     admin_password: str = ""
     admin_session_hours: float = 8.0
+    admin_totp_secret: str = ""
+    """Base32 secret for a second login factor (authenticator app). Generate
+    one with ``odoo-mcp-governed totp-setup``. Empty: password only."""
+    require_registered_tokens: bool = False
+    """Refuse bearer tokens missing from the agent registry (issued before it
+    existed, or minted elsewhere). Recommended once every agent has a token
+    from the Agents page or ``odoo-mcp-governed token``."""
 
     rate_limit_mcp: str = "120/minute"
     """Per actor (token subject), and every message in a batch counts."""
@@ -258,6 +265,14 @@ class Settings(BaseSettings):
                 f"ADMIN_PASSWORD must be at least {MIN_ADMIN_PASSWORD_LENGTH} characters "
                 f"(got {len(self.admin_password)}). There is no default."
             )
+        if self.admin_totp_secret:
+            from .web.totp import valid_secret
+
+            if not valid_secret(self.admin_totp_secret):
+                problems.append(
+                    "ADMIN_TOTP_SECRET is not a valid base32 secret of at least 16 characters. "
+                    "Generate one with: odoo-mcp-governed totp-setup"
+                )
         if problems:
             raise ConfigError(
                 "Refusing to start the HTTP server:\n  - " + "\n  - ".join(problems)

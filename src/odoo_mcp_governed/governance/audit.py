@@ -208,6 +208,9 @@ class AuditLog:
     def since(self, moment: datetime, actor: str | None = None) -> list[AuditEvent]:
         return self._store.since(moment, actor=actor)
 
+    def count_since(self, actor: str, moment: datetime) -> int:
+        return self._store.count_since(actor, moment)
+
     def denied_count(self, moment: datetime, actor: str | None = None) -> int:
         return sum(1 for e in self.since(moment, actor) if e.decision is Decision.DENY)
 

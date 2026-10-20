@@ -9,6 +9,14 @@ cover a different call.
 
 Only metadata is stored: who, which tool, which model, how many records. No
 argument values, for the same reason the audit log holds none.
+
+Approval fatigue is the failure mode of every approval system: an operator
+asked forty times an hour approves the forty-first without reading it. Two
+things keep the count down. An operator can approve a request *and similar
+ones* for a while — same agent, profile, tool and model, up to a number of
+uses — instead of one call at a time; and every pending request of the same
+kind is decided with one click. A burst of similar requests also notifies
+once, not once per call.
 """
 
 from __future__ import annotations
@@ -42,7 +50,24 @@ CREATE TABLE IF NOT EXISTS approvals (
     used_at      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_key ON approvals (actor, profile, tool, arg_digest);
+CREATE TABLE IF NOT EXISTS approval_grants (
+    id         INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    actor      TEXT NOT NULL,
+    profile    TEXT NOT NULL,
+    tool       TEXT NOT NULL,
+    model      TEXT,
+    until      TEXT NOT NULL,
+    max_uses   INTEGER NOT NULL,
+    uses       INTEGER NOT NULL DEFAULT 0,
+    granted_by TEXT NOT NULL,
+    request_id INTEGER
+);
 """
+
+GRANT_MINUTES = (30, 120, 480)
+"""The choices offered for "approve similar calls for…"."""
+GRANT_MAX_USES = 50
 
 
 # On configurator profiles: the changes that run code or cannot be taken back.
@@ -108,9 +133,23 @@ class ApprovalStore:
             (*self._key(call), cutoff),
         ).fetchone()
 
+    def _grant(self, call: ToolCall) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM approval_grants WHERE actor = ? AND profile = ? AND tool = ? "
+            "AND model IS ? AND until > ? AND uses < max_uses ORDER BY id DESC LIMIT 1",
+            (call.actor, call.profile, call.tool, call.model, self._now().isoformat()),
+        ).fetchone()
+
     def consume(self, call: ToolCall) -> bool:
-        """Use an approval for exactly this call, once. True if one existed."""
+        """Use an approval for this call. True if one existed: an approval of
+        this exact call (once), or a standing grant for calls like it."""
         with self._lock:
+            grant = self._grant(call)
+            if grant is not None:
+                self._conn.execute("UPDATE approval_grants SET uses = uses + 1 WHERE id = ?",
+                                   (grant["id"],))
+                self._conn.commit()
+                return True
             row = self._recent(call)
             if row is None or row["status"] != "approved":
                 return False
@@ -145,14 +184,72 @@ class ApprovalStore:
                 "SELECT * FROM approvals WHERE id = ?", (cursor.lastrowid,)).fetchone()
             return dict(row), True
 
-    def decide(self, request_id: int, *, approve: bool, by: str) -> bool:
-        """Approve or deny a pending request. False if it was not pending."""
+    def pending_like(self, call: ToolCall) -> bool:
+        """Whether a request of the same kind is already waiting — then a new
+        one does not need to notify the operator again."""
+        cutoff = (self._now() - self.ttl).isoformat()
+        with self._lock:
+            return self._conn.execute(
+                "SELECT 1 FROM approvals WHERE actor = ? AND profile = ? AND tool = ? "
+                "AND model IS ? AND status = 'pending' AND created_at >= ? LIMIT 1",
+                (call.actor, call.profile, call.tool, call.model, cutoff),
+            ).fetchone() is not None
+
+    def decide(self, request_id: int, *, approve: bool, by: str, grant_minutes: int = 0,
+               group: bool = False) -> bool:
+        """Approve or deny a pending request. False if it was not pending.
+
+        ``group`` decides every pending request of the same kind (agent,
+        profile, tool, model) at once. ``grant_minutes`` (approve only) also
+        lets calls of that kind through for that long, up to
+        :data:`GRANT_MAX_USES` of them.
+        """
+        now = self._now().isoformat()
+        status = "approved" if approve else "denied"
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM approvals WHERE id = ? AND status = 'pending'", (request_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            if group:
+                cutoff = (self._now() - self.ttl).isoformat()
+                self._conn.execute(
+                    "UPDATE approvals SET status = ?, decided_by = ?, decided_at = ? "
+                    "WHERE actor = ? AND profile = ? AND tool = ? AND model IS ? "
+                    "AND status = 'pending' AND created_at >= ?",
+                    (status, by, now, row["actor"], row["profile"], row["tool"], row["model"],
+                     cutoff),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE approvals SET status = ?, decided_by = ?, decided_at = ? "
+                    "WHERE id = ?", (status, by, now, request_id))
+            # Never a standing grant for modules or code: each of those is read.
+            if approve and grant_minutes > 0 and row["model"] not in CODE_MODELS | MODULE_MODELS:
+                until = (self._now() + timedelta(minutes=min(grant_minutes, 24 * 60))).isoformat()
+                self._conn.execute(
+                    "INSERT INTO approval_grants (created_at, actor, profile, tool, model, until, "
+                    "max_uses, granted_by, request_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (now, row["actor"], row["profile"], row["tool"], row["model"], until,
+                     GRANT_MAX_USES, by, request_id),
+                )
+            self._conn.commit()
+            return True
+
+    def grants(self) -> list[dict[str, Any]]:
+        """Standing grants still in force."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM approval_grants WHERE until > ? AND uses < max_uses "
+                "ORDER BY id DESC", (self._now().isoformat(),)).fetchall()
+        return [dict(r) for r in rows]
+
+    def revoke_grant(self, grant_id: int) -> bool:
         with self._lock:
             cursor = self._conn.execute(
-                "UPDATE approvals SET status = ?, decided_by = ?, decided_at = ? "
-                "WHERE id = ? AND status = 'pending'",
-                ("approved" if approve else "denied", by, self._now().isoformat(), request_id),
-            )
+                "UPDATE approval_grants SET until = ? WHERE id = ? AND until > ?",
+                (self._now().isoformat(), grant_id, self._now().isoformat()))
             self._conn.commit()
             return cursor.rowcount == 1
 

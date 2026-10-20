@@ -41,7 +41,8 @@ class AuthError(Exception):
 
 
 def issue_token(
-    settings: Settings, actor: str, *, hours: int | None = None, profile: str | None = None
+    settings: Settings, actor: str, *, hours: int | None = None, profile: str | None = None,
+    variables: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A bearer token for one agent. With ``profile`` the agent is pinned to
     that Odoo profile whatever the panel has active — one token per client."""
@@ -57,6 +58,9 @@ def issue_token(
     }
     if profile:
         claims["profile"] = profile
+    if variables:
+        # Signed with the rest: an agent cannot widen its own record scope.
+        claims["vars"] = dict(variables)
     token = jwt.encode(claims, settings.jwt_secret, algorithm=ALGORITHM)
     return {"token": token, "actor": actor, "issued_at": now.isoformat(),
             "expires_at": expires.isoformat(), "jti": claims["jti"], "profile": profile}
@@ -111,8 +115,11 @@ class TokenStore:
             return None  # secret rotated or token expired: it is dead, say so
         return data
 
-    def regenerate(self, actor: str = "claude", profile: str | None = None) -> dict[str, Any]:
+    def regenerate(self, actor: str = "claude", profile: str | None = None,
+                   registry: Any = None) -> dict[str, Any]:
         data = issue_token(self.settings, actor, profile=profile)
+        if registry is not None:
+            registry.register(data, label="panel token")
         write_private_json(self.path, data)
         return data
 

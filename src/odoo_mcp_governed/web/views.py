@@ -20,6 +20,7 @@ from html import escape
 from typing import Any
 
 from ..governance import AuditEvent, ChainStatus, Decision, Outcome
+from ..governance.approvals import CODE_MODELS, GRANT_MINUTES, MODULE_MODELS
 from ..governance.policy import is_system_model
 
 STYLE = """
@@ -280,7 +281,12 @@ def _status_cls(r: dict) -> str:
 
 def approvals_page(*, csrf: str, pending: list[dict], recent: list[dict], enabled: bool,
                    notifier: bool, ttl_minutes: int, flash: str | None,
-                   flash_kind: str = "ok") -> str:
+                   flash_kind: str = "ok", grants: list[dict] | None = None) -> str:
+    kinds: dict[tuple, int] = {}
+    for r in pending:
+        key = (r["actor"], r["profile"], r["tool"], r.get("model"))
+        kinds[key] = kinds.get(key, 0) + 1
+
     def target(r: dict) -> str:
         count = f" · {esc(r['record_count'])} records" if r.get("record_count") else ""
         return f"<code>{esc(r['tool'])}</code> on <code>{esc(r.get('model') or '-')}</code>{count}"
@@ -293,9 +299,26 @@ def approvals_page(*, csrf: str, pending: list[dict], recent: list[dict], enable
         f'{csrf_field(csrf)}<input type="hidden" name="id" value="{esc(r["id"])}">'
         '<button name="decision" value="approve" type="submit">Approve</button> '
         '<button class="danger" name="decision" value="deny" type="submit">Deny</button>'
+        f'{_similar(r, kinds)}'
         "</form></td></tr>"
         for r in pending
     ) or "<tr><td colspan=6>Nothing is waiting for you.</td></tr>"
+    standing = "".join(
+        f'<tr><td><code>{esc(g["actor"])}</code></td><td>{esc(g["profile"])}</td>'
+        f'<td><code>{esc(g["tool"])}</code> on <code>{esc(g.get("model") or "-")}</code></td>'
+        f'<td class="mono">{esc(g["until"][:16].replace("T", " "))}</td>'
+        f'<td>{esc(g["uses"])}/{esc(g["max_uses"])}</td>'
+        f'<td><form method="post" action="/admin/approvals/grant/revoke" class="inline">'
+        f'{csrf_field(csrf)}<input type="hidden" name="id" value="{esc(g["id"])}">'
+        '<button class="danger" type="submit">Withdraw</button></form></td></tr>'
+        for g in grants or []
+    )
+    standing = (
+        "<section><h2>Standing approvals</h2><p><small>Calls of these kinds go through "
+        "without asking until the time or the uses run out.</small></p><div class=\"wrap\">"
+        "<table><tr><th>Agent</th><th>Profile</th><th>Calls</th><th>Until (UTC)</th>"
+        f"<th>Used</th><th></th></tr>{standing}</table></div></section>" if standing else ""
+    )
     history = "".join(
         f'<tr><td class="mono">#{esc(r["id"])}</td><td><code>{esc(r["actor"])}</code></td>'
         f"<td>{target(r)}</td><td><span class='chip {_status_cls(r)}'>"
@@ -322,7 +345,27 @@ def approvals_page(*, csrf: str, pending: list[dict], recent: list[dict], enable
         f"<th>Agent</th><th>Call</th><th>Status</th><th>By</th></tr>{history}</table></div>"
         "</section>"
     )
-    return page("Approvals", message(flash, flash_kind) + body)
+    return page("Approvals", message(flash, flash_kind) + body.replace(
+        "<section><h2>Recent decisions", standing + "<section><h2>Recent decisions", 1))
+
+
+def _similar(r: dict, kinds: dict[tuple, int]) -> str:
+    """Ways to decide many at once — the cure for approval fatigue."""
+    same = kinds.get((r["actor"], r["profile"], r["tool"], r.get("model")), 1)
+    group = (
+        f' <button name="decision" value="approve_group" type="submit">Approve all {same}</button>'
+        f' <button class="danger" name="decision" value="deny_group" type="submit">'
+        f"Deny all {same}</button>" if same > 1 else ""
+    )
+    if r.get("model") in CODE_MODELS | MODULE_MODELS:
+        return group  # modules and code: every one is read, never a standing grant
+    options = "".join(f'<option value="{m}">{m // 60}h</option>' if m >= 60
+                      else f'<option value="{m}">{m} min</option>' for m in GRANT_MINUTES)
+    return (
+        f'{group}<br><small>or approve this and similar calls (same agent, tool and '
+        f'model) for</small> <select name="minutes">{options}</select> '
+        '<button name="decision" value="approve_similar" type="submit">Approve similar</button>'
+    )
 
 
 REPORT_STYLE = """
@@ -440,8 +483,8 @@ def page(title: str, body: str, *, nav: bool = True) -> str:
     links = (
         '<nav><a href="/admin">Dashboard</a><a href="/admin/logs">Audit log</a>'
         '<a href="/admin/changes">Changes</a><a href="/admin/permissions">Permissions</a>'
-        '<a href="/admin/approvals">Approvals</a><a href="/admin/report">Report</a>'
-        '<a href="/token">Token</a></nav>'
+        '<a href="/admin/approvals">Approvals</a><a href="/admin/agents">Agents</a>'
+        '<a href="/admin/report">Report</a><a href="/token">Token</a></nav>'
         if nav
         else ""
     )
@@ -468,14 +511,20 @@ def message(text: str | None, kind: str = "ok") -> str:
     return f'<div class="msg {esc(kind)}">{esc(text)}</div>' if text else ""
 
 
-def login_page(error: str | None = None) -> str:
+def login_page(error: str | None = None, *, totp: bool = False) -> str:
+    code = (
+        '<label for=t>Authenticator code</label>'
+        '<input id=t type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" '
+        'autocomplete="one-time-code" required>'
+        if totp else ""
+    )
     body = (
         '<section class="login"><h2>Administrator login</h2>'
         f"{message(error, 'bad')}"
         '<form method="post" action="/admin">'
         '<label for=p>Password</label>'
         '<input id=p type="password" name="password" autocomplete="current-password" required autofocus>'
-        '<p><button type="submit">Log in</button></p></form></section>'
+        f'{code}<p><button type="submit">Log in</button></p></form></section>'
     )
     return page("Login", body, nav=False)
 
@@ -917,3 +966,125 @@ def audit_page(
         + "</table></div></section>"
     )
     return page("Audit log", message(flash) + header + form)
+
+
+def agents_page(*, csrf: str, rules: dict, tokens: list[dict], profiles: list[str],
+                tools: list[str], issued: dict | None = None, edit: Any = None,
+                flash: str | None = None, flash_kind: str = "ok",
+                require_registered: bool = False) -> str:
+    """The agent registry: one rule per agent, every token it holds."""
+    shown = ""
+    if issued:
+        shown = (
+            '<section><h2>New token</h2><p class="msg warn">Copy it now: it is shown only '
+            f'once. Agent <b>{esc(issued["actor"])}</b> · expires '
+            f'{esc(issued["expires_at"][:16].replace("T", " "))} UTC'
+            + (f' · pinned to <b>{esc(issued["profile"])}</b>' if issued.get("profile") else "")
+            + f'</p><textarea readonly class="mono">{esc(issued["token"])}</textarea></section>'
+        )
+
+    def chips(values, empty: str) -> str:
+        return " ".join(f"<code>{esc(v)}</code>" for v in sorted(values)) or empty
+
+    rows = "".join(
+        f'<tr><td><b>{esc(name)}</b><br><small>{esc(r.note)}</small></td>'
+        f'<td>{chips(r.models, "policy")}</td><td>{chips(r.tools, "all")}</td>'
+        f'<td>{"read-only" if r.read_only else "policy"}</td>'
+        f'<td>{esc(r.daily_quota) if r.daily_quota else "—"}</td>'
+        f'<td>{esc(r.profile) or "token / active"}</td>'
+        f'<td>{chips(r.scope, "all records")}</td>'
+        f'<td><a href="/admin/agents?edit={esc(name)}">Edit</a></td></tr>'
+        for name, r in sorted(rules.items())
+    ) or "<tr><td colspan=8>No agent rules yet: every agent follows the server policy.</td></tr>"
+
+    def token_row(t: dict) -> str:
+        state = (f'<span class="chip bad">revoked {esc(t["revoked_at"][:10])}</span>'
+                 if t.get("revoked_at") else '<span class="chip ok">active</span>')
+        action = "" if t.get("revoked_at") else (
+            '<form method="post" action="/admin/agents/revoke" class="inline">'
+            f'{csrf_field(csrf)}<input type="hidden" name="jti" value="{esc(t["jti"])}">'
+            '<button class="danger" type="submit">Revoke</button></form>')
+        variables = ", ".join(f"{esc(k)}={esc(v)}" for k, v in (t.get("vars") or {}).items())
+        return (
+            f'<tr><td><code>{esc(t["actor"])}</code></td><td>{esc(t.get("label") or "")}</td>'
+            f'<td class="mono">{esc(t["jti"][:8])}…</td><td>{esc(t.get("profile") or "—")}</td>'
+            f'<td>{variables or "—"}</td>'
+            f'<td class="mono">{esc(t["issued_at"][:16].replace("T", " "))}</td>'
+            f'<td class="mono">{esc(t["expires_at"][:16].replace("T", " "))}</td>'
+            f"<td>{state}</td><td>{action}</td></tr>"
+        )
+
+    token_rows = "".join(token_row(t) for t in tokens) or (
+        "<tr><td colspan=9>No registered tokens.</td></tr>")
+    e = edit
+    tool_boxes = "".join(
+        f'<label class="inline"><input type="checkbox" name="tools" value="{esc(t)}"'
+        f'{" checked" if e and t in e.tools else ""}> {esc(t)}</label> ' for t in tools)
+    profile_options = '<option value="">token or active profile</option>' + "".join(
+        f'<option value="{esc(p)}"{" selected" if e and e.profile == p else ""}>{esc(p)}</option>'
+        for p in profiles)
+    scope_json = json.dumps({m: list(d) for m, d in e.scope.items()}, indent=1) if e else ""
+    registered = (
+        "Unregistered tokens are refused (REQUIRE_REGISTERED_TOKENS=true)."
+        if require_registered else
+        "Tokens issued before the registry still work; set REQUIRE_REGISTERED_TOKENS=true "
+        "once every agent has a registered token, or use “Revoke all” per agent."
+    )
+    body = (
+        message(flash, flash_kind) + shown
+        + '<section><h2>Agents</h2><p><small>A rule only takes away: it can never reach '
+        "what the server policy denies. Empty fields mean “as the policy says”.</small></p>"
+        '<div class="wrap"><table><tr><th>Agent</th><th>Models</th><th>Tools</th>'
+        "<th>Writes</th><th>Calls/day</th><th>Profile</th><th>Record scope</th><th></th></tr>"
+        f"{rows}</table></div></section>"
+        f'<section><h2>{"Edit" if e else "New"} agent rule</h2>'
+        f'<form method="post" action="/admin/agents/save">{csrf_field(csrf)}'
+        '<div class=row><div><label>Agent name (token subject)</label>'
+        f'<input type="text" name="name" value="{esc(e.name if e else "")}" '
+        'pattern="[A-Za-z0-9_.@\\-]{1,64}" required></div>'
+        '<div><label>Note</label>'
+        f'<input type="text" name="note" value="{esc(e.note if e else "")}"></div></div>'
+        '<label>Models (comma-separated; empty = policy)</label>'
+        f'<input type="text" name="models" value="{esc(", ".join(sorted(e.models)) if e else "")}">'
+        f"<label>Tools (none ticked = all)</label><div>{tool_boxes}</div>"
+        '<div class=row><div><label>Calls per day (0 = no quota)</label>'
+        f'<input type="number" name="daily_quota" min="0" value="{esc(e.daily_quota if e else 0)}">'
+        f'</div><div><label>Pinned profile</label><select name="profile">{profile_options}'
+        "</select></div></div>"
+        '<label class="inline"><input type="checkbox" name="read_only" value="yes"'
+        f'{" checked" if e and e.read_only else ""}> Read-only</label>'
+        "<label>Record scope (JSON: model → domain). "
+        '<small>Example for a WhatsApp bot: {"res.partner": [["id", "=", "{partner}"]], '
+        '"sale.order": [["partner_id", "=", "{partner}"]]} — "{partner}" comes from the '
+        "token’s variables. A scoped agent reaches only these models.</small></label>"
+        f'<textarea name="scope" class="mono" rows="5">{esc(scope_json)}</textarea>'
+        '<p><button type="submit">Save rule</button></p></form>'
+        + (
+            '<form method="post" action="/admin/agents/delete" class="inline">'
+            f'{csrf_field(csrf)}<input type="hidden" name="name" value="{esc(e.name)}">'
+            '<label class="inline"><input type="checkbox" name="confirm" value="yes" required>'
+            ' confirm</label> <button class="danger" type="submit">Delete rule</button></form>'
+            if e else ""
+        )
+        + "</section>"
+        '<section><h2>Issue a token</h2><form method="post" action="/admin/agents/token">'
+        f'{csrf_field(csrf)}<div class=row><div><label>Agent name</label>'
+        f'<input type="text" name="name" value="{esc(e.name if e else "")}" '
+        'pattern="[A-Za-z0-9_.@\\-]{1,64}" required></div><div><label>Label</label>'
+        '<input type="text" name="label" placeholder="e.g. laptop, n8n, customer 42"></div>'
+        '<div><label>Hours (empty = default)</label><input type="number" name="hours" min="1">'
+        '</div></div><label>Variables for the scope (name=value, comma-separated)</label>'
+        '<input type="text" name="vars" placeholder="partner=42">'
+        '<p><button type="submit">Issue token</button></p></form></section>'
+        f'<section><h2>Tokens</h2><p><small>{esc(registered)}</small></p>'
+        '<div class="wrap"><table><tr><th>Agent</th><th>Label</th><th>Id</th><th>Profile</th>'
+        "<th>Variables</th><th>Issued (UTC)</th><th>Expires</th><th>State</th><th></th></tr>"
+        f"{token_rows}</table></div>"
+        '<form method="post" action="/admin/agents/revoke"><div class=row><div>'
+        f'{csrf_field(csrf)}<label>Revoke every token of agent (registered or not)</label>'
+        '<input type="text" name="name" pattern="[A-Za-z0-9_.@\\-]{1,64}" required></div></div>'
+        '<p><label class="inline"><input type="checkbox" name="confirm" value="yes" required>'
+        ' confirm</label> <button class="danger" type="submit">Revoke all</button></p></form>'
+        "</section>"
+    )
+    return page("Agents", body)

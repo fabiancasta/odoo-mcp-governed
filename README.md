@@ -13,7 +13,7 @@ leaked — and is built so that when that happens the damage is bounded and the
 evidence survives.
 
 > **Status:** v0.3 — all 19 tools, stdio and HTTP transports, admin panel and
-> Docker deployment work end to end against Odoo 19. 399 tests.
+> Docker deployment work end to end against Odoo 19. 464 tests.
 
 ## What the operator gets
 
@@ -29,6 +29,11 @@ evidence survives.
 | **Sandbox profiles** | For test databases: model lists off and risk only observed, while the denylist, credential fields and audit stay on. Never on production. |
 | **Activity report** | A printable "what your AI did" page per client and period — counts, refusals, changes — with no record values, ready to send as a PDF. |
 | **Several clients** | Pin each agent's token to its client's Odoo profile; switching the active profile can never send it to another client's database. |
+| **Agent registry** | Every token is listed and can be revoked on its own, or all of one agent's at once — no `JWT_SECRET` rotation. A rule per agent narrows the policy: fewer models or tools, read-only, a daily call quota, one pinned profile. |
+| **Record scope** | A domain per model, e.g. a WhatsApp bot sees only `res.partner` `id = {partner}` and that customer's `sale.order`. `{partner}` comes from the token's signed variables, so one rule serves one token per customer. Searches are ANDed with the scope, ids outside it are refused, new records get the scope's values. |
+| **Injection warning** | Record content is data. Text in it that addresses an AI ("ignore previous instructions…") still comes back, plus a separate warning to the agent and an audit entry. |
+| **Less approval fatigue** | Approve all similar pending requests at once, or a kind of call (agent + tool + model) for 30 min, 2 h or 8 h, up to 50 uses — never for modules or code. A burst of similar requests notifies once. |
+| **Two-factor panel** | `ADMIN_TOTP_SECRET` adds an authenticator-app code to the panel login; a code works once. |
 
 ## How a call is handled
 
@@ -245,6 +250,9 @@ locked out by off-hours signals.
 ```bash
 odoo-mcp-governed audit verify   # exit 1 if the chain is broken — cron it
 odoo-mcp-governed audit anchor   # append the head hash to data/anchors.log
+odoo-mcp-governed token --actor wabot --var partner=42 --hours 2   # registered, scoped
+odoo-mcp-governed revoke --actor wabot   # refuse every token of one agent, no restart
+odoo-mcp-governed totp-setup     # ADMIN_TOTP_SECRET plus an otpauth:// URI to scan
 ```
 
 ## Production safeguards
@@ -296,6 +304,8 @@ own. For production:
 | Methods | `ALLOW_EXECUTE_METHOD` off, or a closed `EXECUTE_METHOD_ALLOWLIST` such as `action_confirm,message_post` |
 | Denylist | Kept as the floor, not relied on as the main control |
 | Secrets | A fresh `JWT_SECRET` (rotating it revokes every token) and `AUDIT_HMAC_KEY` |
+| Tokens | One per agent from the Agents page, then `REQUIRE_REGISTERED_TOKENS=true` |
+| Panel | `ADMIN_TOTP_SECRET` set, HTTPS in front |
 
 ## Hardening carried over from day one
 
@@ -346,7 +356,7 @@ valid agents on the same IP) and the canaries found a content leak
 
 ## Tests
 
-The suite has 399 tests. The ones that matter are not the
+The suite has 464 tests. The ones that matter are not the
 "it records events" kind — they are the adversarial ones:
 
 ```bash
@@ -431,7 +441,9 @@ docker compose exec -T web odoo -d govtest -i base \
 - [ ] Per-profile access policy
 - [ ] Approve from the phone (Telegram buttons / WhatsApp reply)
 - [ ] Two-phase audit (intent before the call, outcome after)
-- [ ] Per-token revocation list (today: rotate `JWT_SECRET` to revoke all)
+- [x] Agent registry: per-token revocation, per-agent rules and daily quotas
+- [x] Record-level scope per agent, filled from signed token variables
+- [x] Prompt-injection warning, grouped and standing approvals, TOTP for the panel
 - [ ] Signed off-box anchoring (today: `audit anchor` writes a file to ship)
 
 ## Provenance

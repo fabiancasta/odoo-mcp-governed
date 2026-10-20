@@ -38,6 +38,7 @@ from .governance import (
     ToolCall,
     digest_args,
 )
+from .governance.agents import AgentRule, AgentStore
 from .governance.approvals import ApprovalStore
 from .governance.detectors import DetectorConfig
 from .governance.engine import RiskScorer
@@ -142,6 +143,7 @@ class Runtime:
                 log.warning("ODOO_* settings do not form a valid profile: %s", exc)
 
         self.policy_store = PolicyStore(settings.policy_file, policy_from_settings(settings))
+        self.agents = AgentStore(settings.data_dir / "agents.json")
         self._privileged: set[str] = set()
         self._privileged_lock = threading.Lock()
         self.audit = AuditLog(AuditStore(settings.audit_db), hmac_key=settings.hmac_key())
@@ -193,6 +195,7 @@ class Runtime:
             sandbox_profiles=self.profiles.sandbox_names(),
             configurator_profiles=self.profiles.configurator_names(),
             privileged_profiles=frozenset(self._privileged),
+            agent_rules=self.agents.rules(),
         )
 
     def note_privilege(self, profile: str, privileged: bool) -> None:
@@ -335,10 +338,13 @@ class Runtime:
 
     # -- approvals -----------------------------------------------------------
 
-    def decide_approval(self, request_id: int, approve: bool, *, actor: str) -> bool:
+    def decide_approval(self, request_id: int, approve: bool, *, actor: str,
+                        grant_minutes: int = 0, group: bool = False) -> bool:
         tool = "admin.approval.approve" if approve else "admin.approval.deny"
-        with self.admin_action(actor, tool, detail={"request_id": request_id}) as action:
-            decided = self.approvals.decide(request_id, approve=approve, by=actor)
+        detail = {"request_id": request_id, "group": group, "grant_minutes": grant_minutes}
+        with self.admin_action(actor, tool, detail=detail) as action:
+            decided = self.approvals.decide(request_id, approve=approve, by=actor,
+                                            grant_minutes=grant_minutes, group=group)
             action.count = 1 if decided else 0
         return decided
 
@@ -364,6 +370,56 @@ class Runtime:
             self.policy_store.update({"blocked_actors": sorted(current)})
             self._apply_policy()
             action.count = 1
+
+    # -- agent registry ------------------------------------------------------
+
+    def save_agent(self, rule: AgentRule, *, actor: str) -> None:
+        if not ACTOR_NAME.match(rule.name):
+            raise ValueError("agent names may only contain letters, digits and _ . @ -")
+        if rule.profile and self.profiles.get(rule.profile) is None:
+            raise ValueError(f"there is no profile named {rule.profile!r}")
+        with self.admin_action(actor, "admin.agent.save", detail={"agent": rule.name}) as action:
+            self.agents.save_rule(rule)
+            self._apply_policy()
+            action.count = 1
+
+    def delete_agent(self, name: str, *, actor: str) -> bool:
+        with self.admin_action(actor, "admin.agent.delete", detail={"agent": name}) as action:
+            gone = self.agents.delete_rule(name)
+            self._apply_policy()
+            action.count = 1 if gone else 0
+        return gone
+
+    def issue_agent_token(self, name: str, *, actor: str, hours: int | None = None,
+                          variables: dict[str, Any] | None = None,
+                          label: str = "") -> dict[str, Any]:
+        """A new token for ``name``, registered so it can be revoked alone. A
+        rule's pinned profile goes into the token as well."""
+        from .web.auth import issue_token
+
+        if not ACTOR_NAME.match(name):
+            raise ValueError("agent names may only contain letters, digits and _ . @ -")
+        rule = self.agents.rule(name)
+        profile = rule.profile if rule and rule.profile else None
+        detail = {"agent": name, "profile": profile, "vars": sorted(variables or {})}
+        with self.admin_action(actor, "admin.agent.token", detail=detail) as action:
+            issued = issue_token(self.settings, name, hours=hours, profile=profile,
+                                 variables=variables)
+            self.agents.register(issued, label=label, variables=variables)
+            action.count = 1
+        return issued
+
+    def revoke_token(self, jti: str, *, actor: str) -> bool:
+        with self.admin_action(actor, "admin.agent.revoke", detail={"jti": jti[:12]}) as action:
+            done = self.agents.revoke(jti)
+            action.count = 1 if done else 0
+        return done
+
+    def revoke_agent_tokens(self, name: str, *, actor: str) -> int:
+        with self.admin_action(actor, "admin.agent.revoke_all", detail={"agent": name}) as action:
+            count = self.agents.revoke_all(name)
+            action.count = count
+        return count
 
     # -- undo ----------------------------------------------------------------
 

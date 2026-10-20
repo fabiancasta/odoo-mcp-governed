@@ -282,6 +282,12 @@ class AuditStore:
     def count(self) -> int:
         return self._query("SELECT COUNT(*) AS n FROM audit_events")[0]["n"]
 
+    def count_since(self, actor: str, moment: datetime) -> int:
+        return self._query(
+            "SELECT COUNT(*) AS n FROM audit_events WHERE actor = ? AND ts >= ?",
+            (actor, moment.isoformat()),
+        )[0]["n"]
+
     def count_for_actor(self, actor: str) -> int:
         """Lifetime event count for one actor — the privilege-drift baseline size."""
         return self._query(

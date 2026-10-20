@@ -27,9 +27,11 @@ tools that are actually governed as writes.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 
+from .agents import AgentRule
 from .events import Operation, ToolCall
 
 REASON_SEPARATOR = ": "
@@ -290,6 +292,10 @@ class PolicyConfig:
     missing, nothing in Odoo's own access control would stop the agent.
     Derived at runtime, not edited as policy."""
 
+    agent_rules: Mapping[str, AgentRule] = field(default_factory=dict)
+    """Per-agent rules from the agent registry. They only ever narrow what
+    the rest of this policy allows. Derived, not edited as policy."""
+
     def validate(self) -> list[str]:
         """Config problems worth warning about at startup. Never raises —
         returns warnings so the caller can log them all at once."""
@@ -341,6 +347,38 @@ class PolicyVerdict:
         return tuple(reason_code(r) for r in self.reasons)
 
 
+OUTSIDE_SCOPE = "scope:outside"
+"""Pseudo-field the tool layer reports when a call names records, or would
+write values, outside the agent's record scope."""
+
+
+def _agent_refusal(rule: AgentRule, call: ToolCall, cfg: PolicyConfig) -> str | None:
+    """Why the agent's own rule refuses this call, or ``None``."""
+    if rule.tools and call.tool not in rule.tools:
+        return _reason("agent_tool", f"agent {call.actor!r} may not use {call.tool!r}")
+    if call.operation is Operation.ADMIN:
+        return None
+    if rule.profile and call.profile != rule.profile:
+        return _reason("agent_profile",
+                       f"agent {call.actor!r} works only on profile {rule.profile!r}")
+    if rule.read_only and (call.operation.mutates or call.operation is Operation.EXECUTE):
+        return _reason("agent_read_only", f"agent {call.actor!r} is read-only")
+    if call.model is None:
+        return None
+    configurator = call.profile in cfg.configurator_profiles
+    if rule.models and not covers(call.model, rule.models, configurator):
+        return _reason("agent_model", f"agent {call.actor!r} may not reach {call.model!r}")
+    if rule.scope and call.model not in rule.scope:
+        return _reason("agent_scope",
+                       f"agent {call.actor!r} is limited to its own records, and its scope "
+                       f"does not include {call.model!r}")
+    if OUTSIDE_SCOPE in call.fields_touched:
+        return _reason("record_scope",
+                       f"agent {call.actor!r} may only reach its own records of "
+                       f"{call.model!r}; this call names or would create others")
+    return None
+
+
 class PolicyEngine:
     """Stateless evaluation of a single call against :class:`PolicyConfig`."""
 
@@ -379,6 +417,10 @@ class PolicyEngine:
                 allowed=False,
                 reasons=(_reason("tool_disabled", f"{call.tool!r} is disabled by policy"),),
             )
+
+        rule = cfg.agent_rules.get(call.actor)
+        if rule is not None and (refusal := _agent_refusal(rule, call, cfg)):
+            return PolicyVerdict(allowed=False, reasons=(refusal,))
 
         # Server introspection touches no Odoo data at all.
         if call.operation is Operation.ADMIN:

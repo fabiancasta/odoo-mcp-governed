@@ -1,4 +1,4 @@
-"""The 18 MCP tools.
+"""The 19 MCP tools.
 
 Every tool follows the same shape: parse arguments, describe the call as a
 :class:`~.governance.ToolCall`, run the Odoo work inside
@@ -28,11 +28,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .governance import GuardedCall, Operation, ToolCall, digest_args
+from .governance.agents import ScopeUnresolved, equalities, resolve, scope_fields
 from .governance.policy import (
     ALWAYS_DENIED,
     ATTACHMENT_CONTENT_FIELDS,
     ATTACHMENT_MODEL,
     CONFIG_PARAMETER_MODEL,
+    OUTSIDE_SCOPE,
     WILDCARD,
     covers,
     is_sensitive,
@@ -59,6 +61,8 @@ class ToolContext:
     tool: str
     arguments: dict[str, Any]
     guarded: bool = False
+    variables: dict[str, Any] = field(default_factory=dict)
+    """The token's signed ``vars`` claim, filling the agent's scope."""
 
     def guard(
         self,
@@ -92,6 +96,70 @@ class ToolContext:
 
     def odoo(self, model: str, method: str, args: list | None = None, kwargs: dict | None = None):
         return self.snapshot.client.execute(model, method, args, kwargs)
+
+    # -- record scope ------------------------------------------------------
+
+    def scope(self, model: str | None) -> list | None:
+        """The agent's record scope on ``model``, or ``None`` if it has none.
+
+        A model the scope does not name is refused by policy; only the models
+        it names get here. A placeholder the token does not fill matches no
+        record at all — a scope is never widened for want of a value.
+        """
+        rule = self.policy.agent_rules.get(self.actor)
+        if rule is None or not rule.scope or not model or model not in rule.scope:
+            return None
+        try:
+            return resolve(rule.scope[model], self.variables)
+        except ScopeUnresolved as missing:
+            log.warning("agent %s: scope variable %r missing from its token", self.actor,
+                        str(missing))
+            return [["id", "=", 0]]
+
+    def scoped_domain(self, model: str, domain: list) -> list:
+        """``domain`` AND the agent's scope, each normalised first so that an
+        unbalanced ``|`` from the agent can never swallow a scope condition."""
+        scope = self.scope(model)
+        if scope is None:
+            return domain
+        if not domain:
+            return normalize_domain(scope)
+        return ["&", *normalize_domain(scope), *normalize_domain(domain)]
+
+    def outside_scope(
+        self, model: str | None, ids: list[int] | None = None, *,
+        values: dict[str, Any] | None = None, creating: bool = False,
+        any_call: bool = False,
+    ) -> set[str]:
+        """``{OUTSIDE_SCOPE}`` when the call reaches records outside the
+        agent's scope; policy then refuses it. On create, scope fields the
+        agent left out are filled in ``values``."""
+        scope = self.scope(model)
+        if scope is None:
+            return set()
+        if any_call:
+            return {OUTSIDE_SCOPE}
+        if ids is not None:
+            wanted = set(ids)
+            if not wanted:
+                return {OUTSIDE_SCOPE}
+            found = self.odoo(model, "search_count",
+                              [self.scoped_domain(model, [["id", "in", sorted(wanted)]])])
+            if found != len(wanted):
+                return {OUTSIDE_SCOPE}
+        if values is not None:
+            fixed = equalities(scope)
+            if creating:
+                if fixed is None:
+                    return {OUTSIDE_SCOPE}
+                for name, value in fixed.items():
+                    if values.setdefault(name, value) != value:
+                        return {OUTSIDE_SCOPE}
+            else:
+                touched = scope_fields(scope) & set(values)
+                if touched and (fixed is None or any(values[f] != fixed.get(f) for f in touched)):
+                    return {OUTSIDE_SCOPE}
+        return set()
 
     # -- change journal ----------------------------------------------------
 
@@ -315,6 +383,30 @@ def _arg_ids(ctx: ToolContext) -> list[int]:
     return [record_id]
 
 
+_ARITY = {"!": 1, "&": 2, "|": 2}
+
+
+def normalize_domain(domain: list) -> list:
+    """One complete prefix expression, as Odoo normalises it: implicit ANDs
+    made explicit. An operator without enough operands is refused here."""
+    result: list = []
+    expected = 1
+    for token in domain:
+        if expected == 0:
+            result[0:0] = ["&"]
+            expected = 1
+        if isinstance(token, str):
+            if token not in _ARITY:
+                raise ToolInputError(f"domain operator {token!r} is not '&', '|' or '!'")
+            expected += _ARITY[token] - 1
+        else:
+            expected -= 1
+        result.append(token)
+    if expected != 0:
+        raise ToolInputError("domain is incomplete: an operator is missing its conditions")
+    return result
+
+
 def _arg_domain(ctx: ToolContext) -> list[Any]:
     domain = ctx.arguments.get("domain", [])
     if domain is None:
@@ -421,7 +513,8 @@ def get_record(ctx: ToolContext) -> Any:
     ids = _arg_ids(ctx)
     fields = _arg_str_list(ctx, "fields")
     with ctx.guard(
-        operation=Operation.READ, model=model, fields=fields or (), count=len(ids)
+        operation=Operation.READ, model=model,
+        fields={*(fields or ()), *ctx.outside_scope(model, ids)}, count=len(ids)
     ) as g:
         wanted = _read_fields(ctx, model, fields)
         kwargs = {"fields": wanted} if wanted else {}
@@ -443,6 +536,7 @@ def search_records(ctx: ToolContext) -> Any:
     touched = set(fields or ()) | domain_fields(domain) | order_fields(order)
     touched |= _value_oracle(model, domain_fields(domain) | order_fields(order))
     with ctx.guard(operation=Operation.READ, model=model, fields=touched, count=limit) as g:
+        domain = ctx.scoped_domain(model, domain)
         kwargs: dict[str, Any] = {"limit": limit, "offset": offset}
         if wanted := _read_fields(ctx, model, fields):
             kwargs["fields"] = wanted
@@ -461,7 +555,10 @@ def create_record(ctx: ToolContext) -> Any:
     values = _arg_dict(ctx, "values")
     if not values:
         raise ToolInputError("'values' must not be empty")
-    with ctx.guard(operation=Operation.CREATE, model=model, fields=values, count=1) as g:
+    values = dict(values)
+    outside = ctx.outside_scope(model, values=values, creating=True)
+    with ctx.guard(operation=Operation.CREATE, model=model, fields={*values, *outside},
+                   count=1) as g:
         created = ctx.odoo(model, "create", [values])
         new_id = created[0] if isinstance(created, list) else created
         if isinstance(new_id, int):
@@ -476,8 +573,9 @@ def update_record(ctx: ToolContext) -> Any:
     values = _arg_dict(ctx, "values")
     if not values:
         raise ToolInputError("'values' must not be empty")
+    outside = ctx.outside_scope(model, ids, values=values)
     with ctx.guard(
-        operation=Operation.WRITE, model=model, fields=values, count=len(ids)
+        operation=Operation.WRITE, model=model, fields={*values, *outside}, count=len(ids)
     ) as g:
         before = ctx.snapshot_before(model, ids, values)
         ctx.odoo(model, "write", [ids, values])
@@ -490,7 +588,8 @@ def update_record(ctx: ToolContext) -> Any:
 def delete_record(ctx: ToolContext) -> Any:
     model = _arg_str(ctx, "model")
     ids = _arg_ids(ctx)
-    with ctx.guard(operation=Operation.DELETE, model=model, count=len(ids)) as g:
+    with ctx.guard(operation=Operation.DELETE, model=model,
+                   fields=ctx.outside_scope(model, ids), count=len(ids)) as g:
         before = ctx.snapshot_before(model, ids)
         ctx.odoo(model, "unlink", [ids])
         g.touched(ids)
@@ -515,6 +614,8 @@ def execute_method(ctx: ToolContext) -> Any:
     touched = collect_field_names([args, kwargs])
     for item in [*args, *kwargs.values()]:
         touched |= domain_fields(item)
+    # A scoped agent may call a method only on records of its own.
+    touched |= ctx.outside_scope(model, args[0] if count else [])
     with ctx.guard(
         operation=Operation.EXECUTE, model=model, method=method, fields=touched, count=count
     ) as g:
@@ -534,6 +635,9 @@ def call_onchange(ctx: ToolContext) -> Any:
     if spec is not None and not isinstance(spec, dict):
         raise ToolInputError("'fields_spec' must be an object")
     touched = set(changed) | collect_field_names(values) | collect_field_names(spec or {})
+    # Onchange values can name any record (a partner id), and it answers with
+    # that record's data: a scoped agent has no use for it.
+    touched |= ctx.outside_scope(model, any_call=True)
     with ctx.guard(operation=Operation.READ, model=model, fields=touched, count=1) as g:
         if spec is None:
             spec = _default_onchange_spec(ctx, model)
@@ -664,6 +768,7 @@ def list_models(ctx: ToolContext) -> Any:
         name = ctx.snapshot.profile.name
         configurator = name in policy.configurator_profiles
         open_level = configurator or name in policy.sandbox_profiles
+        rule = policy.agent_rules.get(ctx.actor)
         visible = [
             {**row, "writable": covers(row["model"], policy.writable_models, configurator)}
             for row in rows
@@ -672,6 +777,9 @@ def list_models(ctx: ToolContext) -> Any:
             and covers(row["model"], policy.allowed_models, configurator)
             and (not row.get("transient") or open_level
                  or row["model"] in policy.transient_allowlist)
+            and (rule is None or (
+                (not rule.models or covers(row["model"], rule.models, configurator))
+                and (not rule.scope or row["model"] in rule.scope)))
         ]
         return _done(
             g,
@@ -702,7 +810,8 @@ def name_search(ctx: ToolContext) -> Any:
     ) as g:
         # Positional arguments: the keyword was renamed from ``args`` to
         # ``domain`` in Odoo 18, and position works on both sides of that.
-        pairs = ctx.odoo(model, "name_search", [name, domain, operator, limit])
+        pairs = ctx.odoo(model, "name_search",
+                         [name, ctx.scoped_domain(model, domain), operator, limit])
         results = [{"id": p[0], "name": p[1]} for p in pairs]
         return _done(g, len(results), {"count": len(results), "results": results})
 
@@ -712,7 +821,7 @@ def search_count(ctx: ToolContext) -> Any:
     domain = _arg_domain(ctx)
     touched = domain_fields(domain) | _value_oracle(model, domain_fields(domain))
     with ctx.guard(operation=Operation.READ, model=model, fields=touched) as g:
-        count = ctx.odoo(model, "search_count", [domain])
+        count = ctx.odoo(model, "search_count", [ctx.scoped_domain(model, domain)])
         # Counting reads no record content, so it does not feed mass_read.
         return _done(g, None, {"model": model, "count": count})
 
@@ -738,7 +847,8 @@ def get_report(ctx: ToolContext) -> Any:
     # Governed on the model the report renders, not on ir.actions.report: a
     # PDF of an invoice is a read of the invoice.
     with ctx.guard(
-        operation=Operation.READ, model=report["model"], method=report_name, count=len(ids)
+        operation=Operation.READ, model=report["model"], method=report_name, count=len(ids),
+        fields=ctx.outside_scope(report["model"], ids),
     ) as g:
         if report.get("report_type") != "qweb-pdf":
             raise ToolInputError(f"{report_name!r} is not a PDF report")
@@ -832,7 +942,8 @@ def upload_attachment(ctx: ToolContext) -> Any:
     # Attaching a file to a record changes that record, so it needs write
     # permission on the record's model — governed as a create against it.
     with ctx.guard(
-        operation=Operation.CREATE, model=model, fields=("attachment",), count=1
+        operation=Operation.CREATE, model=model,
+        fields={"attachment", *ctx.outside_scope(model, [record_id])}, count=1
     ) as g:
         values: dict[str, Any] = {
             "name": filename,
@@ -862,7 +973,8 @@ def list_attachments(ctx: ToolContext) -> Any:
     record_id = ctx.arguments.get("record_id")
     if isinstance(record_id, bool) or not isinstance(record_id, int) or record_id <= 0:
         raise ToolInputError("'record_id' must be a positive integer")
-    with ctx.guard(operation=Operation.READ, model=model, fields=("attachment",), count=1) as g:
+    with ctx.guard(operation=Operation.READ, model=model, count=1,
+                   fields={"attachment", *ctx.outside_scope(model, [record_id])}) as g:
         rows = ctx.odoo(
             "ir.attachment",
             "search_read",
@@ -902,6 +1014,8 @@ def get_attachment(ctx: ToolContext) -> Any:
         mimetype = str(meta[0].get("mimetype") or "").lower()
         if "pkcs12" in mimetype or "x-pem" in mimetype or "x-x509" in mimetype:
             checked.add("file:.p12")
+        res_id = meta[0].get("res_id")
+        checked |= ctx.outside_scope(owner, [res_id] if isinstance(res_id, int) and res_id else [])
     with ctx.guard(operation=Operation.READ, model=owner, fields=checked, count=1) as g:
         if not meta:
             raise ToolInputError(f"attachment {attachment_id} does not exist")
