@@ -114,15 +114,32 @@ def openai_complete(base_url: str, api_key: str, model: str) -> Callable[[list, 
                 if exc.code == 429 and attempt < 4:  # free tiers rate-limit: back off
                     time.sleep(15 * (attempt + 1))
                     continue
-                raise
+                # Say why: "HTTP Error 400" alone left a failed run unexplained.
+                detail = exc.read().decode("utf-8", "replace")[:2000]
+                raise RuntimeError(f"LLM API {exc.code}: {detail}") from None
         raise RuntimeError("unreachable")
     return complete
+
+
+def _compatible(schema: Any) -> Any:
+    """Make a JSON schema acceptable to OpenAI-style tool validation: every
+    array needs ``items`` and every object ``properties``."""
+    if isinstance(schema, dict):
+        fixed = {k: _compatible(v) for k, v in schema.items()}
+        if fixed.get("type") == "array" and "items" not in fixed:
+            fixed["items"] = {}
+        if fixed.get("type") == "object" and "properties" not in fixed:
+            fixed["properties"] = {}
+        return fixed
+    if isinstance(schema, list):
+        return [_compatible(v) for v in schema]
+    return schema
 
 
 def to_openai_tools(mcp_tools: list[dict]) -> list[dict]:
     return [{"type": "function", "function": {
         "name": t["name"], "description": t.get("description", ""),
-        "parameters": t.get("inputSchema") or {"type": "object", "properties": {}}}}
+        "parameters": _compatible(t.get("inputSchema") or {"type": "object", "properties": {}})}}
         for t in mcp_tools]
 
 

@@ -105,3 +105,25 @@ def test_the_window_keeps_the_head_and_never_orphans_a_tool_result() -> None:
     assert len(sent) < len(head + history)
     calls = {c["id"] for m in sent if m.get("tool_calls") for c in m["tool_calls"]}
     assert all(m["tool_call_id"] in calls for m in sent if m["role"] == "tool")
+
+
+def test_schemas_are_made_openai_compatible() -> None:
+    tools = agent.to_openai_tools([{"name": "x", "inputSchema": {"type": "object", "properties": {
+        "domain": {"type": "array"}, "values": {"type": "object"}}}}])
+    props = tools[0]["function"]["parameters"]["properties"]
+    assert props["domain"]["items"] == {} and props["values"]["properties"] == {}
+
+
+def test_server_schemas_declare_array_items() -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+    from odoo_mcp_governed.tools import TOOLS
+
+    def arrays(schema):
+        if isinstance(schema, dict):
+            if schema.get("type") == "array":
+                yield schema
+            for value in schema.values():
+                yield from arrays(value)
+    for tool in TOOLS.values():
+        assert all("items" in a for a in arrays(tool.schema()["inputSchema"])), tool.name

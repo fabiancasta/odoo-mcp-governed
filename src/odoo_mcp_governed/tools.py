@@ -366,8 +366,11 @@ FIELDS = {
     "items": {"type": "string"},
     "description": "Fields to return. Omit for all readable fields — prefer naming them.",
 }
+# "items" is spelled out even where any value goes: MCP accepts arrays without
+# it, but OpenAI-compatible tool APIs (Groq, n8n's agents, ...) reject them.
 DOMAIN = {
     "type": "array",
+    "items": {},
     "description": "Odoo search domain, e.g. [[\"customer_rank\", \">\", 0]]",
 }
 
@@ -1018,7 +1021,8 @@ TOOLS: dict[str, Tool] = {
             {
                 "model": MODEL,
                 "method": {"type": "string"},
-                "args": {"type": "array", "description": "Positional args; record ids first"},
+                "args": {"type": "array", "items": {},
+                         "description": "Positional args; record ids first"},
                 "kwargs": {"type": "object"},
             },
             ("model", "method"),
