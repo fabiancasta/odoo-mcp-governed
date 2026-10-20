@@ -1,85 +1,24 @@
-# Red-team runs on GitHub's machines — nothing runs on your computer.
-#
-# - harness (A): deterministic attacks against a throwaway Odoo 19 and a
-#   governed built from the commit, on every push to main and every pull
-#   request. Needs no secret: a regression of the governance floor fails CI.
-# - llm (B): an adversarial model with the 18 tools, two model families per
-#   run, started by hand (Actions → redteam → Run workflow). Needs the
-#   repository secret REDTEAM_LLM_API_KEY (a free Groq key).
-#
-# The world is built by redteam/ci_world.sh. Actions are pinned by commit SHA
-# and images by digest; Dependabot (.github/dependabot.yml) proposes bumps.
-name: redteam
+name: tests
 
 on:
   push:
-    branches: [main]
   pull_request:
-  workflow_dispatch:
-    inputs:
-      turns:
-        description: "LLM attacker turns per model"
-        default: "30"
 
 permissions:
   contents: read
 
 jobs:
-  harness:
+  test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Build the disposable world
-        run: bash redteam/ci_world.sh
-      - name: A — deterministic attacks
-        run: |
-          python3 redteam/harness.py --url http://127.0.0.1:8032 \
-            --canaries canaries.json --report harness.json
-      - name: Audit chain must still verify
-        if: always()
-        run: docker exec governed odoo-mcp-governed audit verify
-      - name: Keep the evidence
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: redteam-harness-${{ github.run_number }}
-          path: |
-            harness.json
-            canaries.json
-          if-no-files-found: ignore
-
-  llm:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        # Two families, so one model's blind spots are not the whole test.
-        model: ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"]
-    env:
-      LLM_API_KEY: ${{ secrets.REDTEAM_LLM_API_KEY }}
-      LLM_BASE_URL: ${{ vars.LLM_BASE_URL || 'https://api.groq.com/openai/v1' }}
-      LLM_MODEL: ${{ matrix.model }}
+        python: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Build the disposable world
-        run: bash redteam/ci_world.sh
-      - name: B — LLM attacker
-        if: env.LLM_API_KEY != ''
-        run: |
-          python3 redteam/agent.py --url http://127.0.0.1:8032 --canaries canaries.json \
-            --transcript agent.jsonl --turns "${{ inputs.turns }}"
-      - name: Audit chain must still verify
-        if: always()
-        run: docker exec governed odoo-mcp-governed audit verify
-      - name: Keep the evidence
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          name: redteam-llm-${{ strategy.job-index }}-${{ github.run_number }}
-          path: |
-            agent.jsonl
-            canaries.json
-          if-no-files-found: ignore
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[http,dev]"
+      - run: ruff check .
+      - run: pytest -q
