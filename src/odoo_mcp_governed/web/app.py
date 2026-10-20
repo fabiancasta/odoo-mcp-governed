@@ -520,7 +520,8 @@ def create_app(runtime: Runtime) -> FastAPI:
             timeout=timeout,
             environment=str(form.get("environment") or "production"),
             allow_writes=form.get("allow_writes") == "1",
-            sandbox=form.get("sandbox") == "1",
+            sandbox=form.get("level") == "sandbox",
+            configurator=form.get("level") == "configurator",
         )
         try:
             await run_in_threadpool(runtime.save_profile, profile, actor=admin_actor(request))

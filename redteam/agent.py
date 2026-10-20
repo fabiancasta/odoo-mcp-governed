@@ -2,7 +2,7 @@
 """LLM red-team agent: an adversarial model tries to break governance.
 
 The deterministic harness (harness.py) checks the attacks we know. This
-script hands governed's 18 tools to a language model told to steal secrets,
+script hands governed's tools to a language model told to steal secrets,
 delete records en masse and talk its way past the server, so it finds the
 attacks we did not think of. The model runs through any OpenAI-compatible
 chat-completions API — by default Groq's free tier — so a run costs nothing.

@@ -107,6 +107,13 @@ class Profile:
     sandbox: bool = False
     """Test databases and controlled activities: model lists do not apply and
     risk is only observed. Never allowed on production."""
+    configurator: bool = False
+    """A consulting agent setting Odoo up: the whole system — modules,
+    settings, users, views, automations. Never allowed on production."""
+
+    @property
+    def level(self) -> str:
+        return "configurator" if self.configurator else "sandbox" if self.sandbox else "business"
 
     @property
     def read_only(self) -> bool:
@@ -133,6 +140,8 @@ class Profile:
             "allow_writes": self.allow_writes,
             "read_only": self.read_only,
             "sandbox": self.sandbox,
+            "configurator": self.configurator,
+            "level": self.level,
         }
 
     def validate(self) -> None:
@@ -152,6 +161,10 @@ class Profile:
             raise ProfileError(f"Environment must be one of: {', '.join(ENVIRONMENTS)}.")
         if self.sandbox and self.environment == "production":
             raise ProfileError("A production profile can never be a sandbox.")
+        if self.configurator and self.environment == "production":
+            raise ProfileError("A production profile can never be a configurator.")
+        if self.sandbox and self.configurator:
+            raise ProfileError("A profile has one level only: sandbox or configurator.")
 
 
 def _profile_from_dict(name: str, raw: dict[str, Any]) -> Profile:
@@ -168,6 +181,9 @@ def _profile_from_dict(name: str, raw: dict[str, Any]) -> Profile:
         environment=str(raw.get("environment") or "production"),
         allow_writes=bool(raw.get("allow_writes", False)),
         sandbox=bool(raw.get("sandbox", False)) and raw.get("environment") != "production",
+        configurator=bool(raw.get("configurator", False))
+        and raw.get("environment") != "production"
+        and not raw.get("sandbox", False),
     )
 
 
@@ -228,6 +244,13 @@ class ProfileStore:
             raise ProfileError(
                 f"{url_host(profile.url)} is covered by PROTECTED_HOSTS; this server will "
                 "not connect to it."
+            )
+
+    def configurator_names(self) -> frozenset[str]:
+        with self._lock:
+            return frozenset(
+                n for n, p in self._profiles.items()
+                if p.configurator and p.environment != "production"
             )
 
     def sandbox_names(self) -> frozenset[str]:

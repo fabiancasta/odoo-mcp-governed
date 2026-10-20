@@ -43,7 +43,7 @@ class TestReview:
     def test_policy_violation_is_denied(
         self, engine: GovernanceEngine, clock: FakeClock
     ) -> None:
-        judgement = engine.review(make_call(clock, model="res.users"))
+        judgement = engine.review(make_call(clock, model="account.move"))
         assert judgement.decision is Decision.DENY
         assert not judgement.permitted
         assert "model_not_allowed" in judgement.policy.codes

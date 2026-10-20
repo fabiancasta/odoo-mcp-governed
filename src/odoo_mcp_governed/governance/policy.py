@@ -130,6 +130,54 @@ def matches(model: str, models: frozenset[str]) -> bool:
     return WILDCARD in models or model in models
 
 
+# Odoo's own machinery — technical records, users and groups, settings,
+# modules, payment providers. A business agent never needs these, so ``*``
+# does not reach them: one is reachable only by naming it exactly, or from a
+# configurator profile. Matched as glob patterns.
+SYSTEM_MODEL_PATTERNS = frozenset({
+    "ir.*", "res.users", "res.users.*", "res.groups", "res.groups.*", "res.config",
+    "res.config.*", "res.lang", "res.device", "res.device.*", "base.*", "base_import.*",
+    "bus.*", "auth.*", "auth_*", "iap.*", "payment.provider", "payment.token", "digest.*",
+    "fetchmail.*", "web_editor.*", "html_editor.*", "api_doc.*",
+})
+
+
+def is_system_model(model: str) -> bool:
+    return any(fnmatchcase(model, pattern) for pattern in SYSTEM_MODEL_PATTERNS)
+
+
+def covers(model: str, models: frozenset[str], system_ok: bool = False) -> bool:
+    """Like :func:`matches`, but ``*`` covers system models only when
+    ``system_ok`` (a configurator profile). An exact name always covers."""
+    if model in models:
+        return True
+    return WILDCARD in models and (system_ok or not is_system_model(model))
+
+
+# Never reachable through the generic tools, on any level, whatever the lists
+# say. Files go through list_attachments / get_attachment / upload_attachment,
+# which check the record they belong to.
+ALWAYS_DENIED = {
+    "ir.attachment": (
+        "'ir.attachment' is never reachable through the generic tools: list a record's "
+        "files with list_attachments and fetch one with get_attachment, which check the "
+        "record it belongs to; add files with upload_attachment"
+    ),
+    "res.users.apikeys": "'res.users.apikeys' holds every user's API keys and is never reachable",
+}
+
+CONFIG_PARAMETER_MODEL = "ir.config_parameter"
+
+# get_attachment refuses files that are keys or certificates, whatever record
+# they belong to: an e-invoicing signing certificate stored on the company is
+# reachable by owner but must never leave.
+KEY_FILE_EXTENSIONS = frozenset({
+    ".p12", ".pfx", ".pem", ".key", ".crt", ".cer", ".der", ".jks", ".keystore",
+    ".kdbx", ".ovpn", ".ppk", ".asc", ".gpg",
+})
+SECRET_FILE_FIELD_PATTERNS = frozenset({"*cert*", "*p12*", "*pfx*", "*pem*", "*keystore*"})
+
+
 # Fields whose values must never leave Odoo through this server, on any model.
 # These are glob patterns matched case-insensitively against every field name a
 # call touches. Patterns, not exact names, because modules add credentials
@@ -218,6 +266,16 @@ class PolicyConfig:
     """Wizards (transient models) agents may use. Every other wizard is
     refused: a wizard acts on other models — a merge wizard rewrites and
     deletes partners — without going through their write and delete gates."""
+
+    configurator_profiles: frozenset[str] = frozenset()
+    """Non-production profiles at the configurator level: the whole system,
+    for an agent that sets Odoo up. Only API keys, attachments and credential
+    fields stay out. Derived from the profiles, not edited as policy."""
+
+    configurator_approvals: bool = True
+    """On configurator profiles, installing or removing modules and adding or
+    changing code (server actions, automations, scheduled actions) waits for a
+    human approval."""
 
     sandbox_profiles: frozenset[str] = frozenset()
     """Non-production profiles marked as sandboxes: model lists and the
@@ -358,7 +416,15 @@ class PolicyEngine:
                 ),
             )
 
-        if call.model is not None and call.model in cfg.denied_models:
+        configurator = call.profile in cfg.configurator_profiles
+        sandbox = call.profile in cfg.sandbox_profiles and not configurator
+
+        if call.model is not None and call.model in ALWAYS_DENIED:
+            # Final whatever the level or the lists say.
+            return PolicyVerdict(
+                allowed=False, reasons=(_reason("model_denied", ALWAYS_DENIED[call.model]),)
+            )
+        if call.model is not None and not configurator and call.model in cfg.denied_models:
             # Final, and reported alone: once a model is on the denylist the
             # other gates are irrelevant, and listing them would suggest that
             # fixing them might help.
@@ -373,29 +439,10 @@ class PolicyEngine:
                 ),
             )
 
-        if call.model == ATTACHMENT_MODEL and (
-            call.operation.mutates or call.operation is Operation.EXECUTE
-        ):
-            # Who an attachment belongs to is what get_attachment checks, so
-            # moving one (res_model / res_id) would launder a denied model's
-            # file onto an allowed record. Part of the floor: sandbox too.
-            return PolicyVerdict(
-                allowed=False,
-                reasons=(
-                    _reason(
-                        "attachment_write",
-                        "attachments are created only through upload_attachment, which checks "
-                        "the record they belong to; the generic tools may read their metadata "
-                        "but not create, change, delete or run methods on them",
-                    ),
-                ),
-            )
-
-        sandbox = call.profile in cfg.sandbox_profiles
         if (
             call.model is not None
             and call.model_transient
-            and not sandbox
+            and not (sandbox or configurator)
             and call.model not in cfg.transient_allowlist
         ):
             return PolicyVerdict(
@@ -409,11 +456,44 @@ class PolicyEngine:
                     ),
                 ),
             )
-        allowed = frozenset({WILDCARD}) if sandbox else cfg.allowed_models
-        writable = frozenset({WILDCARD}) if sandbox else cfg.writable_models
-        deletable = frozenset({WILDCARD}) if sandbox else cfg.deletable_models
 
-        if call.model is not None and not matches(call.model, allowed):
+        if (
+            call.model is not None
+            and not configurator
+            and is_system_model(call.model)
+            and call.model not in cfg.allowed_models
+        ):
+            return PolicyVerdict(
+                allowed=False,
+                reasons=(
+                    _reason(
+                        "system_model",
+                        f"{call.model!r} is an Odoo system model (users, settings, modules, "
+                        "technical records): '*' never reaches system models. Name it exactly "
+                        "in ALLOWED_MODELS, or use a configurator profile on a non-production "
+                        "database",
+                    ),
+                ),
+            )
+
+        if call.model == CONFIG_PARAMETER_MODEL and "domain:value" in call.fields_touched:
+            return PolicyVerdict(
+                allowed=False,
+                reasons=(
+                    _reason(
+                        "sensitive_field",
+                        "filtering or sorting system parameters by value would reveal "
+                        "secret ones; filter by key",
+                    ),
+                ),
+            )
+
+        open_lists = sandbox or configurator
+        allowed = frozenset({WILDCARD}) if open_lists else cfg.allowed_models
+        writable = frozenset({WILDCARD}) if open_lists else cfg.writable_models
+        deletable = frozenset({WILDCARD}) if open_lists else cfg.deletable_models
+
+        if call.model is not None and not covers(call.model, allowed, configurator):
             # Schema introspection is gated too: field names and relations are
             # a map of the database, and handing that out is how someone finds
             # what to go after next.
@@ -424,7 +504,7 @@ class PolicyEngine:
         if call.operation in (Operation.CREATE, Operation.WRITE):
             if call.model is None:
                 reasons.append(_reason("model_required", f"{call.operation.value} needs a model"))
-            elif not matches(call.model, writable):
+            elif not covers(call.model, writable, configurator):
                 reasons.append(
                     _reason("model_not_writable", f"{call.model!r} is not in WRITABLE_MODELS")
                 )
@@ -432,13 +512,13 @@ class PolicyEngine:
         if call.operation is Operation.DELETE:
             if call.model is None:
                 reasons.append(_reason("model_required", "delete needs a model"))
-            elif not matches(call.model, deletable):
+            elif not covers(call.model, deletable, configurator):
                 reasons.append(
                     _reason("model_not_deletable", f"{call.model!r} is not in DELETABLE_MODELS")
                 )
 
         if call.operation is Operation.EXECUTE:
-            reasons.extend(self._evaluate_execute(call, sandbox=sandbox))
+            reasons.extend(self._evaluate_execute(call, sandbox=open_lists))
 
         reasons.extend(self._evaluate_fields(call))
         reasons.extend(self._evaluate_volume(call))
@@ -505,6 +585,22 @@ class PolicyEngine:
                     f"refusing to touch credential fields: {', '.join(hits)}",
                 )
             )
+        if call.tool == "get_attachment":
+            secret = [
+                f for f in call.fields_touched
+                if (f.startswith("file:") and f[5:] in KEY_FILE_EXTENSIONS)
+                or (not f.startswith("file:") and f != "attachment" and (
+                    is_sensitive(f, self.config.sensitive_fields)
+                    or any(fnmatchcase(f.lower(), p) for p in SECRET_FILE_FIELD_PATTERNS)))
+            ]
+            if secret:
+                reasons.append(
+                    _reason(
+                        "attachment_secret",
+                        "this file is a key or certificate (or the field holding one) and is "
+                        "never handed out, whatever record it belongs to",
+                    )
+                )
         if call.model == ATTACHMENT_MODEL:
             content = sorted(set(call.fields_touched) & ATTACHMENT_CONTENT_FIELDS)
             if content:

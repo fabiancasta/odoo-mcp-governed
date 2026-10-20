@@ -45,6 +45,21 @@ CREATE INDEX IF NOT EXISTS idx_approvals_key ON approvals (actor, profile, tool,
 """
 
 
+# On configurator profiles: the changes that run code or cannot be taken back.
+CODE_MODELS = frozenset({"ir.actions.server", "base.automation", "ir.cron"})
+MODULE_MODELS = frozenset({"ir.module.module", "base.module.upgrade", "base.module.uninstall"})
+
+
+def needs_configurator_approval(call: ToolCall) -> bool:
+    if call.model in MODULE_MODELS and call.operation in (
+        Operation.EXECUTE, Operation.CREATE, Operation.WRITE, Operation.DELETE
+    ):
+        return True
+    return call.model in CODE_MODELS and call.operation in (
+        Operation.CREATE, Operation.WRITE, Operation.EXECUTE
+    )
+
+
 def needs_approval(call: ToolCall, kinds: frozenset[str], bulk_threshold: int) -> bool:
     if "delete" in kinds and call.operation is Operation.DELETE:
         return True

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "odoo-mcp-governed"
-version = "0.2.0"
+version = "0.3.0"
 description = "A governed MCP server for Odoo: every tool call is policy-checked, risk-scored and written to a tamper-evident audit log."
 readme = "README.md"
 requires-python = ">=3.10"

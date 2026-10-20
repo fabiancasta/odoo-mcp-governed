@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
-from .approvals import ApprovalStore, needs_approval
+from .approvals import ApprovalStore, needs_approval, needs_configurator_approval
 from .audit import AuditLog
 from .detectors import DetectionContext, Detector, DetectorConfig, default_detectors
 from .events import AuditEvent, Decision, Operation, Outcome, Signal, ToolCall, utcnow
@@ -225,7 +225,8 @@ class GovernanceEngine:
 
         if (
             verdict.allowed
-            and call.profile in self.policy.config.sandbox_profiles
+            and (call.profile in self.policy.config.sandbox_profiles
+                 or call.profile in self.policy.config.configurator_profiles)
             and decision in (Decision.DENY, Decision.THROTTLE)
         ):
             # A sandbox observes risk and records it, but never acts on it.
@@ -381,12 +382,13 @@ class GovernanceEngine:
         through ever wait for approval — and never on a sandbox profile.
         """
         call, cfg = judgement.call, self.policy.config
-        if (
-            self.approvals is None
-            or call.profile in cfg.sandbox_profiles
-            or not needs_approval(call, cfg.approval_required, cfg.approval_bulk_threshold)
-            or self.approvals.consume(call)
-        ):
+        configurator = call.profile in cfg.configurator_profiles
+        if self.approvals is None or (call.profile in cfg.sandbox_profiles and not configurator):
+            return judgement
+        required = needs_approval(call, cfg.approval_required, cfg.approval_bulk_threshold) or (
+            configurator and cfg.configurator_approvals and needs_configurator_approval(call)
+        )
+        if not required or self.approvals.consume(call):
             return judgement
         request, created = self.approvals.request(call)
         minutes = int(self.approvals.ttl.total_seconds() // 60)

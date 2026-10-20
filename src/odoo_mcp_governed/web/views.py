@@ -20,6 +20,7 @@ from html import escape
 from typing import Any
 
 from ..governance import AuditEvent, ChainStatus, Decision, Outcome
+from ..governance.policy import is_system_model
 
 STYLE = """
 :root{--bg:#f6f7f9;--card:#fff;--ink:#1d2330;--mute:#5d6678;--line:#dfe3ea;--acc:#2f5bd3;
@@ -235,6 +236,9 @@ def permissions_page(
                 for key, _, label in gates
             )
             flag = '<span class="chip warn">new — not reviewed</span>' if is_new else ""
+            if is_system_model(name):
+                flag += (' <span class="chip">system — only by exact name or on a configurator '
+                         "profile</span>")
             rows.append(
                 f'<tr><td><input type="hidden" name="shown" value="{esc(name)}">'
                 f'<code>{esc(name)}</code></td><td>{esc(m["name"])}</td>{cells}<td>{flag}</td></tr>'
@@ -601,6 +605,8 @@ def dashboard(
             env_badge = f'<span class="chip ok">{esc(p["environment"])}</span>'
             if p.get("sandbox"):
                 env_badge += ' <span class="chip warn">sandbox · unrestricted</span>'
+            if p.get("configurator"):
+                env_badge += ' <span class="chip bad">configurator · whole system</span>'
         rows.append(
             f'<tr><td>{"● " if p["active"] else ""}<b>{esc(p["name"])}</b></td>'
             f"<td>{env_badge}</td>"
@@ -640,10 +646,18 @@ def dashboard(
         + '</select><label class="inline"><input type="checkbox" name="allow_writes" value="1" '
         f'{"checked" if e.get("allow_writes") else ""}> allow writes on production '
         "<small class=bad>(lifts read-only)</small></label>"
-        '<label class="inline"><input type="checkbox" name="sandbox" value="1" '
-        f'{"checked" if e.get("sandbox") else ""}> sandbox: model lists off, risk only observed '
-        "<small>(never on production; denylist, credential fields and audit stay)</small>"
-        "</label></div>"
+        "<label>Access level <small>(sandbox and configurator: never on production)</small>"
+        "</label><select name=\"level\">"
+        + "".join(
+            f'<option value="{v}" {"selected" if e.get("level", "business") == v else ""}>{label}'
+            "</option>"
+            for v, label in (
+                ("business", "business — business models only, lists apply"),
+                ("sandbox", "sandbox — business models, no lists, risk only observed"),
+                ("configurator", "configurator — the whole system, for setting Odoo up"),
+            )
+        )
+        + "</select></div>"
         '</div><p><button type="submit">Save profile</button> '
         f'{"<a href=/admin>cancel</a>" if editing else ""}</p></form>'
     )

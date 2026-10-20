@@ -12,8 +12,8 @@ instructions changed, because it was prompt-injected, because its token
 leaked — and is built so that when that happens the damage is bounded and the
 evidence survives.
 
-> **Status:** v0.2 — all 18 tools, stdio and HTTP transports, admin panel and
-> Docker deployment work end to end against Odoo 19. 342 tests.
+> **Status:** v0.3 — all 19 tools, stdio and HTTP transports, admin panel and
+> Docker deployment work end to end against Odoo 19. 399 tests.
 
 ## What the operator gets
 
@@ -269,6 +269,21 @@ data, so there are two independent guards:
   the agent. `server_status` warns about such a user on any profile, and
   reports `writes_enabled` with a plain-language note instead of raw flags.
 
+### Access levels
+
+Each profile has one level:
+
+| Level | For | Reaches | Never |
+|---|---|---|---|
+| **business** (default) | Agents that work with the business: sales, collections, support, analysis | Business models in the lists; `*` means every *business* model | System models (`ir.*`, users, groups, settings, modules, payment providers…) unless named exactly |
+| **sandbox** | Test data and controlled activities | Business models without lists; risk observed only | System models; the denylist |
+| **configurator** | A consulting agent setting Odoo up for a client | The whole system: modules, settings, users, groups, views, automations | API keys, `ir.attachment` through the generic tools, credential fields, secret-looking system parameter values. Installing or removing modules and adding code wait for a human |
+
+Sandbox and configurator are refused on production profiles. Files are listed
+per record with `list_attachments` and fetched with `get_attachment`, both
+checked against the record they belong to; keys and certificates are never
+handed out, whatever they belong to.
+
 ### A least-privilege production profile
 
 The MCP policy and Odoo's own access control should each be enough on their
@@ -331,7 +346,7 @@ valid agents on the same IP) and the canaries found a content leak
 
 ## Tests
 
-The suite has 342 tests. The ones that matter are not the
+The suite has 399 tests. The ones that matter are not the
 "it records events" kind — they are the adversarial ones:
 
 ```bash
@@ -402,7 +417,7 @@ docker compose exec -T web odoo -d govtest -i base \
 
 - [x] Governance core — policy, detectors, risk scoring, hash-chained audit
 - [x] Odoo client (JSON-RPC, real timeouts) and multi-profile hot swap
-- [x] The 18 MCP tools, all routed through the engine
+- [x] The 19 MCP tools, all routed through the engine
 - [x] stdio transport (Claude Desktop) and HTTP transport (JWT)
 - [x] Admin panel: profiles, live policy, tokens, audit log with risk view
 - [x] Production safeguards: read-only by default, protected hosts

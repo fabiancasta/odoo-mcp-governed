@@ -24,7 +24,7 @@ def verdict(fields: tuple[str, ...], **config):
     return engine.evaluate(
         ToolCall(
             actor="a", profile="p", tool="search_records", operation=Operation.READ,
-            model="payment.provider", fields_touched=fields,
+            model="res.partner", fields_touched=fields,
         )
     )
 

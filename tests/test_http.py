@@ -174,9 +174,9 @@ class TestMcpAuth:
 
 
 class TestMcpProtocol:
-    def test_lists_18_tools(self, client, runtime) -> None:
+    def test_lists_19_tools(self, client, runtime) -> None:
         tools = client.post("/mcp", json=rpc("tools/list"), headers=bearer(runtime)).json()
-        assert len(tools["result"]["tools"]) == 18
+        assert len(tools["result"]["tools"]) == 19
 
     def test_policy_denial_is_a_tool_error_with_a_reason(self, client, runtime) -> None:
         response = client.post(

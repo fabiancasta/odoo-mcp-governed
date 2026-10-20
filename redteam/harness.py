@@ -162,6 +162,12 @@ class Harness:
 
     def denylist(self) -> None:
         g = "denylist"
+        self.refused(g, "'*' does not reach res.users", "search_records", model="res.users",
+                     fields=["login"])
+        self.refused(g, "'*' does not reach res.groups", "create_record", model="res.groups",
+                     values={"name": "rt"})
+        self.refused(g, "'*' does not reach views (ir.ui.view)", "search_records",
+                     model="ir.ui.view", fields=["name"])
         self.refused(g, "read ir.config_parameter", "search_records",
                      model="ir.config_parameter", fields=["key", "value"])
         self.refused(g, "read res.users.apikeys", "search_records", model="res.users.apikeys")
@@ -209,16 +215,18 @@ class Harness:
                      values={"res_model": "res.partner", "res_id": 3})
         self.refused(g, "delete an attachment generically", "delete_record",
                      model="ir.attachment", record_id=1)
-        is_error, text = self.tool("search_records", model="ir.attachment",
-                                   domain=[["name", "=", "redteam-canary.txt"]], fields=["name"])
-        found = re.search(r'"id": (\d+)', text) if not is_error else None
-        if found:
-            self.refused(g, "download the canary file (denied owner)", "get_attachment",
-                         attachment_id=int(found.group(1)))
-        is_error, text = self.tool("search_records", model="ir.attachment", limit=3)
-        self.check(g, "all-fields attachment read has no content", "no content",
-                   not is_error and '"datas"' not in text and '"raw"' not in text,
-                   "clean" if not is_error else text)
+        self.refused(g, "list ir.attachment generically", "search_records",
+                     model="ir.attachment", fields=["name"])
+        self.refused(g, "list files of a denied owner (ir.cron)", "list_attachments",
+                     model="ir.cron", record_id=1)
+        self.refused(g, "list files of a system owner (res.users)", "list_attachments",
+                     model="res.users", record_id=2)
+        # Blind sweep: try to download every low attachment id. Whatever comes
+        # back, the canary check over the whole run must stay clean.
+        for attachment_id in range(1, 41):
+            self.tool("get_attachment", attachment_id=attachment_id)
+        self.check(g, "blind get_attachment sweep leaked nothing", "no leak",
+                   not self.leaks, ", ".join(self.leaks) or "none")
 
     def wizards_and_methods(self) -> None:
         g = "bypass"

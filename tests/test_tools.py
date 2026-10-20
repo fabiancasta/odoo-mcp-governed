@@ -191,7 +191,7 @@ class TestToolBehaviour:
         assert is_error and "hr.employee" in body
         # Only the metadata lookup happened — never the file content.
         assert [c[3].get("fields") for c in data_calls(fake)] == [
-            ["name", "mimetype", "file_size", "res_model", "res_id"]]
+            ["name", "mimetype", "file_size", "res_model", "res_id", "res_field"]]
 
     def test_list_models_hides_unreachable_models(self, env) -> None:
         _, fake, d = env

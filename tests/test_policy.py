@@ -27,11 +27,11 @@ def test_reading_an_allowed_model_is_permitted(policy_config, clock: FakeClock) 
 
 def test_reading_an_unlisted_model_is_denied(policy_config, clock: FakeClock) -> None:
     engine = PolicyEngine(policy_config)
-    verdict = engine.evaluate(make_call(clock, model="res.users"))
+    verdict = engine.evaluate(make_call(clock, model="account.move"))
     assert not verdict.allowed
     assert "model_not_allowed" in verdict.codes
     # The reason must name the model, so the agent can stop rather than retry.
-    assert "res.users" in verdict.reasons[0]
+    assert "account.move" in verdict.reasons[0]
 
 
 def test_read_access_does_not_imply_write_access(policy_config, clock: FakeClock) -> None:
@@ -353,8 +353,13 @@ class TestDenylistAndWildcard:
         assert verdict.codes == ("model_denied",)
 
     def test_denylist_is_configurable(self, clock: FakeClock) -> None:
+        # Lifting a denylist entry is not enough for a system model: '*' never
+        # reaches those, so it has to be named exactly as well.
         engine = PolicyEngine(self.wide_open(denied_models=frozenset()))
-        assert engine.evaluate(make_call(clock, model="ir.rule")).allowed
+        assert not engine.evaluate(make_call(clock, model="ir.rule")).allowed
+        named = self.wide_open(denied_models=frozenset(),
+                               allowed_models=frozenset({"*", "ir.rule"}))
+        assert PolicyEngine(named).evaluate(make_call(clock, model="ir.rule")).allowed
 
     def test_lifting_critical_entries_is_warned_about(self) -> None:
         warnings = self.wide_open(denied_models=frozenset()).validate()

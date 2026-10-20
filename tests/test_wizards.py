@@ -93,8 +93,11 @@ class TestWizardsAreRefused:
         runtime, fake, d = wide()
         runtime.save_profile(replace(runtime.profiles.active(), sandbox=True), actor="admin")
         runtime._snapshot = Snapshot(runtime.profiles.active(), fake)
-        fake.responses[(WIZARD, "create")] = 3
-        assert not call(d, "create_record", model=WIZARD, values={"x": 1})[0]
+        # A business wizard; the partner merge wizard is base.*, a system model,
+        # which a sandbox does not reach either.
+        fake.responses[("account.payment.register", "create")] = 3
+        assert not call(d, "create_record", model="account.payment.register",
+                        values={"x": 1})[0]
 
     def test_list_models_does_not_offer_refused_wizards(self, wide) -> None:
         _, _, d = wide()

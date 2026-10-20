@@ -29,11 +29,13 @@ from typing import Any
 
 from .governance import GuardedCall, Operation, ToolCall, digest_args
 from .governance.policy import (
+    ALWAYS_DENIED,
     ATTACHMENT_CONTENT_FIELDS,
     ATTACHMENT_MODEL,
+    CONFIG_PARAMETER_MODEL,
     WILDCARD,
+    covers,
     is_sensitive,
-    matches,
 )
 from .runtime import Runtime, Snapshot
 
@@ -160,7 +162,18 @@ class ToolContext:
         """
         patterns = self.policy.sensitive_fields
         content = ATTACHMENT_CONTENT_FIELDS if model == ATTACHMENT_MODEL else frozenset()
-        return _strip(records, lambda key: key in content or is_sensitive(key, patterns))
+        clean = _strip(records, lambda key: key in content or is_sensitive(key, patterns))
+        if model == CONFIG_PARAMETER_MODEL:
+            # Reachable only from a configurator profile: settings are its job,
+            # secrets are not. A parameter whose key looks like a credential
+            # (database.secret, *.access_key, *_token…) comes back without its
+            # value.
+            for row in clean if isinstance(clean, list) else [clean]:
+                if isinstance(row, dict) and is_sensitive(
+                    str(row.get("key", "")).replace(".", "_"), patterns
+                ):
+                    row["value"] = None
+        return clean
 
 
 def _strip(records: Any, hidden: Callable[[str], bool]) -> Any:
@@ -203,6 +216,12 @@ def collect_field_names(value: Any) -> set[str]:
             else:
                 stack.extend(item)
     return found
+
+
+def _value_oracle(model: str, filtered_on: set[str]) -> set[str]:
+    """Mark a filter or sort on a system parameter's value: on a secret one it
+    would be a guessing oracle even though the value itself is hidden."""
+    return {"domain:value"} if model == CONFIG_PARAMETER_MODEL and "value" in filtered_on else set()
 
 
 def order_fields(order: str | None) -> set[str]:
@@ -422,6 +441,7 @@ def search_records(ctx: ToolContext) -> Any:
     offset = _arg_int(ctx, "offset", 0)
     order = _arg_str(ctx, "order", required=False) or None
     touched = set(fields or ()) | domain_fields(domain) | order_fields(order)
+    touched |= _value_oracle(model, domain_fields(domain) | order_fields(order))
     with ctx.guard(operation=Operation.READ, model=model, fields=touched, count=limit) as g:
         kwargs: dict[str, Any] = {"limit": limit, "offset": offset}
         if wanted := _read_fields(ctx, model, fields):
@@ -587,6 +607,7 @@ def model_info(ctx: ToolContext) -> Any:
         access = {op: _has_access(ctx, model, op) for op in ("read", "write", "create", "unlink")}
         policy = ctx.policy
         read_only = ctx.snapshot.profile.read_only
+        configurator = ctx.snapshot.profile.name in policy.configurator_profiles
         return _done(
             g,
             None,
@@ -600,9 +621,11 @@ def model_info(ctx: ToolContext) -> Any:
                 "field_count": len(defs),
                 "odoo_access": access,
                 "governance": {
-                    "readable": matches(model, policy.allowed_models),
-                    "writable": not read_only and matches(model, policy.writable_models),
-                    "deletable": not read_only and matches(model, policy.deletable_models),
+                    "readable": covers(model, policy.allowed_models, configurator),
+                    "writable": not read_only
+                    and covers(model, policy.writable_models, configurator),
+                    "deletable": not read_only
+                    and covers(model, policy.deletable_models, configurator),
                     "profile_read_only": read_only,
                 },
             },
@@ -638,13 +661,16 @@ def list_models(ctx: ToolContext) -> Any:
         policy = ctx.policy
         # Only what this server would actually let the agent read: listing
         # unreachable models just invites calls that will be refused.
-        sandbox = ctx.snapshot.profile.name in policy.sandbox_profiles
+        name = ctx.snapshot.profile.name
+        configurator = name in policy.configurator_profiles
+        open_level = configurator or name in policy.sandbox_profiles
         visible = [
-            {**row, "writable": matches(row["model"], policy.writable_models)}
+            {**row, "writable": covers(row["model"], policy.writable_models, configurator)}
             for row in rows
-            if row["model"] not in policy.denied_models
-            and matches(row["model"], policy.allowed_models)
-            and (not row.get("transient") or sandbox
+            if row["model"] not in ALWAYS_DENIED
+            and (configurator or row["model"] not in policy.denied_models)
+            and covers(row["model"], policy.allowed_models, configurator)
+            and (not row.get("transient") or open_level
                  or row["model"] in policy.transient_allowlist)
         ]
         return _done(
@@ -671,7 +697,8 @@ def name_search(ctx: ToolContext) -> Any:
     operator = _arg_str(ctx, "operator", required=False, default="ilike")
     limit = _limit(ctx, default=10)
     with ctx.guard(
-        operation=Operation.READ, model=model, fields=domain_fields(domain), count=limit
+        operation=Operation.READ, model=model,
+        fields=domain_fields(domain) | _value_oracle(model, domain_fields(domain)), count=limit
     ) as g:
         # Positional arguments: the keyword was renamed from ``args`` to
         # ``domain`` in Odoo 18, and position works on both sides of that.
@@ -683,7 +710,8 @@ def name_search(ctx: ToolContext) -> Any:
 def search_count(ctx: ToolContext) -> Any:
     model = _arg_str(ctx, "model")
     domain = _arg_domain(ctx)
-    with ctx.guard(operation=Operation.READ, model=model, fields=domain_fields(domain)) as g:
+    touched = domain_fields(domain) | _value_oracle(model, domain_fields(domain))
+    with ctx.guard(operation=Operation.READ, model=model, fields=touched) as g:
         count = ctx.odoo(model, "search_count", [domain])
         # Counting reads no record content, so it does not feed mass_read.
         return _done(g, None, {"model": model, "count": count})
@@ -823,6 +851,32 @@ def upload_attachment(ctx: ToolContext) -> Any:
         )
 
 
+def list_attachments(ctx: ToolContext) -> Any:
+    """The files attached to one record — the only way to discover files.
+
+    Governed as a read of the record's own model, so a denied or system
+    owner is refused before ir.attachment is touched, and only metadata is
+    returned.
+    """
+    model = _arg_str(ctx, "model")
+    record_id = ctx.arguments.get("record_id")
+    if isinstance(record_id, bool) or not isinstance(record_id, int) or record_id <= 0:
+        raise ToolInputError("'record_id' must be a positive integer")
+    with ctx.guard(operation=Operation.READ, model=model, fields=("attachment",), count=1) as g:
+        rows = ctx.odoo(
+            "ir.attachment",
+            "search_read",
+            [[["res_model", "=", model], ["res_id", "=", record_id]]],
+            {"fields": ["name", "mimetype", "file_size", "create_date"], "limit": 100},
+        )
+        files = [
+            {k: r.get(k) for k in ("id", "name", "mimetype", "file_size", "create_date")}
+            for r in rows if isinstance(r, dict)
+        ]
+        return _done(g, len(files), {"model": model, "record_id": record_id,
+                                     "count": len(files), "attachments": files})
+
+
 def get_attachment(ctx: ToolContext) -> Any:
     attachment_id = ctx.arguments.get("attachment_id")
     if isinstance(attachment_id, bool) or not isinstance(attachment_id, int) or attachment_id <= 0:
@@ -833,10 +887,22 @@ def get_attachment(ctx: ToolContext) -> Any:
         "ir.attachment",
         "read",
         [[attachment_id]],
-        {"fields": ["name", "mimetype", "file_size", "res_model", "res_id"]},
+        {"fields": ["name", "mimetype", "file_size", "res_model", "res_id", "res_field"]},
     )
     owner = (meta[0].get("res_model") if meta else None) or "ir.attachment"
-    with ctx.guard(operation=Operation.READ, model=owner, fields=("attachment",), count=1) as g:
+    checked = {"attachment"}
+    if meta:
+        # Which field holds the file, and what kind of file it is: keys and
+        # certificates are refused whatever record they belong to.
+        if meta[0].get("res_field"):
+            checked.add(str(meta[0]["res_field"]))
+        name = str(meta[0].get("name") or "").lower()
+        if "." in name:
+            checked.add("file:" + name[name.rindex("."):])
+        mimetype = str(meta[0].get("mimetype") or "").lower()
+        if "pkcs12" in mimetype or "x-pem" in mimetype or "x-x509" in mimetype:
+            checked.add("file:.p12")
+    with ctx.guard(operation=Operation.READ, model=owner, fields=checked, count=1) as g:
         if not meta:
             raise ToolInputError(f"attachment {attachment_id} does not exist")
         info = meta[0]
@@ -927,6 +993,13 @@ def _profile_status(profile) -> dict[str, Any]:
         k: v for k, v in profile.public().items() if k not in ("allow_writes", "read_only")
     }
     status["writes_enabled"] = not profile.read_only
+    status["level"] = profile.level if profile.environment != "production" else "business"
+    if profile.configurator and profile.environment != "production":
+        status["level_note"] = (
+            "configurator: the whole system is reachable — modules, settings, users, views, "
+            "automations; API keys, attachments outside list_attachments/get_attachment and "
+            "credential fields are not, and module changes or code wait for a human"
+        )
     if profile.sandbox and profile.environment != "production":
         status["sandbox"] = True
         status["sandbox_note"] = (
@@ -1139,6 +1212,15 @@ TOOLS: dict[str, Tool] = {
             WRITES,
         ),
         Tool(
+            "list_attachments",
+            "List the files attached to one record (name, type, size).",
+            Operation.READ,
+            {"model": MODEL, "record_id": RECORD_ID},
+            ("model", "record_id"),
+            list_attachments,
+            READ_ONLY,
+        ),
+        Tool(
             "get_attachment",
             "Download an attachment as base64.",
             Operation.READ,
@@ -1170,5 +1252,5 @@ TOOLS: dict[str, Tool] = {
 
 # The tool surface is a contract with every connected agent. A real check, not
 # an assert: asserts vanish under ``python -O``.
-if len(TOOLS) != 18:
-    raise RuntimeError(f"the tool surface is a contract — 18 tools, found {len(TOOLS)}")
+if len(TOOLS) != 19:
+    raise RuntimeError(f"the tool surface is a contract — 19 tools, found {len(TOOLS)}")

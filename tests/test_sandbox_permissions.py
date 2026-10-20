@@ -52,7 +52,7 @@ class TestSandboxPolicy:
     @pytest.mark.parametrize("call_kwargs, code", [
         ({"model": "ir.cron"}, "model_denied"),
         ({"fields": ("password",)}, "sensitive_field"),
-        ({"model": "ir.attachment", "fields": ("datas",)}, "attachment_content"),
+        ({"model": "ir.attachment", "fields": ("datas",)}, "model_denied"),
     ])
     def test_the_floor_stays(self, clock: FakeClock, call_kwargs, code) -> None:
         verdict = PolicyEngine(SANDBOX).evaluate(make_call(clock, profile="lab", **call_kwargs))

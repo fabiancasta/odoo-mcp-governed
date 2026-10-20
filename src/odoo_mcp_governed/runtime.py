@@ -191,6 +191,7 @@ class Runtime:
             config,
             read_only_profiles=self.profiles.read_only_names(),
             sandbox_profiles=self.profiles.sandbox_names(),
+            configurator_profiles=self.profiles.configurator_names(),
             privileged_profiles=frozenset(self._privileged),
         )
 
