@@ -90,3 +90,18 @@ def test_malformed_tool_arguments_do_not_crash_the_run() -> None:
     outcome, _ = run(governed, scripted(bad, {"role": "assistant", "content": "done"}))
     assert governed.calls == [("search_records", {})]
     assert outcome["stats"]["calls"] == 1
+
+
+def test_the_window_keeps_the_head_and_never_orphans_a_tool_result() -> None:
+    head = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
+    history = []
+    for i in range(20):
+        history.append({"role": "assistant", "content": None, "tool_calls": [
+            {"id": f"c{i}", "type": "function", "function": {"name": "t", "arguments": "{}"}}]})
+        history.append({"role": "tool", "tool_call_id": f"c{i}", "content": "x" * 400})
+    sent = agent.window(head + history, budget_chars=3_000)
+    assert sent[:2] == head
+    assert sent[2]["role"] == "assistant"
+    assert len(sent) < len(head + history)
+    calls = {c["id"] for m in sent if m.get("tool_calls") for c in m["tool_calls"]}
+    assert all(m["tool_call_id"] in calls for m in sent if m["role"] == "tool")

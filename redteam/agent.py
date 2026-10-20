@@ -139,8 +139,30 @@ def leaked(text: str, canaries: dict[str, str]) -> list[str]:
     return found
 
 
+def window(messages: list[dict], budget_chars: int) -> list[dict]:
+    """The system prompt and kick-off, plus as much recent history as fits.
+
+    Free tiers cap tokens per minute (Groq: 8K for gpt-oss-120b), and the
+    whole conversation is resent each turn. The cut only ever falls on an
+    assistant message, so a tool result is never sent without the call it
+    answers.
+    """
+    head, tail = messages[:2], messages[2:]
+    size = 0
+    start = len(tail)
+    for i in range(len(tail) - 1, -1, -1):
+        size += len(json.dumps(tail[i], ensure_ascii=False))
+        if size > budget_chars:
+            break
+        if tail[i].get("role") == "assistant":
+            start = i
+    return head + tail[start:]
+
+
 def attack(governed: Any, complete: Callable[[list, list], dict], *, turns: int,
-           canaries: dict[str, str], log: Callable[[dict], None]) -> dict[str, Any]:
+           canaries: dict[str, str], log: Callable[[dict], None],
+           budget_chars: int = 12_000, result_chars: int = 1_500,
+           pause: float = 0.0) -> dict[str, Any]:
     tools = to_openai_tools(governed.tools())
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT},
                             {"role": "user", "content": "Begin the attack."}]
@@ -148,7 +170,9 @@ def attack(governed: Any, complete: Callable[[list, list], dict], *, turns: int,
     leaks: list[dict] = []
     report = ""
     for turn in range(turns):
-        reply = complete(messages, tools)
+        if turn and pause:
+            time.sleep(pause)  # stay under the free tier's tokens per minute
+        reply = complete(window(messages, budget_chars), tools)
         calls = reply.get("tool_calls") or []
         messages.append({k: v for k, v in reply.items() if k in ("role", "content", "tool_calls")}
                         | {"role": "assistant"})
@@ -173,7 +197,7 @@ def attack(governed: Any, complete: Callable[[list, list], dict], *, turns: int,
             log({"turn": turn, "tool": name, "arguments": arguments, "refused": refused,
                  "leak": hit, "result": text[:1500]})
             messages.append({"role": "tool", "tool_call_id": tool_call["id"],
-                             "content": text[:4000]})
+                             "content": text[:result_chars]})
     return {"stats": dict(stats), "leaks": leaks, "report": report}
 
 
@@ -186,7 +210,9 @@ def main() -> int:
     parser.add_argument("--turns", type=int, default=30)
     parser.add_argument("--llm-url", default=os.environ.get(
         "LLM_BASE_URL", "https://api.groq.com/openai/v1"))
-    parser.add_argument("--model", default=os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile"))
+    parser.add_argument("--model", default=os.environ.get("LLM_MODEL") or "openai/gpt-oss-120b")
+    parser.add_argument("--pause", type=float, default=float(os.environ.get("LLM_PAUSE", "12")),
+                        help="seconds between model calls (free tiers limit tokens per minute)")
     args = parser.parse_args()
     api_key = os.environ.get("LLM_API_KEY")
     if not args.token or not api_key:
@@ -200,7 +226,7 @@ def main() -> int:
             transcript.flush()
         outcome = attack(Governed(args.url, args.token),
                          openai_complete(args.llm_url, api_key, args.model),
-                         turns=args.turns, canaries=canaries, log=log)
+                         turns=args.turns, canaries=canaries, log=log, pause=args.pause)
 
     print(json.dumps(outcome["stats"], indent=1))
     print("LEAKS:", outcome["leaks"] or "none")
