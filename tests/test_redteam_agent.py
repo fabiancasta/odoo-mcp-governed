@@ -127,3 +127,21 @@ def test_server_schemas_declare_array_items() -> None:
                 yield from arrays(value)
     for tool in TOOLS.values():
         assert all("items" in a for a in arrays(tool.schema()["inputSchema"])), tool.name
+
+
+def test_a_request_too_large_shrinks_the_history_and_retries() -> None:
+    governed = FakeGoverned([(True, "Refused"), (True, "Refused")])
+    sizes = []
+    steps = [tool_turn({}), tool_turn({}), {"role": "assistant", "content": "done"}]
+
+    def complete(messages, tools):
+        sizes.append(len(messages))
+        if len(sizes) == 2:
+            raise agent.RequestTooLarge("LLM API 413: too large")
+        return steps.pop(0)
+
+    log = []
+    outcome = agent.attack(governed, complete, turns=5, canaries=CANARIES, log=log.append,
+                           budget_chars=4_000)
+    assert outcome["report"] == "done"
+    assert any("request too large" in str(e.get("note", "")) for e in log)

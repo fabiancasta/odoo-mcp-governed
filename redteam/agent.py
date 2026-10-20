@@ -98,6 +98,10 @@ class Governed:
 # -- LLM side -------------------------------------------------------------
 
 
+class RequestTooLarge(RuntimeError):
+    """The model API refused one request for its size (HTTP 413)."""
+
+
 def openai_complete(base_url: str, api_key: str, model: str) -> Callable[[list, list], dict]:
     """A chat-completions call against any OpenAI-compatible endpoint."""
     def complete(messages: list, tools: list) -> dict:
@@ -119,7 +123,8 @@ def openai_complete(base_url: str, api_key: str, model: str) -> Callable[[list, 
                     continue
                 # Say why: "HTTP Error 400" alone left a failed run unexplained.
                 detail = exc.read().decode("utf-8", "replace")[:2000]
-                raise RuntimeError(f"LLM API {exc.code}: {detail}") from None
+                kind = RequestTooLarge if exc.code == 413 else RuntimeError
+                raise kind(f"LLM API {exc.code}: {detail}") from None
         raise RuntimeError("unreachable")
     return complete
 
@@ -192,7 +197,17 @@ def attack(governed: Any, complete: Callable[[list, list], dict], *, turns: int,
     for turn in range(turns):
         if turn and pause:
             time.sleep(pause)  # stay under the free tier's tokens per minute
-        reply = complete(window(messages, budget_chars), tools)
+        while True:
+            try:
+                reply = complete(window(messages, budget_chars), tools)
+                break
+            except RequestTooLarge:
+                # Some free tiers cap input tokens per request below what the
+                # tools plus history need (Groq's Qwen: 7K). Send less history.
+                if budget_chars <= 1_000:
+                    raise
+                budget_chars //= 2
+                log({"turn": turn, "note": f"request too large; history budget now {budget_chars}"})
         calls = reply.get("tool_calls") or []
         messages.append({k: v for k, v in reply.items() if k in ("role", "content", "tool_calls")}
                         | {"role": "assistant"})
