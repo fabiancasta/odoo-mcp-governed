@@ -8,7 +8,7 @@
 # * The Debian base carries CVEs that have no upstream fix yet. Rebuild
 #   regularly so fixes arrive as soon as they exist:
 #     docker compose build --pull && docker compose up -d
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 ARG APP_UID=1000
 ENV PYTHONDONTWRITEBYTECODE=1 \
