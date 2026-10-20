@@ -1,120 +1,85 @@
-# Red-team run on GitHub's own machines — nothing runs on your computer.
+# Red-team runs on GitHub's machines — nothing runs on your computer.
 #
-# Install: in the GitHub web UI, Add file → Create new file, name it
-# `.github/workflows/redteam.yml` and paste this file. (A token without the
-# `workflow` scope cannot push files under .github/workflows.)
+# - harness (A): deterministic attacks against a throwaway Odoo 19 and a
+#   governed built from the commit, on every push to main and every pull
+#   request. Needs no secret: a regression of the governance floor fails CI.
+# - llm (B): an adversarial model with the 18 tools, two model families per
+#   run, started by hand (Actions → redteam → Run workflow). Needs the
+#   repository secret REDTEAM_LLM_API_KEY (a free Groq key).
 #
-# Optional, for the LLM attacker: Settings → Secrets and variables → Actions →
-# New repository secret REDTEAM_LLM_API_KEY (a free Groq API key). Without it
-# only the deterministic harness runs. Change the provider with the
-# repository variables LLM_BASE_URL and LLM_MODEL.
-#
-# Run it: Actions → redteam → Run workflow. Everything — Odoo, its database,
-# governed, the attacker — is created for the run and destroyed after it.
+# The world is built by redteam/ci_world.sh. Actions are pinned by commit SHA
+# and images by digest; Dependabot (.github/dependabot.yml) proposes bumps.
 name: redteam
 
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
     inputs:
       turns:
-        description: "LLM attacker turns"
+        description: "LLM attacker turns per model"
         default: "30"
 
 permissions:
   contents: read
 
 jobs:
-  redteam:
+  harness:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    env:
-      LLM_API_KEY: ${{ secrets.REDTEAM_LLM_API_KEY }}
-      LLM_BASE_URL: ${{ vars.LLM_BASE_URL || 'https://api.groq.com/openai/v1' }}
-      LLM_MODEL: ${{ vars.LLM_MODEL || 'llama-3.3-70b-versatile' }}
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Start a throwaway Odoo 19
-        run: |
-          docker network create rt
-          docker run -d --name db --network rt -e POSTGRES_USER=odoo \
-            -e POSTGRES_PASSWORD=odoo -e POSTGRES_DB=postgres postgres:15
-          until docker exec db pg_isready -U odoo >/dev/null 2>&1; do sleep 2; done
-          docker run --rm --network rt -e HOST=db -e USER=odoo -e PASSWORD=odoo \
-            odoo:19.0 odoo -d govtest -i base,contacts --stop-after-init
-          docker run -d --name web --network rt -p 127.0.0.1:8069:8069 \
-            -e HOST=db -e USER=odoo -e PASSWORD=odoo odoo:19.0 odoo --db-filter='^govtest$'
-          for i in $(seq 1 60); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8069/web/login || true)
-            [ "$code" = 200 ] && break; sleep 3
-          done
-          echo "odoo answered $code"
-
-      - name: Plant canaries
-        run: python3 redteam/canaries.py --url http://127.0.0.1:8069 --db govtest --out canaries.json
-
-      - name: Start governed from this commit
-        run: |
-          docker build -q -t governed:rt .
-          python3 - <<'EOF'
-          import os, secrets
-          values = {
-              "JWT_SECRET": secrets.token_urlsafe(48),
-              "ADMIN_PASSWORD": secrets.token_urlsafe(24),
-              "AUDIT_HMAC_KEY": secrets.token_urlsafe(32),
-              "ODOO_URL": "http://web:8069", "ODOO_DB": "govtest",
-              "ODOO_USERNAME": "admin", "ODOO_PASSWORD": "admin",
-              "ODOO_ENVIRONMENT": "development",
-              # Widest policy on purpose: the floor must hold on its own.
-              "ALLOWED_MODELS": "*", "WRITABLE_MODELS": "*", "DELETABLE_MODELS": "*",
-              "ALLOW_EXECUTE_METHOD": "true", "EXECUTE_METHOD_ALLOWLIST": "",
-              "BUSINESS_HOURS": "00:00-23:59", "BUSINESS_DAYS": "mon,tue,wed,thu,fri,sat,sun",
-              "BUSINESS_TIMEZONE": "UTC", "RISK_THROTTLE_SECONDS": "0",
-              "DATA_DIR": "/data", "MCP_HOST": "0.0.0.0", "MCP_PORT": "8000",
-          }
-          with open("rt.env", "w") as f:
-              f.writelines(f"{k}={v}\n" for k, v in values.items())
-          print(f"::add-mask::{values['ADMIN_PASSWORD']}")
-          with open(os.environ["GITHUB_ENV"], "a") as f:
-              f.write(f"REDTEAM_ADMIN_PASSWORD={values['ADMIN_PASSWORD']}\n")
-          EOF
-          mkdir -m 777 rtdata
-          docker run -d --name governed --network rt -p 127.0.0.1:8032:8000 \
-            --env-file rt.env -v "$PWD/rtdata:/data" --read-only \
-            --tmpfs /tmp:size=16m,mode=1777 --cap-drop ALL \
-            --security-opt no-new-privileges:true governed:rt
-          for i in $(seq 1 40); do
-            [ "$(docker inspect -f '{{.State.Health.Status}}' governed)" = healthy ] && break; sleep 2
-          done
-          token() { docker exec governed odoo-mcp-governed token --actor "$1" --hours 2 \
-            | grep -o 'eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*'; }
-          seed=$(token rt-seed); llm=$(token rt-llm-attacker)
-          echo "::add-mask::$seed"; echo "::add-mask::$llm"
-          echo "REDTEAM_TOKEN=$seed" >> "$GITHUB_ENV"
-          echo "REDTEAM_AGENT_TOKEN=$llm" >> "$GITHUB_ENV"
-
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the disposable world
+        run: bash redteam/ci_world.sh
       - name: A — deterministic attacks
         run: |
           python3 redteam/harness.py --url http://127.0.0.1:8032 \
             --canaries canaries.json --report harness.json
-
-      - name: B — LLM attacker
-        if: ${{ always() && env.LLM_API_KEY != '' }}
-        run: |
-          python3 redteam/agent.py --url http://127.0.0.1:8032 --canaries canaries.json \
-            --transcript agent.jsonl --turns "${{ inputs.turns }}"
-
       - name: Audit chain must still verify
         if: always()
         run: docker exec governed odoo-mcp-governed audit verify
-
       - name: Keep the evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: redteam-${{ github.run_number }}
+          name: redteam-harness-${{ github.run_number }}
           path: |
             harness.json
+            canaries.json
+          if-no-files-found: ignore
+
+  llm:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # Two families, so one model's blind spots are not the whole test.
+        model: ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"]
+    env:
+      LLM_API_KEY: ${{ secrets.REDTEAM_LLM_API_KEY }}
+      LLM_BASE_URL: ${{ vars.LLM_BASE_URL || 'https://api.groq.com/openai/v1' }}
+      LLM_MODEL: ${{ matrix.model }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the disposable world
+        run: bash redteam/ci_world.sh
+      - name: B — LLM attacker
+        if: env.LLM_API_KEY != ''
+        run: |
+          python3 redteam/agent.py --url http://127.0.0.1:8032 --canaries canaries.json \
+            --transcript agent.jsonl --turns "${{ inputs.turns }}"
+      - name: Audit chain must still verify
+        if: always()
+        run: docker exec governed odoo-mcp-governed audit verify
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: redteam-llm-${{ strategy.job-index }}-${{ github.run_number }}
+          path: |
             agent.jsonl
             canaries.json
           if-no-files-found: ignore
