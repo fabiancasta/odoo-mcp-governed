@@ -86,17 +86,20 @@ def test_different_actors_are_not_serialised_behind_each_other(
     stall every other integration on the server."""
     engine = _engine(AuditStore(tmp_path / "audit.db"), policy_config, clock)
 
+    # No stopwatch: a wall-clock bound failed on a slow CI runner with correct
+    # code. Instead all five calls must be inside their guarded section at the
+    # same moment. If actors were serialised behind one another, the barrier
+    # could never fill and every wait would time out.
+    barrier = threading.Barrier(5, timeout=10)
+
     def slow_read(actor: str) -> None:
         with engine.guard(make_call(clock, actor=actor)) as guarded:
-            time.sleep(0.2)
+            barrier.wait()
             guarded.affected(1)
 
-    started = time.perf_counter()
     with ThreadPoolExecutor(max_workers=5) as pool:
         list(pool.map(slow_read, [f"agent-{i}" for i in range(5)]))
-    elapsed = time.perf_counter() - started
-
-    assert elapsed < 0.6, f"5 actors x 0.2s took {elapsed:.2f}s — they were serialised"
+    assert not barrier.broken
 
 
 def test_chain_does_not_fork_under_concurrent_appends(tmp_path, clock: FakeClock) -> None:
