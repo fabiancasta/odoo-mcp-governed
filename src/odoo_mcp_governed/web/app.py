@@ -320,8 +320,11 @@ def create_app(runtime: Runtime) -> FastAPI:
                 reasons=(f"auth_failed: {exc}",),
                 outcome=Outcome.DENIED,
             )
+            # Why it failed stays in the audit log above. The caller learns only
+            # that it failed: "expired" versus "wrong issuer" is a hint for the
+            # next attempt, and a fixed text cannot leak anything internal.
             return JSONResponse(
-                {"error": str(exc)},
+                {"error": "invalid or expired token"},
                 status_code=401,
                 headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
             )

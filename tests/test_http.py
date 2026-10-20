@@ -64,6 +64,13 @@ def rpc(method: str, params: dict | None = None, id_: int = 1) -> dict:
     return {"jsonrpc": "2.0", "id": id_, "method": method, "params": params or {}}
 
 
+def last_auth_reason(runtime: Runtime) -> str:
+    """Why the last authentication failed — kept in the audit log, never sent
+    to the caller (CodeQL py/stack-trace-exposure, CWE-209)."""
+    [event] = [e for e in runtime.audit.store.tail(5) if e.tool == "mcp.auth"][:1]
+    return event.reasons[0]
+
+
 def login(client: TestClient) -> str:
     response = client.post("/admin", data={"password": ADMIN}, follow_redirects=False)
     assert response.status_code == 303
@@ -115,22 +122,24 @@ class TestMcpAuth:
                                headers={"Authorization": f"Bearer {forged}"})
         assert response.status_code == 401
 
-    def test_alg_none_is_rejected(self, client) -> None:
+    def test_alg_none_is_rejected(self, client, runtime) -> None:
         """The classic: a token that declares no signature at all."""
         unsigned = jwt.encode({"sub": "x", "iss": "odoo-mcp-governed", "iat": int(time.time()),
                                "exp": int(time.time()) + 60}, None, algorithm="none")
         response = client.post("/mcp", json=rpc("tools/list"),
                                headers={"Authorization": f"Bearer {unsigned}"})
         assert response.status_code == 401
-        assert "algorithm" in response.json()["error"]
+        assert response.json() == {"error": "invalid or expired token"}
+        assert "algorithm" in last_auth_reason(runtime)
 
-    def test_expired_token_is_rejected(self, client) -> None:
+    def test_expired_token_is_rejected(self, client, runtime) -> None:
         old = jwt.encode({"sub": "x", "iss": "odoo-mcp-governed", "iat": 1, "exp": 2},
                          SECRET, algorithm="HS256")
         response = client.post("/mcp", json=rpc("tools/list"),
                                headers={"Authorization": f"Bearer {old}"})
         assert response.status_code == 401
-        assert "expired" in response.json()["error"]
+        assert response.json() == {"error": "invalid or expired token"}
+        assert "expired" in last_auth_reason(runtime)
 
     def test_wrong_issuer_is_rejected(self, client) -> None:
         other = jwt.encode({"sub": "x", "iss": "someone-else", "iat": int(time.time()),
