@@ -105,7 +105,10 @@ def openai_complete(base_url: str, api_key: str, model: str) -> Callable[[list, 
                            "tool_choice": "auto", "temperature": 0.8}).encode()
         request = urllib.request.Request(
             base_url.rstrip("/") + "/chat/completions", data=body, method="POST",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
+                     # Groq sits behind Cloudflare, which refuses urllib's default
+                     # "Python-urllib" signature with 403 / error code 1010.
+                     "User-Agent": "odoo-mcp-governed-redteam/0.2"})
         for attempt in range(5):
             try:
                 with urllib.request.urlopen(request, timeout=120) as response:
