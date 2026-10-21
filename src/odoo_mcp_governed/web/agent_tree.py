@@ -300,7 +300,12 @@ def tree_page(*, csrf: str, name: str, rule: AgentRule | None, policy: PolicyCon
             '<input type="hidden" name="kind" value="unregistered">'
             '<button class="danger" type="submit">Revoke unregistered tokens</button></form>'
             "</div></li>")
-    token_nodes += (
+    if archived:
+        token_nodes += ('<li><div class="node off"><small>Archived: no token can be issued. '
+                        "Restore the agent first — it comes back with no valid token."
+                        "</small></div></li>")
+    else:
+        token_nodes += (
         f'<li><form method="post" action="/admin/agents/token" class="plus">{csrf_field(csrf)}'
         f'<input type="hidden" name="name" value="{esc(name)}">'
         '<input type="hidden" name="from_tree" value="1">'

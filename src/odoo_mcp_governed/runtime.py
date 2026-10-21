@@ -416,6 +416,9 @@ class Runtime:
 
         if not ACTOR_NAME.match(name):
             raise ValueError("agent names may only contain letters, digits and _ . @ -")
+        if name in self.agents.archived():
+            raise ValueError(f"agent {name!r} is archived: restore it first — no token is "
+                             "issued to an archived agent")
         rule = self.agents.rule(name)
         if rule and rule.profile:
             if profile and profile != rule.profile:
@@ -456,9 +459,13 @@ class Runtime:
             action.count = 1
 
     def restore_agent(self, name: str, *, actor: str) -> None:
-        """Bring an archived agent back. Its old tokens stay revoked: it needs
-        a new one."""
+        """Bring an archived agent back with no valid token at all: every token
+        issued until now is revoked again. It needs a new one."""
         with self.admin_action(actor, "admin.agent.restore", detail={"agent": name}) as action:
+            # Restoring never hands credentials back: whatever was issued up to
+            # now — before or while archived — stays dead. A new token is a
+            # separate, deliberate step.
+            self.agents.revoke_all(name)
             self.agents.set_archived(name, False)
             current = set(self.policy_store.config.blocked_actors) - {name}
             self.policy_store.update({"blocked_actors": sorted(current)})

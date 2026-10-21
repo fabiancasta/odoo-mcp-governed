@@ -86,7 +86,8 @@ FLASH = {
                       "history stays.", "ok"),
     "agent_archived": ("Agent archived: tokens revoked and agent blocked. Find it under "
                        "“Archived agents” to restore it.", "ok"),
-    "agent_restored": ("Agent restored and unblocked. Issue it a new token.", "ok"),
+    "agent_restored": ("Agent restored and unblocked, with no valid token: every token "
+                       "issued until now stays revoked. Issue it a new one.", "ok"),
     "token_revoked": ("Revoked. The token is refused from its next request.", "ok"),
     "grant_revoked": ("Standing approval withdrawn.", "ok"),
     "permissions_default": ("This profile uses the default permissions again.", "ok"),
@@ -1187,6 +1188,8 @@ def create_app(runtime: Runtime) -> FastAPI:
         problem = vars_problem(pairs) or (
             None if ACTOR_NAME.match(name) else "agent names may only contain letters, digits "
             "and _ . @ -")
+        if not problem and name in runtime.agents.archived():
+            problem = f"{name} is archived; restore it first"
         if problem:
             return agents_page(session, flash=f"No token issued: {problem}", kind="bad")
         try:
@@ -1351,6 +1354,10 @@ def create_app(runtime: Runtime) -> FastAPI:
         if problem:
             return connect_page(session, request, flash=f"No token issued: {problem}",
                                 kind="bad")
+        if actor in runtime.agents.archived():
+            return connect_page(session, request, kind="bad", flash=(
+                f"No token issued: {actor} is archived. Restore it first, from Agents → "
+                "Archived agents."))
         try:
             issued = await run_in_threadpool(lambda: runtime.issue_agent_token(
                 actor, actor=admin_actor(request), profile=profile,

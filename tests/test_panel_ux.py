@@ -359,3 +359,55 @@ class TestConnect:
         client.post("/admin/token/forget", data={"csrf": csrf, "confirm": "yes"})
         assert not runtime.settings.token_file.exists()
         assert "stored by the old" not in client.get("/token").text
+
+
+class TestArchiveIsFinal:
+    """Archiving is a security decision: restoring never hands credentials back."""
+
+    def status(self, client, token: str) -> int:
+        return client.post("/mcp", headers={"Authorization": f"Bearer {token}"},
+                           json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).status_code
+
+    def test_no_token_is_issued_to_an_archived_agent(self, tmp_path) -> None:
+        runtime, client, csrf = app(tmp_path)
+        runtime.archive_agent("claude", actor="a")
+        page = client.post("/admin/token/regenerate", data={"csrf": csrf, "actor": "claude"}).text
+        assert "is archived" in page and not runtime.agents.tokens("claude")
+        import pytest
+        with pytest.raises(ValueError, match="archived"):
+            runtime.issue_agent_token("claude", actor="a")
+
+    def test_an_archived_agent_is_refused_at_the_door_even_if_unblocked(self, tmp_path) -> None:
+        import time
+        runtime, client, _ = app(tmp_path)
+        runtime.archive_agent("claude", actor="a")
+        time.sleep(1.1)
+        # Someone mints a token outside the panel and unblocks the agent by hand.
+        from odoo_mcp_governed.web.auth import issue_token
+        token = issue_token(runtime.settings, "claude")["token"]
+        runtime.set_actor_blocked("claude", False, actor="a")
+        assert self.status(client, token) == 401
+
+    def test_restore_brings_no_valid_token_back(self, tmp_path) -> None:
+        import time
+        runtime, client, _ = app(tmp_path)
+        before = runtime.issue_agent_token("claude", actor="a")["token"]
+        runtime.archive_agent("claude", actor="a")
+        time.sleep(1.1)
+        from odoo_mcp_governed.web.auth import issue_token
+        during = issue_token(runtime.settings, "claude")["token"]  # minted while archived
+        runtime.restore_agent("claude", actor="a")
+        assert self.status(client, before) == 401 and self.status(client, during) == 401
+        time.sleep(1.1)
+        after = runtime.issue_agent_token("claude", actor="a")["token"]
+        assert self.status(client, after) == 200
+
+    def test_a_deleted_name_reused_later_gets_no_old_token(self, tmp_path) -> None:
+        import time
+        runtime, client, _ = app(tmp_path)
+        old = runtime.issue_agent_token("claude", actor="a")["token"]
+        runtime.archive_agent("claude", actor="a", delete_rule=True)
+        runtime.restore_agent("claude", actor="a")
+        assert self.status(client, old) == 401
+        time.sleep(1.1)
+        assert self.status(client, runtime.issue_agent_token("claude", actor="a")["token"]) == 200

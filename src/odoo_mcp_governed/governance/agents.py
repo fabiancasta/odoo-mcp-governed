@@ -351,6 +351,11 @@ class AgentStore:
             token = self._data["tokens"].get(jti) if isinstance(jti, str) else None
             cutoff = self._data["revoked_before"].get(sub)
             loose_cutoff = self._data.get("unregistered_before", {}).get(sub)
+            archived = sub in (self._data.get("archived") or {})
+        if archived:
+            # Checked at the door, not only by the policy's block list: two
+            # independent locks, so unblocking by hand does not reopen it.
+            return "agent archived"
         if token is not None and token.get("revoked_at"):
             return "token revoked"
         if token is not None and token.get("actor") != sub:
