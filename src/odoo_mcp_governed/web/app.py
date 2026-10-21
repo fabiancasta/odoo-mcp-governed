@@ -32,6 +32,7 @@ from .. import __version__
 from ..governance import ChainStatus, Decision, Operation, Outcome, ToolCall
 from ..governance.agents import AgentError, AgentRule, parse_vars, rule_problem, vars_problem
 from ..governance.approvals import GRANT_MINUTES
+from ..governance.policy import is_system_model
 from ..odoo import OdooClient, OdooError
 from ..policy_store import LIST_FIELDS
 from ..profiles import PROFILE_NAME, Profile, ProfileError
@@ -79,7 +80,11 @@ FLASH = {
         "ok",
     ),
     "agent_saved": ("Agent saved. Its rule applies to its next call.", "ok"),
-    "agent_deleted": ("Agent rule deleted. Its tokens still follow the server policy.", "ok"),
+    "agent_deleted": ("Agent deleted: tokens revoked, agent blocked, rule removed. Its audit "
+                      "history stays.", "ok"),
+    "agent_archived": ("Agent archived: tokens revoked and agent blocked. Find it under "
+                       "“Archived agents” to restore it.", "ok"),
+    "agent_restored": ("Agent restored and unblocked. Issue it a new token.", "ok"),
     "token_revoked": ("Revoked. The token is refused from its next request.", "ok"),
     "grant_revoked": ("Standing approval withdrawn.", "ok"),
     "permissions_default": ("This profile uses the default permissions again.", "ok"),
@@ -748,6 +753,73 @@ def create_app(runtime: Runtime) -> FastAPI:
             read_only=bool(profile) and profile in runtime.profiles.read_only_names(),
         ))
 
+    def mark_seen(profile: str, models: list[str]) -> None:
+        seen = seen_models()
+        key = profile or runtime.profile_name
+        seen[key] = sorted(set(seen.get(key, [])) | set(models))
+        write_private_json(settings.data_dir / "models_seen.json", seen)
+
+    def save_levels(request: Request, profile: str, levels: dict[str, str]):
+        denied = runtime.policy_store.config.denied_models
+        lists = {k: set(v) for k, v in lists_for(profile).items()}
+        for model, level in levels.items():
+            if model in denied or level not in ("none", "read", "write", "delete"):
+                continue
+            views.set_level(lists, model, level)
+        save_lists(profile, lists, admin_actor(request))
+        mark_seen(profile, list(levels))
+
+    @app.post("/admin/permissions/app")
+    async def permissions_app(request: Request):
+        """One click: every business model of an app at one level."""
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf", "/admin/permissions")
+        profile = target_profile(form.get("profile"))
+        app_key, level = str(form.get("app") or ""), str(form.get("level") or "")
+        try:
+            models = await run_in_threadpool(odoo_models, profile)
+        except Exception:  # noqa: BLE001 - nothing to apply without the list
+            return to_permissions("permissions_error", profile)
+        targets = [str(m.get("model")) for m in models if isinstance(m, dict)
+                   and not m.get("transient") and m.get("model")
+                   and permissions.app_key(str(m["model"])) == app_key
+                   and not is_system_model(str(m["model"]))]
+        if not targets or level not in ("none", "read", "write", "delete"):
+            return to_permissions("permissions_error", profile)
+        try:
+            await run_in_threadpool(save_levels, request, profile, dict.fromkeys(targets, level))
+        except (ValueError, KeyError):
+            return to_permissions("permissions_error", profile)
+        query = {"m": "permissions_saved"} | ({"profile": profile} if profile else {})
+        return RedirectResponse(f"/admin/permissions?{urlencode(query)}#app-{app_key}",
+                                status_code=303)
+
+    @app.post("/admin/permissions/models")
+    async def permissions_models(request: Request):
+        """The fine-tune form of an app: one level per model."""
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf", "/admin/permissions")
+        profile = target_profile(form.get("profile"))
+        levels = {k[4:]: str(v) for k, v in form.items()
+                  if k.startswith("lvl:") and MODEL_NAME.match(k[4:]) and k[4:] != "*"}
+        if not levels:
+            return to_permissions("permissions_error", profile)
+        try:
+            await run_in_threadpool(save_levels, request, profile, levels)
+        except (ValueError, KeyError):
+            return to_permissions("permissions_error", profile)
+        app_key = str(form.get("app") or "")
+        query = {"m": "permissions_saved"} | ({"profile": profile} if profile else {})
+        anchor = f"#app-{app_key}" if MODEL_NAME.match(app_key) else ""
+        return RedirectResponse(f"/admin/permissions?{urlencode(query)}{anchor}",
+                                status_code=303)
+
     @app.post("/admin/permissions/reset")
     async def permissions_reset(request: Request):
         session, form = await admin_form(request)
@@ -917,12 +989,13 @@ def create_app(runtime: Runtime) -> FastAPI:
             selected=tab, read_only_profiles=runtime.profiles.read_only_names(),
             seen=seen, summaries=agent_summaries(names),
             new_name=edit if edit and edit not in rules and ACTOR_NAME.match(edit) else "",
-            open_form=open_form or kind == "bad",
+            open_form=open_form or kind == "bad", archived=runtime.agents.archived(),
         ))
 
     def roster() -> list[tuple[str, str]]:
         rules, seen = runtime.agents.rules(), actor_stats()
-        names = sorted(set(rules) | set(seen) | {t["actor"] for t in runtime.agents.tokens()})
+        names = sorted((set(rules) | set(seen) | {t["actor"] for t in runtime.agents.tokens()})
+                       - set(runtime.agents.archived()))
         out = []
         for n in names:
             rule = rules.get(n)
@@ -949,6 +1022,7 @@ def create_app(runtime: Runtime) -> FastAPI:
             tokens=runtime.agents.tokens(name), stats=actor_stats().get(name),
             tools=sorted(TOOLS), blocked=name in cfg.blocked_actors, flash=flash,
             flash_kind=kind, agents_list=roster(), issued=issued,
+            archived=runtime.agents.archived().get(name),
             edit_form=views.rule_form(csrf=session.csrf, e=rule or AgentRule(name=name),
                                       profiles=[p["name"] for p in runtime.profiles.public()],
                                       tools=sorted(TOOLS)),
@@ -974,6 +1048,27 @@ def create_app(runtime: Runtime) -> FastAPI:
                 target.split("=", 1)[1]):
             return target
         return default
+
+    @app.post("/admin/agents/archive")
+    async def agents_archive(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf", "/admin/agents")
+        name, action = str(form.get("name") or ""), str(form.get("action") or "")
+        if not ACTOR_NAME.match(name) or action not in ("archive", "delete", "restore"):
+            return back("csrf", "/admin/agents")
+        if action == "restore":
+            await run_in_threadpool(lambda: runtime.restore_agent(name, actor=admin_actor(request)))
+            return RedirectResponse(
+                f"/admin/agents/view?{urlencode({'name': name, 'm': 'agent_restored'})}",
+                status_code=303)
+        if form.get("confirm") != "yes":
+            return back("csrf", "/admin/agents")
+        await run_in_threadpool(lambda: runtime.archive_agent(
+            name, actor=admin_actor(request), delete_rule=action == "delete"))
+        return back("agent_deleted" if action == "delete" else "agent_archived", "/admin/agents")
 
     @app.post("/admin/agents/quick")
     async def agents_quick(request: Request):

@@ -13,7 +13,7 @@ leaked — and is built so that when that happens the damage is bounded and the
 evidence survives.
 
 > **Status:** v0.3 — all 19 tools, stdio and HTTP transports, admin panel and
-> Docker deployment work end to end against Odoo 19. 516 tests, 13 of them clicking through the panel in a real browser.
+> Docker deployment work end to end against Odoo 19. 526 tests, 15 of them clicking through the panel in a real browser.
 
 ## What the operator gets
 
@@ -29,7 +29,8 @@ evidence survives.
 | **Sandbox profiles** | For test databases: model lists off and risk only observed, while the denylist, credential fields and audit stay on. Never on production. |
 | **Activity report** | A printable "what your AI did" page per client and period — counts, refusals, changes — with no record values, ready to send as a PDF. |
 | **Several clients** | Pin each agent's token to its client's Odoo profile; switching the active profile can never send it to another client's database. |
-| **Permissions per profile** | One server, several Odoo (Spain, Colombia…): each profile can have its own read / change / delete lists, or follow the default ones. Tabs per profile, chips with + and ×, and a warning when a production profile is read-only anyway. |
+| **Permissions per profile** | One server, several Odoo (Spain, Colombia…): each profile can have its own lists, or follow the default ones. Each app gets one level in one click — none, read, change, delete — with a selector per model to fine-tune, a search box, and Odoo's system models kept apart. |
+| **Archive or delete agents** | Revokes every token, blocks the agent and hides it; restore any time. The audit log keeps its history. |
 | **Clickable dashboard** | Tabs (summary, Odoo profiles, policy). Every number, bar, refusal kind and model opens the audit log filtered to exactly those events. |
 | **Agent tree** | Each agent — with a rule or only seen in the audit log — opens as a tree: profiles → what it can really read, change and delete there, model and tool limits, record scope, tokens, activity; with + to add. |
 | **Agent registry** | Every token is listed and can be revoked on its own, or all of one agent's at once — no `JWT_SECRET` rotation. A rule per agent narrows the policy: fewer models or tools, read-only, a daily call quota, one pinned profile. |
@@ -360,7 +361,7 @@ valid agents on the same IP) and the canaries found a content leak
 
 ## Tests
 
-The suite has 516 tests (`pytest tests/e2e` drives the panel in Chromium with Playwright). The ones that matter are not the
+The suite has 526 tests (`pytest tests/e2e` drives the panel in Chromium with Playwright). The ones that matter are not the
 "it records events" kind — they are the adversarial ones:
 
 ```bash

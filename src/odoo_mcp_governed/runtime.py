@@ -432,6 +432,33 @@ class Runtime:
             action.count = 1 if done else 0
         return done
 
+    def archive_agent(self, name: str, *, actor: str, delete_rule: bool = False) -> None:
+        """Retire an agent: every token revoked, the agent blocked, hidden from
+        the lists — and with ``delete_rule`` its rule removed. Its audit
+        history stays: the chain cannot lose events."""
+        if not ACTOR_NAME.match(name):
+            raise ValueError("agent names may only contain letters, digits and _ . @ -")
+        tool = "admin.agent.delete" if delete_rule else "admin.agent.archive"
+        with self.admin_action(actor, tool, detail={"agent": name}) as action:
+            self.agents.revoke_all(name)
+            if delete_rule:
+                self.agents.delete_rule(name)
+            self.agents.set_archived(name, True)
+            current = set(self.policy_store.config.blocked_actors) | {name}
+            self.policy_store.update({"blocked_actors": sorted(current)})
+            self._apply_policy()
+            action.count = 1
+
+    def restore_agent(self, name: str, *, actor: str) -> None:
+        """Bring an archived agent back. Its old tokens stay revoked: it needs
+        a new one."""
+        with self.admin_action(actor, "admin.agent.restore", detail={"agent": name}) as action:
+            self.agents.set_archived(name, False)
+            current = set(self.policy_store.config.blocked_actors) - {name}
+            self.policy_store.update({"blocked_actors": sorted(current)})
+            self._apply_policy()
+            action.count = 1
+
     def revoke_unregistered_tokens(self, name: str, *, actor: str) -> None:
         with self.admin_action(actor, "admin.agent.revoke_unregistered",
                                detail={"agent": name}) as action:

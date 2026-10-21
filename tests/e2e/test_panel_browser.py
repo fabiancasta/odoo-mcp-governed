@@ -173,22 +173,50 @@ def test_an_agent_is_managed_from_its_tree(page, server) -> None:
     assert not page.errors, page.errors
 
 
-def test_permissions_tabs_and_plus(page, server) -> None:
-    _, runtime = server
+def test_permissions_by_app(page, server) -> None:
+    base, runtime = server
+    models = [{"model": m, "name": m, "transient": False}
+              for m in ("sale.order", "sale.order.line", "res.partner", "res.users")]
+    for profile in ("default", "colombia"):
+        runtime.cache.get_or_set((profile, "permissions", "ir.model"), lambda: models)
     page.click("aside.side >> text=Permissions")
+    # Filter.
+    page.fill("#perm-filter", "sale")
+    assert page.locator("#app-sale").is_visible()
+    assert not page.locator("#app-res").is_visible()
+    page.fill("#perm-filter", "")
+    # One click: the whole app.
+    page.locator("#app-sale button[value=write]").click()
+    page.wait_for_load_state()
+    assert "sale.order.line" in runtime.engine.policy.config.writable_models
+    assert page.locator("#app-sale button.on").inner_text().strip().endswith("Change")
+    # Another profile: its own lists, the other tabs still there.
     page.locator(".tabs a", has_text="colombia").click()
     page.wait_for_load_state()
-    assert "profile=colombia" in page.url
-    assert page.locator(".tabs a").count() >= 3  # the other tabs are still there
-    card = page.locator(".card:has-text('Can read')")
-    card.locator("input[name=model][type=text]").fill("pos.order")
-    card.locator("button[value=add]").click()
+    assert page.locator(".tabs a").count() >= 3
+    page.locator("#app-sale button[value=read]").click()
     page.wait_for_load_state()
-    assert "pos.order" in runtime.engine.policy.config.profile_lists["colombia"][
+    assert "sale.order" in runtime.engine.policy.config.profile_lists["colombia"][
         "allowed_models"]
     page.click("text=Use the default again")
     page.wait_for_load_state()
     assert "colombia" not in runtime.engine.policy.config.profile_lists
+    assert not page.errors, page.errors
+
+
+def test_archive_and_restore_an_agent(page, server) -> None:
+    base, runtime = server
+    page.goto(base + "/admin/agents/view?name=wabot")
+    page.click("text=Archive or delete this agent")
+    page.check(".danger-zone input[name=confirm]")
+    page.click(".danger-zone button[value=archive]")
+    page.wait_for_load_state()
+    assert "wabot" in runtime.agents.archived()
+    assert page.locator("a.card.agent", has_text="wabot").count() == 0
+    page.click("details.archived summary")
+    page.locator("li:has-text('wabot') button[value=restore]").click()
+    page.wait_for_load_state()
+    assert "wabot" not in runtime.agents.archived()
     assert not page.errors, page.errors
 
 

@@ -142,6 +142,31 @@ def _remove(csrf: str, action: str, hidden: dict[str, str], label: str) -> str:
             'title="Remove">×</button></form></span>')
 
 
+def _danger_zone(csrf: str, name: str, archived: str | None, has_rule: bool) -> str:
+    hidden = f'{csrf_field(csrf)}<input type="hidden" name="name" value="{esc(name)}">'
+    if archived:
+        return (
+            '<details class="card-like danger-zone" open><summary><b>🗄️ Archived</b></summary>'
+            f'<form method="post" action="/admin/agents/archive">{hidden}'
+            '<button name="action" value="restore" type="submit">↺ Restore this agent</button> '
+            "<small>unblocks it; it then needs a new token.</small></form></details>"
+        )
+    return (
+        '<details class="card-like danger-zone"><summary><b>⚠️ Archive or delete this agent'
+        "</b></summary><p><small><b>Archive</b>: revokes every token, blocks the agent and "
+        "hides it from the lists; restore it any time. <b>Delete</b>: the same, and its rule "
+        "is removed. Either way the audit log keeps its history — it cannot be erased."
+        "</small></p>"
+        f'<form method="post" action="/admin/agents/archive">{hidden}'
+        '<label class="inline"><input type="checkbox" name="confirm" value="yes" required> '
+        f"confirm for {esc(name)}</label> "
+        '<button class="danger" name="action" value="archive" type="submit">🗄️ Archive</button> '
+        + ('<button class="danger" name="action" value="delete" type="submit">🗑️ Delete</button>'
+           if has_rule else "")
+        + "</form></details>"
+    )
+
+
 def describe_domain(domain: Any) -> str:
     parts = []
     for item in domain:
@@ -158,7 +183,7 @@ def tree_page(*, csrf: str, name: str, rule: AgentRule | None, policy: PolicyCon
               stats: tuple[int, int, str] | None, tools: list[str], blocked: bool,
               flash: str | None = None, flash_kind: str = "ok",
               agents_list: list[tuple[str, str]] = (), issued: dict | None = None,
-              edit_form: str = "") -> str:
+              edit_form: str = "", archived: str | None = None) -> str:
     back = f"/admin/agents/view?name={name}"
     has_rule = rule is not None
     r = rule or AgentRule(name=name)
@@ -328,7 +353,11 @@ def tree_page(*, csrf: str, name: str, rule: AgentRule | None, policy: PolicyCon
         f"{tree}</section>"
         + (f'<details class="card-like"><summary><b>✎ Advanced: edit the whole rule</b>'
            f"</summary>{edit_form}</details>" if edit_form else "")
+        + _danger_zone(csrf, name, archived, has_rule)
     )
+    if archived:
+        detail = (f'<p class="msg warn">🗄️ This agent was archived on {esc(archived[:10])}: '
+                  "its tokens are revoked and it is blocked.</p>") + detail
     body = (
         TREE_STYLE
         + '<div class="hub"><aside class="roster"><a class="new" href="/admin/agents?new=1">'

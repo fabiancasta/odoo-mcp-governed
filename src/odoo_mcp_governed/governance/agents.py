@@ -228,7 +228,8 @@ class AgentStore:
         data = read_json(self.path, default=None) or {}
         return {"agents": dict(data.get("agents") or {}), "tokens": dict(data.get("tokens") or {}),
                 "revoked_before": dict(data.get("revoked_before") or {}),
-                "unregistered_before": dict(data.get("unregistered_before") or {})}
+                "unregistered_before": dict(data.get("unregistered_before") or {}),
+                "archived": dict(data.get("archived") or {})}
 
     def _save(self) -> None:
         write_private_json(self.path, self._data)
@@ -300,6 +301,23 @@ class AgentStore:
             token["revoked_at"] = _now()
             self._save()
             return True
+
+    def archived(self) -> dict[str, str]:
+        """Archived agents and when: hidden from the panel lists, their tokens
+        revoked. The audit log keeps their history — it cannot be deleted."""
+        with self._lock:
+            self._fresh()
+            return dict(self._data.get("archived") or {})
+
+    def set_archived(self, name: str, archived: bool) -> None:
+        with self._lock:
+            self._fresh()
+            box = self._data.setdefault("archived", {})
+            if archived:
+                box[name] = _now()
+            else:
+                box.pop(name, None)
+            self._save()
 
     def revoke_unregistered(self, actor: str) -> None:
         """Refuse every token of ``actor`` that is not in the registry and was

@@ -23,7 +23,7 @@ from typing import Any
 from ..governance import AuditEvent, ChainStatus, Decision, Outcome
 from ..governance.agents import AgentRule
 from ..governance.approvals import CODE_MODELS, GRANT_MINUTES, MODULE_MODELS
-from ..governance.policy import is_system_model
+from ..governance.policy import WILDCARD, is_system_model
 
 STYLE = """
 :root{--bg:#f6f7f9;--card:#fff;--ink:#1d2330;--mute:#5d6678;--line:#dfe3ea;--acc:#2f5bd3;
@@ -62,7 +62,7 @@ h2{font-size:15px;margin:0 0 12px}h3{font-size:13px;margin:14px 0 6px;color:var(
 table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:7px 8px;
 border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--mute);font-weight:600}
 .wrap{overflow-x:auto}code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
-input[type=text],input[type=password],input[type=url],input[type=number],textarea,select{width:100%;
+input[type=text],input[type=password],input[type=url],input[type=number],input[type=search],textarea,select{width:100%;
 padding:7px 9px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink);font:inherit}
 textarea{min-height:64px;font-family:ui-monospace,monospace;font-size:12px}
 label{display:block;margin:8px 0 3px;color:var(--mute);font-size:12px}
@@ -83,6 +83,16 @@ align-items:center;gap:12px;flex-wrap:wrap}
 a.card.agent{display:block;color:var(--ink);text-decoration:none;transition:border-color .15s}
 a.card.agent:hover{border-color:var(--acc)}a.card.agent small{display:block;color:var(--mute)}
 a.card.agent .open{color:var(--acc);font-weight:600;font-size:13px}
+.apps{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}
+.app{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--bg)}
+.app h3{margin:0;color:var(--ink);font-size:14px}.app details summary{cursor:pointer;
+color:var(--acc);font-size:13px;margin-top:6px}
+.levels{display:flex;margin:8px 0 2px;border:1px solid var(--line);border-radius:8px;
+overflow:hidden}.levels button{flex:1;border:0;border-right:1px solid var(--line);border-radius:0;
+background:var(--card);color:var(--ink);padding:7px 2px;font-size:12px;white-space:nowrap}
+.levels button:last-child{border-right:0}.levels button.on{background:var(--acc);color:#fff}
+.levels button:hover{background:var(--chip)}.levels button.on:hover{background:var(--acc)}
+#perm-filter{max-width:320px}table.compact select{width:auto}
 .tabs{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}.tabs a{padding:7px 14px;border-radius:99px;
 border:1px solid var(--line);background:var(--card);color:var(--ink);text-decoration:none}
 .tabs a.on{background:var(--acc);border-color:var(--acc);color:#fff}.tabs small{opacity:.75}
@@ -156,8 +166,21 @@ PANEL_JS = """(function () {
       });
     });
   }
+  function bindFilter(root) {
+    var box = root.getElementById ? root.getElementById("perm-filter") : null;
+    if (!box) return;
+    var apply = function () {
+      var q = box.value.trim().toLowerCase();
+      root.querySelectorAll(".app[data-search]").forEach(function (card) {
+        card.hidden = q !== "" && card.getAttribute("data-search").indexOf(q) === -1;
+      });
+    };
+    box.addEventListener("input", apply);
+    apply();
+  }
   document.addEventListener("DOMContentLoaded", function () {
     bindFaders(document);
+    bindFilter(document);
     bindGroups(document);
     var live = document.getElementById("live");
     if (!live) return;
@@ -260,83 +283,160 @@ def permissions_page(
     flash: str | None, flash_kind: str = "ok", profiles: Iterable = (),
     profile: str = "", own: bool = False, read_only: bool = False,
 ) -> str:
-    gates = (("r", "allowed_models", "Read"), ("w", "writable_models", "Write"),
-             ("d", "deletable_models", "Delete"))
+    """Permissions as apps with one level each, not hundreds of checkboxes.
+
+    Every app gets a four-step control — none, read, change, delete — that
+    sets all its models at once; "fine-tune" opens one selector per model.
+    Odoo's system models sit apart, folded, reachable only one by one.
+    """
+    lists = {k: set(policy[k]) for k in ("allowed_models", "writable_models",
+                                          "deletable_models")}
     every_model = sorted({m["model"] for _, _, ms in groups for m in ms} - set(denied))
-    lists = {key: set(policy[name]) for key, name, _ in gates}
-    switches = "".join(
-        f'<label class="inline"><input type="checkbox" name="all_{key}" value="1" '
-        f'{"checked" if "*" in lists[key] else ""}> <b>{label}: allow every model</b> '
-        f'<small class="warn">(* — includes models installed later)</small></label><br>'
-        for key, _, label in gates
-    )
-    sections = []
-    new_total = 0
+    hidden = (f'{csrf_field(csrf)}<input type="hidden" name="profile" value="{esc(profile)}">')
+
+    def level(model: str) -> str:
+        return model_level(model, lists)
+
+    def selector(model: str, current: str, locked: bool = False) -> str:
+        if locked:
+            return '<span class="chip bad">🔒 always blocked</span>'
+        return (f'<select name="lvl:{esc(model)}" aria-label="Access to {esc(model)}">'
+                + "".join(f'<option value="{key}"{" selected" if key == current else ""}>'
+                          f"{icon} {label}</option>" for key, icon, label in LEVELS)
+                + "</select>")
+
+    def fine_tune(app: str, models: list[dict], warn: str = "") -> str:
+        rows = "".join(
+            f'<tr><td><code>{esc(m["model"])}</code><br><small>{esc(m["name"])}</small></td>'
+            f'<td>{selector(m["model"], level(m["model"]), m["model"] in denied)}</td>'
+            f'<td>{new_chip(m["model"])}</td></tr>'
+            for m in models
+        )
+        return (
+            f'<form method="post" action="/admin/permissions/models">{hidden}'
+            f'<input type="hidden" name="app" value="{esc(app)}">{warn}'
+            f'<div class="wrap"><table class="compact">{rows}</table></div>'
+            '<p><button type="submit">Save these models</button></p></form>'
+        )
+
+    def new_chip(model: str) -> str:
+        if model in denied or model in seen or level(model) != "none":
+            return ""
+        return '<span class="chip warn">new — not reviewed</span>'
+
+    cards, system_models, new_total = [], [], 0
     for app, title, models in groups:
-        rows = []
-        for m in models:
-            name = m["model"]
-            if name in denied:
-                rows.append(
-                    f'<tr class="deny"><td><code>{esc(name)}</code></td><td>{esc(m["name"])}</td>'
-                    '<td colspan=3><span class="chip bad">🔒 always blocked</span> <small>denylist: '
-                    "runs code, holds credentials or controls access</small></td><td></td></tr>"
-                )
-                continue
-            listed = any(name in lists[k] for k in lists)
-            is_new = name not in seen and not listed
-            new_total += is_new
-            cells = "".join(
-                f'<td><input type="checkbox" name="{key}" value="{esc(name)}" data-app="{esc(app)}" '
-                f'data-gate="{key}" aria-label="{label} {esc(name)}" '
-                f'{"checked" if name in lists[key] or "*" in lists[key] else ""}></td>'
-                for key, _, label in gates
-            )
-            flag = '<span class="chip warn">new — not reviewed</span>' if is_new else ""
-            if is_system_model(name):
-                flag += (' <span class="chip">system — only by exact name or on a configurator '
-                         "profile</span>")
-            rows.append(
-                f'<tr><td><input type="hidden" name="shown" value="{esc(name)}">'
-                f'<code>{esc(name)}</code></td><td>{esc(m["name"])}</td>{cells}<td>{flag}</td></tr>'
-            )
-        toggles = "".join(
-            f'<label class="inline"><input type="checkbox" name="app_{key}" value="{esc(app)}" '
-            f'data-app-toggle="{esc(app)}" data-gate="{key}"> {label}</label>'
-            for key, _, label in gates
+        business = [m for m in models if not is_system_model(m["model"])]
+        system_models += [m for m in models if is_system_model(m["model"])]
+        if not business:
+            continue
+        open_models = [m for m in business if m["model"] not in denied]
+        levels = [level(m["model"]) for m in open_models]
+        news = sum(bool(new_chip(m["model"])) for m in business)
+        new_total += news
+        uniform = levels[0] if levels and len(set(levels)) == 1 else ("custom" if levels else "")
+        counts = " ".join(f'<span title="{label}">{icon} {levels.count(key)}</span>'
+                          for key, icon, label in LEVELS[1:] if levels.count(key))
+        buttons = "".join(
+            f'<button type="submit" name="level" value="{key}" title="{label} — every model '
+            f'of this app"{" class=on" if key == uniform else ""}>{icon} {label}</button>'
+            for key, icon, label in LEVELS
         )
-        sections.append(
-            f'<details open><summary><b>{esc(title)}</b> <small>({len(models)} models)</small>'
-            f'</summary><p class="apptoggles"><small>Whole app:</small> {toggles}</p>'
-            '<div class="wrap"><table><tr><th>Model</th><th>Name</th><th>Read</th><th>Write</th>'
-            "<th>Delete</th><th></th></tr>" + "".join(rows) + "</table></div></details>"
+        search = " ".join([app, title] + [m["model"] + " " + m["name"] for m in business])
+        cards.append(
+            f'<div class="app" id="app-{esc(app)}" data-search="{esc(search.lower())}">'
+            f'<div class="spread"><h3>{esc(title)}</h3><small>{len(business)} models'
+            + (" · custom" if uniform == "custom" else "") + "</small></div>"
+            f'<form method="post" action="/admin/permissions/app" class="levels">{hidden}'
+            f'<input type="hidden" name="app" value="{esc(app)}">{buttons}</form>'
+            f'<div class="sum">{counts}'
+            + (f'<span class="warn">🆕 {news} new — not reviewed</span>' if news else "")
+            + "</div>"
+            f"<details><summary>Fine-tune each model</summary>{fine_tune(app, business)}"
+            "</details></div>"
         )
+
+    star = [label for key, label in (("allowed_models", "read"), ("writable_models", "change"),
+                                     ("deletable_models", "delete")) if WILDCARD in lists[key]]
+    star_note = (
+        f'<p class="msg warn">✱ Every business model can be {esc(" / ".join(star))} '
+        "(“allow every model” is on under Advanced): the levels below cannot take models "
+        "away from that until you turn it off.</p>" if star else "")
     banner = (
         f'<p class="msg bad">{esc(new_total)} model(s) are new and not reviewed: they stay '
-        "blocked until you tick them and save.</p>" if new_total else ""
-    )
+        "blocked until you give their app or them a level.</p>" if new_total else "")
     odoo_note = f'<p class="msg bad">{esc(error)}</p>' if error else ""
-    head = _profile_tabs(list(profiles), profile, own, csrf, read_only) + _quick_permissions(
-        csrf, policy, profile, every_model)
-    body = (
-        "<section><h2>Permissions by app</h2><p><small>From this profile's Odoo model list. "
-        "Wizards are not shown. Write and delete imply read. The denylist always wins. Saving "
-        "applies to the next call and is sealed into the audit log.</small></p>"
-        f'<form method="get" action="/admin/permissions" class="inline"><input type="text" '
-        f'name="q" value="{esc(query)}" placeholder="res.partner, Contact, pos…">'
-        '<button class="ghost" type="submit">Filter</button></form>'
-        f"{odoo_note}{banner}"
-        f'<form method="post" action="/admin/permissions">{csrf_field(csrf)}'
-        f'<input type="hidden" name="profile" value="{esc(profile)}">'
-        f'<div class="msg">{switches}</div>' + "".join(sections)
-        + '<p><button type="submit">Save permissions</button></p></form></section>'
+    system = ""
+    if system_models:
+        system = (
+            '<details class="card-like"><summary><b>🔧 Odoo system models</b> '
+            f"<small>({len(system_models)}) — users, settings, technical records. Only "
+            "reachable one by one, never through an app or “*”.</small></summary>"
+            + fine_tune("_system", sorted(system_models, key=lambda m: m["model"]),
+                        '<p class="msg warn">Giving an agent a system model lets it see or '
+                        "change how Odoo itself works. Only for a configurator agent on a test "
+                        "database.</p>")
+            + "</details>"
+        )
+    switches = "".join(
+        f'<label class="inline"><input type="checkbox" name="all_{key}" value="1" '
+        f'{"checked" if WILDCARD in lists[name] else ""}> <b>{label}: allow every business '
+        "model</b> <small class=\"warn\">(* — includes models installed later)</small></label><br>"
+        for key, name, label in (("r", "allowed_models", "Read"), ("w", "writable_models",
+                                                                   "Change"),
+                                 ("d", "deletable_models", "Delete"))
     )
-    body = body.replace(
-        '<form method="get" action="/admin/permissions" class="inline">',
-        '<form method="get" action="/admin/permissions" class="inline">'
-        f'<input type="hidden" name="profile" value="{esc(profile)}">', 1)
-    return page("Permissions", message(flash, flash_kind) + head + body)
+    locked = "".join(f"<code>{esc(m)}</code> " for m in sorted(denied))
+    advanced = (
+        '<details class="card-like"><summary><b>⚙️ Advanced</b> <small>exact lists, '
+        "“allow every model”, the denylist</small></summary>"
+        + _quick_permissions(csrf, policy, profile, every_model)
+        + f'<form method="post" action="/admin/permissions">{hidden}<div class="msg">{switches}'
+        '</div><p><button type="submit">Apply</button></p></form>'
+        f'<h3>🔒 Always blocked (denylist)</h3><p>{locked}</p>'
+        "<p><small>These run code, hold credentials or control access: always blocked, "
+        "whatever the levels say.</small></p></details>"
+    )
+    legend = " ".join(f"<span>{icon} {label}</span>" for _, icon, label in LEVELS)
+    body = (
+        _profile_tabs(list(profiles), profile, own, csrf, read_only)
+        + odoo_note + banner + star_note
+        + '<section><div class="spread"><h2>Apps</h2><input type="search" id="perm-filter" '
+        f'placeholder="Find an app or model…" value="{esc(query)}" aria-label="Filter apps">'
+        f'</div><p class="sum">{legend} <small>— each level includes the ones before it. One '
+        "click sets every model of the app.</small></p>"
+        f'<div class="apps">{"".join(cards) or "<p>No models to show.</p>"}</div></section>'
+        + system + advanced
+    )
+    return page("Permissions", message(flash, flash_kind) + body)
 
+
+LEVELS = (("none", "⛔", "None"), ("read", "👁️", "Read"), ("write", "✏️", "Change"),
+          ("delete", "🗑️", "Delete"))
+
+
+def model_level(model: str, lists: dict[str, set[str]]) -> str:
+    """The highest gate a model is in; ``*`` covers business models only."""
+    def has(key: str) -> bool:
+        return model in lists[key] or (WILDCARD in lists[key] and not is_system_model(model))
+    if has("deletable_models"):
+        return "delete"
+    if has("writable_models"):
+        return "write"
+    if has("allowed_models"):
+        return "read"
+    return "none"
+
+
+def set_level(lists: dict[str, set[str]], model: str, level: str) -> None:
+    """Put ``model`` at ``level``: each level includes the ones before it."""
+    gates = {"none": (), "read": ("allowed_models",),
+             "write": ("allowed_models", "writable_models"),
+             "delete": ("allowed_models", "writable_models", "deletable_models")}[level]
+    for key in ("allowed_models", "writable_models", "deletable_models"):
+        lists[key].discard(model)
+        if key in gates:
+            lists[key].add(model)
 
 ENV_ICON = {"production": "🏭", "staging": "🧪", "development": "🛠️"}
 GATE_ICON = {"r": ("👁️", "Can read"), "w": ("✏️", "Can change"), "d": ("🗑️", "Can delete")}
@@ -1221,7 +1321,7 @@ def agents_page(*, csrf: str, rules: dict, tokens: list[dict], profiles: list[st
                 read_only_profiles: frozenset[str] = frozenset(),
                 seen: dict[str, tuple[int, int, str]] | None = None,
                 summaries: dict[str, str] | None = None, new_name: str = "",
-                open_form: bool = False) -> str:
+                open_form: bool = False, archived: dict[str, str] | None = None) -> str:
     """The agent registry: one rule per agent, every token it holds."""
     shown = ""
     if issued:
@@ -1275,6 +1375,9 @@ def agents_page(*, csrf: str, rules: dict, tokens: list[dict], profiles: list[st
     everyone = dict(rules)
     for name in sorted(set(seen or {}) | {t["actor"] for t in tokens}):
         everyone.setdefault(name, AgentRule(name=name))
+    retired = archived or {}
+    for name in retired:
+        everyone.pop(name, None)
     shown_rules = {n: r for n, r in everyone.items()
                    if not tab or (tab == "-" and not r.profile) or r.profile == tab}
     rows = tabs + (
@@ -1282,6 +1385,19 @@ def agents_page(*, csrf: str, rules: dict, tokens: list[dict], profiles: list[st
         + "</div>" if shown_rules
         else "<p>No agent rules here yet: these agents follow the server policy.</p>"
     )
+    if retired:
+        rows += (
+            f'<details class="archived"><summary>🗄️ Archived agents ({len(retired)})</summary>'
+            '<p><small>Tokens revoked and agent blocked; the audit log keeps their history. '
+            "Restoring unblocks it — it then needs a new token.</small></p><ul>"
+            + "".join(
+                f'<li><code>{esc(n)}</code> <small>archived {esc(ts[:10])}</small> '
+                f'<form method="post" action="/admin/agents/archive" class="inline">'
+                f'{csrf_field(csrf)}<input type="hidden" name="name" value="{esc(n)}">'
+                '<button class="ghost" name="action" value="restore" type="submit">↺ Restore'
+                "</button></form></li>" for n, ts in sorted(retired.items()))
+            + "</ul></details>"
+        )
 
     def token_row(t: dict) -> str:
         state = (f'<span class="chip bad">revoked {esc(t["revoked_at"][:10])}</span>'

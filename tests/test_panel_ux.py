@@ -235,3 +235,105 @@ class TestHub:
         _, client, _ = app(tmp_path)
         page = client.get("/admin/agents").text
         assert '<select name="name" required><option value="claude">' in page
+
+
+class FakeModels:
+    MODELS = [{"model": m, "name": m, "transient": False} for m in (
+        "sale.order", "sale.order.line", "res.partner", "res.users", "ir.cron")]
+
+
+def perm_app(tmp_path):
+    runtime, client, csrf = app(tmp_path)
+    runtime.cache.get_or_set(("default", "permissions", "ir.model"), lambda: FakeModels.MODELS)
+    return runtime, client, csrf
+
+
+class TestPermissionsByApp:
+    def test_apps_with_one_level_each(self, tmp_path) -> None:
+        _, client, _ = perm_app(tmp_path)
+        page = client.get("/admin/permissions").text
+        assert 'id="app-sale"' in page and 'name="level" value="write"' in page
+        assert "Odoo system models" in page  # res.users and ir.cron, folded apart
+        assert 'id="perm-filter"' in page
+
+    def test_one_click_sets_every_model_of_the_app(self, tmp_path) -> None:
+        runtime, client, csrf = perm_app(tmp_path)
+        response = client.post("/admin/permissions/app", data={
+            "csrf": csrf, "app": "sale", "level": "write"}, follow_redirects=False)
+        assert response.headers["location"].endswith("#app-sale")
+        cfg = runtime.engine.policy.config
+        assert {"sale.order", "sale.order.line"} <= cfg.writable_models
+        assert {"sale.order", "sale.order.line"} <= cfg.allowed_models
+        client.post("/admin/permissions/app", data={"csrf": csrf, "app": "sale",
+                                                    "level": "none"})
+        cfg = runtime.engine.policy.config
+        assert not {"sale.order", "sale.order.line"} & (cfg.allowed_models | cfg.writable_models)
+
+    def test_an_app_level_never_reaches_system_models(self, tmp_path) -> None:
+        runtime, client, csrf = perm_app(tmp_path)
+        client.post("/admin/permissions/app", data={"csrf": csrf, "app": "res",
+                                                    "level": "delete"})
+        cfg = runtime.engine.policy.config
+        assert "res.partner" in cfg.deletable_models and "res.users" not in cfg.allowed_models
+
+    def test_fine_tune_one_selector_per_model(self, tmp_path) -> None:
+        runtime, client, csrf = perm_app(tmp_path)
+        client.post("/admin/permissions/models", data={
+            "csrf": csrf, "app": "sale", "lvl:sale.order": "delete",
+            "lvl:sale.order.line": "read", "lvl:ir.cron": "write"})
+        cfg = runtime.engine.policy.config
+        assert "sale.order" in cfg.deletable_models
+        assert "sale.order.line" in cfg.allowed_models
+        assert "sale.order.line" not in cfg.writable_models
+        assert "ir.cron" not in cfg.allowed_models  # on the denylist: ignored
+
+    def test_on_a_profile_it_gives_the_profile_its_own_lists(self, tmp_path) -> None:
+        runtime, client, csrf = perm_app(tmp_path)
+        runtime.save_profile(Profile(name="co", url="http://co.invalid", database="co",
+                                     username="u", api_key="k", environment="development"),
+                             actor="a")
+        runtime.cache.get_or_set(("co", "permissions", "ir.model"), lambda: FakeModels.MODELS)
+        client.post("/admin/permissions/app", data={"csrf": csrf, "profile": "co",
+                                                    "app": "sale", "level": "read"})
+        cfg = runtime.engine.policy.config
+        assert "sale.order" in cfg.profile_lists["co"]["allowed_models"]
+        assert "sale.order" not in cfg.allowed_models
+
+
+class TestArchive:
+    def test_archive_hides_revokes_and_blocks(self, tmp_path) -> None:
+        runtime, client, csrf = app(tmp_path)
+        token = runtime.issue_agent_token("claude", actor="a")["token"]
+        client.post("/admin/agents/archive", data={"csrf": csrf, "name": "claude",
+                                                   "action": "archive", "confirm": "yes"})
+        assert "claude" in runtime.engine.policy.config.blocked_actors
+        assert client.post("/mcp", headers={"Authorization": f"Bearer {token}"},
+                           json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+                           ).status_code == 401
+        page = client.get("/admin/agents").text
+        assert "Archived agents (1)" in page
+        assert 'href="/admin/agents/view?name=claude"' not in page.split("Archived agents")[0]
+
+    def test_restore_unblocks(self, tmp_path) -> None:
+        runtime, client, csrf = app(tmp_path)
+        runtime.archive_agent("claude", actor="a")
+        client.post("/admin/agents/archive", data={"csrf": csrf, "name": "claude",
+                                                   "action": "restore"})
+        assert "claude" not in runtime.engine.policy.config.blocked_actors
+        assert "claude" not in runtime.agents.archived()
+
+    def test_delete_removes_the_rule_but_not_the_history(self, tmp_path) -> None:
+        runtime, client, csrf = app(tmp_path)
+        runtime.save_agent(AgentRule(name="claude", read_only=True), actor="a")
+        before = runtime.audit.store.count_for_actor("claude")
+        client.post("/admin/agents/archive", data={"csrf": csrf, "name": "claude",
+                                                   "action": "delete", "confirm": "yes"})
+        assert runtime.agents.rule("claude") is None
+        assert runtime.audit.store.count_for_actor("claude") == before
+        assert runtime.audit.verify().intact
+
+    def test_archive_needs_confirmation(self, tmp_path) -> None:
+        runtime, client, csrf = app(tmp_path)
+        client.post("/admin/agents/archive", data={"csrf": csrf, "name": "claude",
+                                                   "action": "archive"})
+        assert "claude" not in runtime.agents.archived()
