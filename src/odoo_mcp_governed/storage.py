@@ -42,6 +42,24 @@ def write_private_json(path: str | Path, data: Any) -> None:
         raise
 
 
+def write_private_text(path: str | Path, text: str) -> None:
+    """Like :func:`write_private_json`, for a plain text file."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=str(target.parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, target)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp_name)
+        raise
+
+
 def read_json(path: str | Path, default: Any = None) -> Any:
     target = Path(path)
     if not target.exists():

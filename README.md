@@ -13,7 +13,7 @@ leaked — and is built so that when that happens the damage is bounded and the
 evidence survives.
 
 > **Status:** v0.3 — all 19 tools, stdio and HTTP transports, admin panel and
-> Docker deployment work end to end against Odoo 19. 478 tests.
+> Docker deployment work end to end against Odoo 19. 495 tests.
 
 ## What the operator gets
 
@@ -30,6 +30,8 @@ evidence survives.
 | **Activity report** | A printable "what your AI did" page per client and period — counts, refusals, changes — with no record values, ready to send as a PDF. |
 | **Several clients** | Pin each agent's token to its client's Odoo profile; switching the active profile can never send it to another client's database. |
 | **Permissions per profile** | One server, several Odoo (Spain, Colombia…): each profile can have its own read / change / delete lists, or follow the default ones. Tabs per profile, chips with + and ×, and a warning when a production profile is read-only anyway. |
+| **Clickable dashboard** | Tabs (summary, Odoo profiles, policy). Every number, bar, refusal kind and model opens the audit log filtered to exactly those events. |
+| **Agent tree** | Each agent — with a rule or only seen in the audit log — opens as a tree: profiles → what it can really read, change and delete there, model and tool limits, record scope, tokens, activity; with + to add. |
 | **Agent registry** | Every token is listed and can be revoked on its own, or all of one agent's at once — no `JWT_SECRET` rotation. A rule per agent narrows the policy: fewer models or tools, read-only, a daily call quota, one pinned profile. |
 | **Record scope** | A domain per model, e.g. a WhatsApp bot sees only `res.partner` `id = {partner}` and that customer's `sale.order`. `{partner}` comes from the token's signed variables, so one rule serves one token per customer. Searches are ANDed with the scope, ids outside it are refused, new records get the scope's values. |
 | **Injection warning** | Record content is data. Text in it that addresses an AI ("ignore previous instructions…") still comes back, plus a separate warning to the agent and an audit entry. |
@@ -253,7 +255,7 @@ odoo-mcp-governed audit verify   # exit 1 if the chain is broken — cron it
 odoo-mcp-governed audit anchor   # append the head hash to data/anchors.log
 odoo-mcp-governed token --actor wabot --var partner=42 --hours 2   # registered, scoped
 odoo-mcp-governed revoke --actor wabot   # refuse every token of one agent, no restart
-odoo-mcp-governed totp-setup     # ADMIN_TOTP_SECRET plus an otpauth:// URI to scan
+odoo-mcp-governed totp-setup     # writes data/totp-setup.txt (0600): secret + otpauth:// URI
 ```
 
 ## Production safeguards
@@ -357,7 +359,7 @@ valid agents on the same IP) and the canaries found a content leak
 
 ## Tests
 
-The suite has 478 tests. The ones that matter are not the
+The suite has 495 tests. The ones that matter are not the
 "it records events" kind — they are the adversarial ones:
 
 ```bash

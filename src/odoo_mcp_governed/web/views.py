@@ -20,6 +20,7 @@ from html import escape
 from typing import Any
 
 from ..governance import AuditEvent, ChainStatus, Decision, Outcome
+from ..governance.agents import AgentRule
 from ..governance.approvals import CODE_MODELS, GRANT_MINUTES, MODULE_MODELS
 from ..governance.policy import is_system_model
 
@@ -51,6 +52,10 @@ font:inherit;cursor:pointer}button.ghost{background:transparent;color:var(--acc)
 button.danger{border-color:var(--bad);background:transparent;color:var(--bad)}
 .inline{display:inline-flex;gap:6px;align-items:center;margin:0}
 .chip{display:inline-block;padding:1px 8px;border-radius:99px;background:var(--chip);font-size:12px}
+a.stat.link{display:block;color:inherit;text-decoration:none}a.stat.link:hover,
+a.hbar:hover{border-color:var(--acc);background:color-mix(in srgb,var(--acc) 7%,transparent)}
+a.hbar{color:inherit;text-decoration:none;border:1px solid transparent;border-radius:6px}
+svg.chart a rect:hover{opacity:.75;cursor:pointer}
 .tabs{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}.tabs a{padding:7px 14px;border-radius:99px;
 border:1px solid var(--line);background:var(--card);color:var(--ink);text-decoration:none}
 .tabs a.on{background:var(--acc);border-color:var(--acc);color:#fff}.tabs small{opacity:.75}
@@ -164,10 +169,13 @@ def _hourly_chart(hours: list[dict[str, Any]]) -> str:
             if size <= 0:
                 continue
             y -= size
+            show = {"allowed": "allow", "flagged": "flagged", "denied": "deny"}[key]
             bars.append(
+                f'<a href="/admin/logs?agents=1&amp;decision={show}&amp;hour='
+                f'{esc(h["start"].strftime("%Y-%m-%dT%H"))}">'
                 f'<rect class="{cls}" x="{x + 1:.1f}" y="{y:.1f}" width="{slot - 2:.1f}" '
                 f'height="{size:.1f}" rx="2"><title>{esc(h["start"].strftime("%H:00"))} · '
-                f'{esc(key)} {h[key]}</title></rect>'
+                f'{esc(key)} {h[key]} — click to see them</title></rect></a>'
             )
         if i % 3 == 0:
             labels.append(
@@ -186,23 +194,30 @@ def charts_fragment(summary: dict[str, Any], *, max_risk: int) -> str:
     categories = summary["by_category"]
     top = max(categories.values(), default=0) or 1
     category_rows = "".join(
-        f'<div class="hbar"><span class="lbl">{esc(name)}</span><span class="track">'
+        f'<a class="hbar" href="/admin/logs?agents=1&amp;hours=24&amp;decision=deny&amp;'
+        f'kind={esc(name)}" title="See these refusals"><span class="lbl">{esc(name)}</span>'
+        '<span class="track">'
         f'<span style="width:{count / top * 100:.0f}%;background:{CATEGORY_COLORS.get(name, "#94a3b8")}">'
-        f'</span></span><b>{count}</b></div>'
+        f'</span></span><b>{count}</b></a>'
         for name, count in categories.items()
     ) or '<p><small class="ok">No blocked attempts in the last 24 hours.</small></p>'
     models = "".join(
-        f"<tr><td><code>{esc(m)}</code></td><td>{n}</td></tr>" for m, n in summary["top_models"]
+        f'<tr><td><a href="/admin/logs?agents=1&amp;hours=24&amp;model={esc(m)}">'
+        f"<code>{esc(m)}</code></a></td><td>{n}</td></tr>" for m, n in summary["top_models"]
     ) or "<tr><td colspan=2><small>No activity.</small></td></tr>"
     risk_cls = "bad" if max_risk >= 70 else "warn" if max_risk >= 40 else "ok"
     return (
         '<div class="grid">'
-        f'<div class="stat"><small>Agent calls (24h)</small><strong>{summary["total"]}</strong></div>'
-        f'<div class="stat"><small>Blocked (24h)</small><strong class="{"bad" if summary["denied"] else "ok"}">'
-        f'{summary["denied"]}</strong></div>'
-        f'<div class="stat"><small>Flagged or throttled</small><strong class="{"warn" if summary["flagged"] else "ok"}">'
-        f'{summary["flagged"]}</strong></div>'
-        f'<div class="stat"><small>Highest agent risk now</small><strong class="{risk_cls}">{max_risk}</strong></div>'
+        '<a class="stat link" href="/admin/logs?agents=1&amp;hours=24">'
+        f'<small>Agent calls (24h) ›</small><strong>{summary["total"]}</strong></a>'
+        '<a class="stat link" href="/admin/logs?agents=1&amp;hours=24&amp;decision=deny">'
+        f'<small>Blocked (24h) ›</small><strong class="{"bad" if summary["denied"] else "ok"}">'
+        f'{summary["denied"]}</strong></a>'
+        '<a class="stat link" href="/admin/logs?agents=1&amp;hours=24&amp;decision=flagged">'
+        f'<small>Flagged or throttled ›</small><strong class="{"warn" if summary["flagged"] else "ok"}">'
+        f'{summary["flagged"]}</strong></a>'
+        '<a class="stat link" href="/admin/logs">'
+        f'<small>Highest agent risk now ›</small><strong class="{risk_cls}">{max_risk}</strong></a>'
         "</div>"
         '<div class="charts"><div><h3>Calls per hour — <span class="ok">allowed</span> · '
         '<span class="warn">flagged</span> · <span class="bad">blocked</span></h3>'
@@ -662,6 +677,8 @@ def dashboard(
     max_risk: int = 0,
     tuning: dict[str, int] | None = None,
     tuning_source: str = ".env",
+    tab: str = "summary",
+    profile_cards: str = "",
 ) -> str:
     odoo_badge = (
         '<strong class="ok">reachable</strong>' if odoo_ok
@@ -714,7 +731,9 @@ def dashboard(
         state = '<span class="chip bad">blocked</span>' if is_blocked else (
             '<span class="chip ok">active</span>')
         agent_rows.append(
-            f"<tr><td><code>{esc(actor)}</code></td><td>{state}</td>"
+            f'<tr><td><a href="/admin/agents/view?name={esc(actor)}">🤖 <code>{esc(actor)}</code>'
+            f'</a> <small><a href="/admin/logs?actor={esc(actor)}">log</a></small></td>'
+            f"<td>{state}</td>"
             f'<td><span class="meter"><span class="{level}" style="width:{min(score, 100)}%">'
             f"</span></span> {esc(score)}</td><td>{esc(count)}</td>"
             f'<td><form method="post" action="/admin/actor/{action}" class="inline">'
@@ -877,11 +896,48 @@ def dashboard(
         + area("sensitive_fields", "Extra patterns", "SENSITIVE_FIELDS")
         + '</div><p><button type="submit">Apply policy</button></p></form></section>'
     )
-    return page(
-        "Dashboard",
-        message(flash, flash_kind) + emergency + status + live_section + agents_section
-        + console + profiles_section + policy_section,
-    )
+    panes = {
+        "summary": ("📊 Summary", status + live_section + agents_section),
+        "profiles": ("🗄️ Odoo profiles", profile_cards + profiles_section),
+        "policy": ("🛡️ Policy and thresholds", policy_section + console),
+    }
+    tab = tab if tab in panes else "summary"
+    bar = '<div class="tabs">' + "".join(
+        f'<a href="/admin?tab={key}"{" class=on" if key == tab else ""}>{label}</a>'
+        for key, (label, _) in panes.items()
+    ) + '<a href="/admin/agents">🤖 Agents ›</a><a href="/admin/permissions">🔑 Permissions ›</a></div>'
+    # Every pane is in the page; only the chosen one is shown.
+    body = "".join(f'<div id="pane-{key}"{"" if key == tab else " hidden"}>{html}</div>'
+                   for key, (_, html) in panes.items())
+    return page("Dashboard", message(flash, flash_kind) + emergency + bar + body)
+
+
+def profile_cards(profiles: list[dict[str, Any]], *, summaries: dict[str, str],
+                  own: set[str], agents_by_profile: dict[str, list[str]]) -> str:
+    """One card per Odoo: environment, permissions, and who is pinned to it."""
+    cards = []
+    for p in profiles:
+        name = p["name"]
+        env = p.get("environment", "")
+        level = ("🧪 sandbox" if p.get("sandbox") else "🧰 configurator" if p.get("configurator")
+                 else "")
+        writes = ("✏️ writes on" if env != "production" or p.get("allow_writes")
+                  else "👁️ read-only")
+        pinned = agents_by_profile.get(name, [])
+        cards.append(
+            f'<div class="card"><h3>{ENV_ICON.get(env, "🗄️")} {esc(name)}'
+            + (' <span class="chip ok">★ active</span>' if p.get("active") else "") + "</h3>"
+            f'<small>{esc(env)} · {esc(p.get("url", ""))}</small>'
+            f'<p><span class="chip">{writes}</span> '
+            + (f'<span class="chip">{level}</span> ' if level else "")
+            + f'<span class="chip">{"🔑 own permissions" if name in own else "🌐 default permissions"}'
+            f'</span></p><div class="sum">{summaries.get(name, "")}</div>'
+            + (f'<p><small>📌 {esc(", ".join(pinned))}</small></p>' if pinned else "")
+            + f'<p><a href="/admin/permissions?profile={esc(name)}">🔑 permissions</a> · '
+            f'<a href="/admin?tab=profiles&amp;edit={esc(name)}">✎ edit</a></p></div>'
+        )
+    return ('<section><h2>Your Odoo instances</h2><div class="cards">' + "".join(cards)
+            + "</div></section>") if cards else ""
 
 
 def token_page(*, csrf: str, token: dict[str, Any] | None, mcp_url: str,
@@ -1033,7 +1089,7 @@ def audit_page(
     )
     options = "".join(
         f'<option value="{esc(v)}" {"selected" if f.get("decision") == v else ""}>{esc(v or "any")}</option>'
-        for v in ("", "allow", "allow_flagged", "throttle", "deny")
+        for v in ("", "allow", "allow_flagged", "throttle", "flagged", "deny")
     )
     risk_rows = "".join(
         f'<tr><td>{esc(a)}</td><td class="{"bad" if r >= 70 else "warn" if r >= 40 else "ok"}">'
@@ -1055,13 +1111,26 @@ def audit_page(
         f'{risk_rows or "<tr><td colspan=4>No activity in the last hour.</td></tr>"}'
         "</table></div></section>"
     )
+    labels = {"agents": "agent calls only", "hours": "last {} h", "hour": "hour {}",
+              "kind": "refusal kind: {}", "model": "model: {}"}
+    active = [(k, v) for k, v in f.items() if k in labels and v]
+    filtered = "" if not active else (
+        '<p class="msg">Showing '
+        + " · ".join(f"<b>{esc(labels[k].format(v))}</b>" for k, v in active)
+        + (f' · <b>decision: {esc(f["decision"])}</b>' if f.get("decision") else "")
+        + f' — {len(events)} event(s). <a href="/admin/logs">clear filters</a></p>'
+    )
     form = (
-        f'<section><h2>Audit log</h2><p>{shortcuts}</p>'
+        f'<section><h2>Audit log</h2><p>{shortcuts}</p>{filtered}'
         '<form method="get" action="/admin/logs"><div class="row">'
         f'<div><label>Actor</label><input type="text" name="actor" value="{esc(f.get("actor"))}"></div>'
         f'<div><label>Tool (prefix)</label><input type="text" name="tool" value="{esc(f.get("tool"))}"></div>'
         f'<div><label>Decision</label><select name="decision">{options}</select></div>'
         f'<div><label>Text</label><input type="text" name="q" value="{esc(f.get("q"))}"></div>'
+        f'<div><label>Model</label><input type="text" name="model" value="{esc(f.get("model"))}">'
+        "</div>"
+        + "".join(f'<input type="hidden" name="{k}" value="{esc(f.get(k))}">'
+                  for k in ("agents", "hours", "hour", "kind") if f.get(k)) +
         f'<div><label>Rows</label><input type="number" name="limit" min="1" max="2000" '
         f'value="{esc(f.get("limit") or 200)}"></div>'
         '</div><p><button type="submit">Filter</button></p></form>'
@@ -1071,14 +1140,17 @@ def audit_page(
         + ("".join(_event_row(e) for e in events) or "<tr><td colspan=12>No events.</td></tr>")
         + "</table></div></section>"
     )
-    return page("Audit log", message(flash) + header + form)
+    # Arriving from a dashboard number, the events come first.
+    return page("Audit log", message(flash) + (form + header if active else header + form))
 
 
 def agents_page(*, csrf: str, rules: dict, tokens: list[dict], profiles: list[str],
                 tools: list[str], issued: dict | None = None, edit: Any = None,
                 flash: str | None = None, flash_kind: str = "ok",
                 require_registered: bool = False, selected: str = "",
-                read_only_profiles: frozenset[str] = frozenset()) -> str:
+                read_only_profiles: frozenset[str] = frozenset(),
+                seen: dict[str, tuple[int, int, str]] | None = None,
+                summaries: dict[str, str] | None = None, new_name: str = "") -> str:
     """The agent registry: one rule per agent, every token it holds."""
     shown = ""
     if issued:
@@ -1108,6 +1180,20 @@ def agents_page(*, csrf: str, rules: dict, tokens: list[dict], profiles: list[st
         )
 
     def card(name: str, r) -> str:
+        has_rule = name in rules
+        stat = (seen or {}).get(name)
+        activity = (f"<small>{stat[0]} calls in 24 h · last "
+                    f"{esc(stat[2][:16].replace('T', ' '))}</small>" if stat else
+                    "<small>no calls yet</small>")
+        if not has_rule:
+            return (
+                f'<div class="card"><div class="who">{avatar(name)}<div><b>{esc(name)}</b><br>'
+                f'{activity}</div></div><p><span class="chip">🌐 follows the server policy</span>'
+                "</p>"
+                f'<div class="sum">{(summaries or {}).get(name, "")}</div>'
+                f'<p><a href="/admin/agents/view?name={esc(name)}">🌳 open its tree</a> · '
+                f'<a href="/admin/agents?edit={esc(name)}">＋ create rule</a></p></div>'
+            )
         badges = " ".join(b for b in (
             '<span class="chip warn">👁️ read-only</span>' if r.read_only else
             '<span class="chip warn">🏭 read-only (production)</span>'
@@ -1118,7 +1204,9 @@ def agents_page(*, csrf: str, rules: dict, tokens: list[dict], profiles: list[st
         ) if b)
         return (
             f'<div class="card"><div class="who">{avatar(name)}<div><b>{esc(name)}</b><br>'
-            f'<small>{esc(r.note)}</small></div></div><p>{badges}</p>'
+            f'<small>{esc(r.note)}</small><br>{activity}</div></div><p>{badges}</p>'
+            f'<div class="sum">{(summaries or {}).get(name, "")}</div>'
+            f'<p><a href="/admin/agents/view?name={esc(name)}">🌳 open its tree</a></p>'
             f'<h3>🧩 Models</h3>{model_pills(r)}'
             f'<h3>🛠️ Tools</h3>{chips(r.tools, "<small>all</small>")}'
             + (f'<h3>🔐 Scope</h3>{chips(r.scope, "")}' if r.scope else "")
@@ -1135,7 +1223,10 @@ def agents_page(*, csrf: str, rules: dict, tokens: list[dict], profiles: list[st
         + f'<a href="/admin/agents?tab=-"{" class=on" if tab == "-" else ""}>🌐 not pinned</a>'
         "</div>"
     )
-    shown_rules = {n: r for n, r in rules.items()
+    everyone = dict(rules)
+    for name in sorted(set(seen or {}) | {t["actor"] for t in tokens}):
+        everyone.setdefault(name, AgentRule(name=name))
+    shown_rules = {n: r for n, r in everyone.items()
                    if not tab or (tab == "-" and not r.profile) or r.profile == tab}
     rows = tabs + (
         '<div class="cards">' + "".join(card(n, r) for n, r in sorted(shown_rules.items()))
@@ -1162,7 +1253,7 @@ def agents_page(*, csrf: str, rules: dict, tokens: list[dict], profiles: list[st
 
     token_rows = "".join(token_row(t) for t in tokens) or (
         "<tr><td colspan=9>No registered tokens.</td></tr>")
-    e = edit
+    e = edit if edit is not None or not new_name else AgentRule(name=new_name)
     tool_boxes = "".join(
         f'<label class="inline"><input type="checkbox" name="tools" value="{esc(t)}"'
         f'{" checked" if e and t in e.tools else ""}> {esc(t)}</label> ' for t in tools)

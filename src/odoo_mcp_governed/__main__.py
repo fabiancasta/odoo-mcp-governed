@@ -127,12 +127,19 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if command == "totp-setup":
+            from .storage import write_private_text
             from .web.totp import new_secret, provisioning_uri
 
+            # Written to a 0600 file, never printed: terminals, CI logs and
+            # shell history keep what is printed.
             secret = new_secret()
-            print(f"ADMIN_TOTP_SECRET={secret}")
-            print(f"# add it to .env, restart, and scan this in an authenticator app:\n"
-                  f"# {provisioning_uri(secret)}", file=sys.stderr)
+            target = settings.data_dir / "totp-setup.txt"
+            write_private_text(target, f"ADMIN_TOTP_SECRET={secret}\n"
+                                       f"# scan in an authenticator app:\n"
+                                       f"# {provisioning_uri(secret)}\n")
+            print(f"new TOTP secret written to {target} (mode 0600): copy the "
+                  "ADMIN_TOTP_SECRET line into .env, scan the otpauth:// line, restart, "
+                  "then delete the file")
             return 0
 
         if command == "report":

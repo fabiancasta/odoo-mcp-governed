@@ -53,9 +53,11 @@ def _models(value: Any) -> frozenset[str]:
     return frozenset(str(v).strip() for v in value or () if str(v).strip())
 
 
-def validate_domain(domain: Any, where: str) -> list:
+def domain_problem(domain: Any, where: str) -> str | None:
+    """What is wrong with a scope domain, or ``None``. Plain text built from
+    the input only, so it is safe to show to the operator."""
     if not isinstance(domain, list):
-        raise AgentError(f"scope for {where} must be a list of conditions")
+        return f"scope for {where} must be a list of conditions"
     for item in domain:
         if item in ("&", "|", "!"):
             continue
@@ -64,9 +66,48 @@ def validate_domain(domain: Any, where: str) -> list:
             or not isinstance(item[0], str) or not item[0]
             or item[1] not in DOMAIN_OPERATORS
         ):
-            raise AgentError(
-                f"scope for {where}: {item!r} is not a [field, operator, value] condition")
+            return f"scope for {where}: {item!r} is not a [field, operator, value] condition"
+    return None
+
+
+def validate_domain(domain: Any, where: str) -> list:
+    problem = domain_problem(domain, where)
+    if problem:
+        raise AgentError(problem)
     return [list(i) if isinstance(i, (list, tuple)) else i for i in domain]
+
+
+def rule_problem(data: Mapping[str, Any]) -> str | None:
+    """Why :meth:`AgentRule.from_dict` would refuse ``data``, or ``None`` —
+    worked out without raising, so the panel can say it as is."""
+    scope = data.get("scope") or {}
+    if isinstance(scope, str):
+        if not scope.strip():
+            scope = {}
+        else:
+            try:
+                scope = json.loads(scope)
+            except ValueError:
+                return 'scope is not valid JSON: {"model": [["field", "=", value]]}'
+    if not isinstance(scope, dict):
+        return 'scope must be an object: {"model": [[field, op, value]]}'
+    for model, domain in scope.items():
+        if problem := domain_problem(domain, str(model)):
+            return problem
+    quota = str(data.get("daily_quota") or "0").strip()
+    if not quota.lstrip("-").isdigit():
+        return "the daily quota must be a whole number"
+    if int(quota) < 0:
+        return "the daily quota cannot be negative"
+    return None
+
+
+def vars_problem(pairs: list[str]) -> str | None:
+    for pair in pairs:
+        name = pair.split("=", 1)[0].strip()
+        if not VAR_NAME.match(name):
+            return f"variable name {name!r}: use a-z, 0-9 and _"
+    return None
 
 
 @dataclass(frozen=True)

@@ -229,10 +229,30 @@ class AuditStore:
         outcome: str | None = None,
         text: str | None = None,
         limit: int = 200,
+        model: str | None = None,
+        decisions: tuple[str, ...] = (),
+        since: datetime | None = None,
+        until: datetime | None = None,
+        agents_only: bool = False,
     ) -> list[AuditEvent]:
         """Filtered tail for the admin audit view, newest first."""
         clauses: list[str] = []
         params: list[object] = []
+        if model:
+            clauses.append("model = ?")
+            params.append(model)
+        if decisions:
+            clauses.append(f"decision IN ({','.join('?' * len(decisions))})")
+            params.extend(decisions)
+        if since is not None:
+            clauses.append("ts >= ?")
+            params.append(since.isoformat())
+        if until is not None:
+            clauses.append("ts < ?")
+            params.append(until.isoformat())
+        if agents_only:
+            # What the dashboard counts: agent calls, not panel actions.
+            clauses.append("tool NOT LIKE 'admin.%' AND tool != 'self_check'")
         if actor:
             clauses.append("actor = ?")
             params.append(actor)
@@ -281,6 +301,16 @@ class AuditStore:
 
     def count(self) -> int:
         return self._query("SELECT COUNT(*) AS n FROM audit_events")[0]["n"]
+
+    def actor_stats(self, moment: datetime) -> dict[str, tuple[int, int, str]]:
+        """``{actor: (calls since moment, calls ever, last call ts)}``."""
+        rows = self._query(
+            "SELECT actor, SUM(CASE WHEN ts >= ? THEN 1 ELSE 0 END) AS recent, "
+            "COUNT(*) AS total, MAX(ts) AS last FROM audit_events GROUP BY actor",
+            (moment.isoformat(),),
+        )
+        return {r["actor"]: (int(r["recent"] or 0), int(r["total"]), str(r["last"]))
+                for r in rows}
 
     def count_since(self, actor: str, moment: datetime) -> int:
         return self._query(

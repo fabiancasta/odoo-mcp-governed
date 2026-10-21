@@ -30,7 +30,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 
 from .. import __version__
 from ..governance import ChainStatus, Decision, Operation, Outcome, ToolCall
-from ..governance.agents import AgentError, AgentRule, parse_vars
+from ..governance.agents import AgentError, AgentRule, parse_vars, rule_problem, vars_problem
 from ..governance.approvals import GRANT_MINUTES
 from ..odoo import OdooClient, OdooError
 from ..policy_store import LIST_FIELDS
@@ -433,14 +433,16 @@ def create_app(runtime: Runtime) -> FastAPI:
     # -- admin: session ----------------------------------------------------
 
     @app.get("/admin", response_class=HTMLResponse)
-    async def admin_home(request: Request, edit: str | None = None, m: str | None = None):
+    async def admin_home(request: Request, edit: str | None = None, m: str | None = None,
+                         tab: str = ""):
         session = session_for(request)
         if session is None:
             return HTMLResponse(views.login_page(totp=totp is not None))
-        return await run_in_threadpool(render_dashboard, session, edit_name=edit, flash_code=m)
+        return await run_in_threadpool(lambda: render_dashboard(
+            session, edit_name=edit, flash_code=m, tab=tab[:20]))
 
     def render_dashboard(session, *, edit_name=None, flash_code=None, error=None,
-                         edit_override=None, status_code=200) -> HTMLResponse:
+                         edit_override=None, status_code=200, tab="") -> HTMLResponse:
         flash, kind = FLASH.get(flash_code or "", (None, "ok"))
         if error:
             flash, kind = error, "bad"
@@ -488,8 +490,48 @@ def create_app(runtime: Runtime) -> FastAPI:
             max_risk=max((a[1] for a in agents), default=0),
             tuning=runtime.tuning.values,
             tuning_source=runtime.tuning.source,
+            tab=tab or _tab_for(flash_code, error, edit),
+            profile_cards=views.profile_cards(
+                runtime.profiles.public(), summaries=profile_summaries(),
+                own=set(runtime.policy_store.config.profile_lists),
+                agents_by_profile=pinned_agents()),
         )
         return HTMLResponse(html, status_code=status_code)
+
+    def profile_summaries() -> dict[str, str]:
+        from .agent_tree import counts, effective
+        ro = runtime.profiles.read_only_names()
+        return {p["name"]: counts(effective(runtime.engine.policy.config, None, p["name"], ro))
+                for p in runtime.profiles.public()}
+
+    def pinned_agents() -> dict[str, list[str]]:
+        out: dict[str, list[str]] = {}
+        for name, rule in runtime.agents.rules().items():
+            if rule.profile:
+                out.setdefault(rule.profile, []).append(name)
+        return out
+
+    def agent_summaries(names) -> dict[str, str]:
+        """Read / change / delete counts on the profile each agent lands on."""
+        from .agent_tree import counts, effective
+        cfg, ro = runtime.engine.policy.config, runtime.profiles.read_only_names()
+        rules, active = cfg.agent_rules, runtime.profiles.active_name
+        out = {}
+        for name in names:
+            rule = rules.get(name)
+            profile = (rule.profile if rule and rule.profile else active) or ""
+            if profile:
+                out[name] = (counts(effective(cfg, rule, profile, ro))
+                             + f"<span>on {esc_(profile)}</span>")
+        return out
+
+    def actor_stats() -> dict[str, tuple[int, int, str]]:
+        from datetime import timedelta as _td
+
+        from ..governance.events import utcnow
+        stats = runtime.audit.store.actor_stats(utcnow() - _td(hours=24))
+        return {a: s for a, s in stats.items()
+                if not a.startswith(("admin@", "anonymous@")) and a != "system"}
 
     async def dashboard_error(session, error: str, **kwargs) -> HTMLResponse:
         return await run_in_threadpool(
@@ -730,6 +772,9 @@ def create_app(runtime: Runtime) -> FastAPI:
             await run_in_threadpool(save_lists, profile, lists, admin_actor(request))
         except (ValueError, KeyError):
             return to_permissions("permissions_error", profile)
+        target = back_to(form, "")
+        if target:
+            return RedirectResponse(f"{target}&m=permissions_saved", status_code=303)
         return to_permissions("permissions_saved", profile)
 
     @app.post("/admin/permissions")
@@ -845,13 +890,69 @@ def create_app(runtime: Runtime) -> FastAPI:
 
     def agents_page(session, *, flash=None, kind="ok", issued=None, edit=None, tab=""):
         rules = runtime.agents.rules()
+        seen = actor_stats()
+        names = set(rules) | set(seen) | {t["actor"] for t in runtime.agents.tokens()}
         return HTMLResponse(views.agents_page(
             csrf=session.csrf, rules=rules, tokens=runtime.agents.tokens(),
             profiles=[p["name"] for p in runtime.profiles.public()],
             tools=sorted(TOOLS), issued=issued, edit=rules.get(edit) if edit else None,
             flash=flash, flash_kind=kind, require_registered=settings.require_registered_tokens,
             selected=tab, read_only_profiles=runtime.profiles.read_only_names(),
+            seen=seen, summaries=agent_summaries(names),
+            new_name=edit if edit and edit not in rules and ACTOR_NAME.match(edit) else "",
         ))
+
+    @app.get("/admin/agents/view", response_class=HTMLResponse)
+    async def agent_view(request: Request, name: str = "", m: str | None = None):
+        """One agent as a tree of what it can really do."""
+        from .agent_tree import tree_page
+
+        session = session_for(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if not ACTOR_NAME.match(name):
+            return back("csrf", "/admin/agents")
+        flash, kind = FLASH.get(m or "", (None, "ok"))
+        cfg = runtime.engine.policy.config
+        return HTMLResponse(tree_page(
+            csrf=session.csrf, name=name, rule=runtime.agents.rule(name), policy=cfg,
+            profiles=runtime.profiles.public(), active=runtime.profiles.active_name,
+            read_only_profiles=runtime.profiles.read_only_names(),
+            tokens=runtime.agents.tokens(name), stats=actor_stats().get(name),
+            tools=sorted(TOOLS), blocked=name in cfg.blocked_actors, flash=flash,
+            flash_kind=kind,
+        ))
+
+    def back_to(form, default: str) -> str:
+        """Where a quick action returns: the agent tree it came from, if any."""
+        target = str(form.get("back") or "") if form is not None else ""
+        if target.startswith("/admin/agents/view?name=") and ACTOR_NAME.match(
+                target.split("=", 1)[1]):
+            return target
+        return default
+
+    @app.post("/admin/agents/quick")
+    async def agents_quick(request: Request):
+        """Read-only, quota and pinned profile from the agent tree; creates the
+        rule if the agent had none."""
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf", "/admin/agents")
+        name = str(form.get("name") or "")
+        quota = str(form.get("daily_quota") or "0")
+        if not ACTOR_NAME.match(name) or not quota.isdigit():
+            return back("csrf", "/admin/agents")
+        rule = runtime.agents.rule(name) or AgentRule(name=name)
+        try:
+            await run_in_threadpool(lambda: runtime.save_agent(replace(
+                rule, read_only=form.get("read_only") == "yes", daily_quota=int(quota),
+                profile=str(form.get("profile") or "")), actor=admin_actor(request)))
+        except (AgentError, ValueError):
+            return back("csrf", f"/admin/agents/view?name={name}")
+        query = urlencode({"name": name, "m": "agent_saved"})
+        return RedirectResponse(f"/admin/agents/view?{query}", status_code=303)
 
     @app.get("/admin/agents", response_class=HTMLResponse)
     async def agents_view(request: Request, m: str | None = None, edit: str | None = None,
@@ -871,15 +972,19 @@ def create_app(runtime: Runtime) -> FastAPI:
         if form is None:
             return back("csrf", "/admin/agents")
         name, model = str(form.get("name") or ""), str(form.get("model") or "").strip()
-        rule = runtime.agents.rule(name)
-        if rule is None or not MODEL_NAME.match(model) or form.get("action") not in (
+        kind = "tools" if form.get("kind") == "tool" else "models"
+        valid = model in TOOLS if kind == "tools" else bool(MODEL_NAME.match(model))
+        if not ACTOR_NAME.match(name) or not valid or form.get("action") not in (
                 "add", "remove"):
             return back("csrf", "/admin/agents")
-        models = (rule.models | {model} if form.get("action") == "add"
-                  else rule.models - {model})
+        rule = runtime.agents.rule(name) or AgentRule(name=name)
+        current = getattr(rule, kind)
+        values = current | {model} if form.get("action") == "add" else current - {model}
         await run_in_threadpool(lambda: runtime.save_agent(
-            replace(rule, models=frozenset(models)), actor=admin_actor(request)))
-        return back("agent_saved", "/admin/agents")
+            replace(rule, **{kind: frozenset(values)}), actor=admin_actor(request)))
+        target = back_to(form, "/admin/agents")
+        sep = "&" if "?" in target else "?"
+        return RedirectResponse(f"{target}{sep}m=agent_saved", status_code=303)
 
     @app.post("/admin/agents/save", response_class=HTMLResponse)
     async def agents_save(request: Request):
@@ -889,17 +994,28 @@ def create_app(runtime: Runtime) -> FastAPI:
         if form is None:
             return back("csrf", "/admin/agents")
         name = str(form.get("name") or "").strip()
+        data = {
+            "models": str(form.get("models") or ""), "tools": form.getlist("tools"),
+            "read_only": form.get("read_only") == "yes",
+            "daily_quota": str(form.get("daily_quota") or "0"),
+            "profile": str(form.get("profile") or ""), "scope": str(form.get("scope") or ""),
+            "note": str(form.get("note") or ""),
+        }
+        # Checked before, not caught after: what the operator reads is built
+        # from the form, never from an exception.
+        problem = rule_problem(data)
+        if not ACTOR_NAME.match(name):
+            problem = "agent names may only contain letters, digits and _ . @ -"
+        elif data["profile"] and runtime.profiles.get(data["profile"]) is None:
+            problem = "that profile does not exist"
+        if problem:
+            return agents_page(session, flash=f"Agent not saved: {problem}", kind="bad")
         try:
-            rule = AgentRule.from_dict(name, {
-                "models": str(form.get("models") or ""), "tools": form.getlist("tools"),
-                "read_only": form.get("read_only") == "yes",
-                "daily_quota": str(form.get("daily_quota") or "0"),
-                "profile": str(form.get("profile") or ""), "scope": str(form.get("scope") or ""),
-                "note": str(form.get("note") or ""),
-            })
+            rule = AgentRule.from_dict(name, data)
             await run_in_threadpool(runtime.save_agent, rule, actor=admin_actor(request))
-        except (AgentError, ValueError) as exc:
-            return agents_page(session, flash=f"Agent not saved: {exc}", kind="bad")
+        except (AgentError, ValueError):
+            return agents_page(session, flash="Agent not saved: the form held an invalid value.",
+                               kind="bad")
         return back("agent_saved", "/admin/agents")
 
     @app.post("/admin/agents/delete")
@@ -922,14 +1038,19 @@ def create_app(runtime: Runtime) -> FastAPI:
             return back("csrf", "/admin/agents")
         name = str(form.get("name") or "").strip()
         hours = str(form.get("hours") or "").strip()
+        pairs = [v for v in str(form.get("vars") or "").split(",") if v.strip()]
+        problem = vars_problem(pairs) or (
+            None if ACTOR_NAME.match(name) else "agent names may only contain letters, digits "
+            "and _ . @ -")
+        if problem:
+            return agents_page(session, flash=f"No token issued: {problem}", kind="bad")
         try:
-            variables = parse_vars([v for v in str(form.get("vars") or "").split(",")
-                                    if v.strip()])
+            variables = parse_vars(pairs)
             issued = await run_in_threadpool(lambda: runtime.issue_agent_token(
                 name, actor=admin_actor(request), hours=int(hours) if hours.isdigit() else None,
                 variables=variables, label=str(form.get("label") or "")))
-        except (AgentError, ValueError) as exc:
-            return agents_page(session, flash=f"No token issued: {exc}", kind="bad")
+        except (AgentError, ValueError):
+            return agents_page(session, flash="No token issued: invalid value.", kind="bad")
         # Shown once, in this response only: it is not stored to be shown again.
         return agents_page(session, issued=issued)
 
@@ -1065,24 +1186,57 @@ def create_app(runtime: Runtime) -> FastAPI:
 
     @app.get("/admin/logs", response_class=HTMLResponse)
     async def audit_view(request: Request, actor: str = "", tool: str = "", decision: str = "",
-                         outcome: str = "", q: str = "", limit: int = 200, m: str | None = None):
+                         outcome: str = "", q: str = "", limit: int = 200, m: str | None = None,
+                         model: str = "", kind: str = "", hours: int = 0, hour: str = "",
+                         agents: str = ""):
+        """The audit log, filtered. Every number on the dashboard links here
+        with the filter that reproduces it."""
         session = session_for(request)
         if session is None:
             return RedirectResponse("/admin", status_code=303)
-        decision = decision if decision in {d.value for d in Decision} else ""
+        from datetime import datetime as _dt
+        from datetime import timedelta as _td
+
+        from ..governance.events import utcnow
+        from .metrics import CATEGORY_ORDER, categorise
+
+        decisions: tuple[str, ...] = ()
+        if decision == "flagged":
+            decisions = (Decision.ALLOW_FLAGGED.value, Decision.THROTTLE.value)
+        decision = decision if decision in {d.value for d in Decision} | {"flagged"} else ""
         outcome = outcome if outcome in {o.value for o in Outcome} else ""
-        events = await run_in_threadpool(
-            runtime.audit.store.search,
-            actor=actor or None, tool_prefix=tool or None, decision=decision or None,
-            outcome=outcome or None, text=q or None, limit=max(1, min(limit, 2000)),
-        )
+        model = model if MODEL_NAME.match(model or "") and model != "*" else ""
+        kind = kind if kind in CATEGORY_ORDER else ""
+        since = until = None
+        if hour:
+            try:
+                since = _dt.strptime(hour, "%Y-%m-%dT%H").replace(tzinfo=utcnow().tzinfo)
+                until = since + _td(hours=1)
+            except ValueError:
+                hour = ""
+        elif 0 < hours <= 24 * 90:
+            since = (utcnow() - _td(hours=hours - 1)).replace(minute=0, second=0, microsecond=0)
+        else:
+            hours = 0
+        wanted = max(1, min(limit, 2000))
+        events = await run_in_threadpool(lambda: runtime.audit.store.search(
+            actor=actor or None, tool_prefix=tool or None,
+            decision=None if decisions else decision or None, decisions=decisions,
+            outcome=outcome or None, text=q or None, model=model or None,
+            since=since, until=until, agents_only=agents == "1",
+            limit=5000 if kind else wanted,
+        ))
+        if kind:
+            events = [e for e in events if categorise(e.reasons) == kind][:wanted]
         actors = await run_in_threadpool(_actor_risk, runtime)
         flash, _ = FLASH.get(m or "", (None, "ok"))
         return HTMLResponse(views.audit_page(
             csrf=session.csrf, events=events, chain=chain_status(force=bool(m)),
             keyed=runtime.audit.keyed, actors=actors,
             filters={"actor": actor, "tool": tool, "decision": decision, "q": q,
-                     "limit": str(limit)},
+                     "limit": str(limit), "model": model, "kind": kind,
+                     "hours": str(hours) if hours else "", "hour": hour,
+                     "agents": "1" if agents == "1" else ""},
             flash=flash,
         ))
 
@@ -1141,6 +1295,21 @@ def create_app(runtime: Runtime) -> FastAPI:
         return back("anchor_written", "/admin/logs")
 
     return app
+
+
+def _tab_for(flash_code: str | None, error: str | None, edit: Any) -> str:
+    """The dashboard tab an action returns to."""
+    code = flash_code or ""
+    if edit is not None or code.startswith("profile_") or (error or "").startswith("Profile"):
+        return "profiles"
+    if code.startswith(("policy_", "tuning_")) or (error or "").startswith(("Policy", "Threshold")):
+        return "policy"
+    return "summary"
+
+
+def esc_(value: Any) -> str:
+    from html import escape
+    return escape(str(value), quote=True)
 
 
 def _summary(runtime: Runtime) -> dict[str, Any]:
