@@ -432,13 +432,17 @@ class TestAdmin:
 
     def test_token_page_and_regeneration(self, client, runtime) -> None:
         csrf = login(client)
-        client.post("/admin/token/regenerate",
-                    data={"csrf": csrf, "actor": "claude-desktop", "confirm": "yes"})
-        page = client.get("/token").text
-        token = re.search(r'readonly class="mono">([^<]+)<', page).group(1)
+        page = client.post("/admin/token/regenerate",
+                           data={"csrf": csrf, "actor": "claude-desktop"}).text
+        token = re.search(r'readonly class="mono" rows="3">([^<]+)<', page).group(1)
         assert client.post("/mcp", json=rpc("ping"),
                            headers={"Authorization": f"Bearer {token}"}).status_code == 200
-        assert (runtime.settings.token_file.stat().st_mode & 0o777) == 0o600
+        # Shown once, with the config to paste — and never kept on disk.
+        assert '"Authorization": "Bearer ' in page.replace("&quot;", '"')
+        assert not runtime.settings.token_file.exists()
+        assert token not in client.get("/token").text
+        [row] = runtime.agents.tokens("claude-desktop")
+        assert row["label"] == "connect page"
 
     def test_secret_files_are_0600(self, client, runtime) -> None:
         for path in (runtime.settings.profiles_file,):

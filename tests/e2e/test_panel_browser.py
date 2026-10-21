@@ -115,7 +115,7 @@ def page(server, browser):
 
 
 SIDEBAR = ["Agents", "Dashboard", "Approvals", "Audit log", "Changes", "Report",
-           "Permissions", "Odoo instances", "Policy & thresholds", "Panel token"]
+           "Permissions", "Odoo instances", "Policy & thresholds", "Connect a client"]
 
 
 def test_login_lands_on_agents(page) -> None:

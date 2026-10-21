@@ -73,10 +73,10 @@ def test_panel_issues_pinned_tokens_and_per_client_reports(tmp_path) -> None:
     client = TestClient(create_app(runtime))
     csrf = login(client)
     assert "cliente-b" in client.get("/token").text
-    client.post("/admin/token/regenerate", data={
-        "csrf": csrf, "actor": "bot-b", "profile": "cliente-b", "confirm": "yes"})
-    stored = verify_token(runtime.settings, client.get("/token").text.split(
-        'class="mono">')[1].split("<")[0])
+    page = client.post("/admin/token/regenerate", data={
+        "csrf": csrf, "actor": "bot-b", "profile": "cliente-b"}).text
+    stored = verify_token(runtime.settings, page.split(
+        'class="mono" rows="3">')[1].split("<")[0])
     assert stored["profile"] == "cliente-b" and stored["sub"] == "bot-b"
 
     count_with(client, runtime, "cliente-b")

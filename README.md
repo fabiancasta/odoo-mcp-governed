@@ -13,7 +13,7 @@ leaked — and is built so that when that happens the damage is bounded and the
 evidence survives.
 
 > **Status:** v0.3 — all 19 tools, stdio and HTTP transports, admin panel and
-> Docker deployment work end to end against Odoo 19. 526 tests, 15 of them clicking through the panel in a real browser.
+> Docker deployment work end to end against Odoo 19. 528 tests, 15 of them clicking through the panel in a real browser.
 
 ## What the operator gets
 
@@ -361,7 +361,7 @@ valid agents on the same IP) and the canaries found a content leak
 
 ## Tests
 
-The suite has 526 tests (`pytest tests/e2e` drives the panel in Chromium with Playwright). The ones that matter are not the
+The suite has 528 tests (`pytest tests/e2e` drives the panel in Chromium with Playwright). The ones that matter are not the
 "it records events" kind — they are the adversarial ones:
 
 ```bash

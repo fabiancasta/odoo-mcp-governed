@@ -742,12 +742,12 @@ NAV = (
     ("Configure", (("permissions", "🔑", "Permissions", "/admin/permissions"),
                    ("profiles", "🗄️", "Odoo instances", "/admin?tab=profiles"),
                    ("policy", "🛡️", "Policy & thresholds", "/admin?tab=policy"),
-                   ("token", "🔐", "Panel token", "/token"))),
+                   ("token", "🔌", "Connect a client", "/token"))),
 )
 ACTIVE_BY_TITLE = {"Dashboard": "summary", "Odoo instances": "profiles",
                    "Policy & thresholds": "policy", "Audit log": "audit", "Changes": "changes",
                    "Permissions": "permissions", "Approvals": "approvals", "Agents": "agents",
-                   "Report": "report", "Token": "token"}
+                   "Report": "report", "Connect a client": "token"}
 
 
 def _sidebar(active: str) -> str:
@@ -1110,37 +1110,85 @@ def profile_cards(profiles: list[dict[str, Any]], *, summaries: dict[str, str],
             + "</div></section>") if cards else ""
 
 
-def token_page(*, csrf: str, token: dict[str, Any] | None, mcp_url: str,
-               profiles: list[str] | None = None) -> str:
-    if token:
-        pin = (f' · pinned to profile <b>{esc(token["profile"])}</b>' if token.get("profile")
-               else " · follows the active profile")
-        body = (
-            '<section><h2>MCP access token</h2>'
-            f'<p>Actor: <b>{esc(token["actor"])}</b>{pin} · expires {esc(token["expires_at"][:10])}</p>'
-            f'<label>Bearer token</label><textarea readonly class="mono">{esc(token["token"])}</textarea>'
-            f'<label>MCP endpoint</label><input type="text" readonly value="{esc(mcp_url)}">'
-            '<p><small>Every request made with this token is attributed to this actor in the '
-            "audit log. Give each agent its own token if you want the detectors to tell them "
-            "apart. Rotating <code>JWT_SECRET</code> revokes every token at once.</small></p>"
+def connect_page(*, csrf: str, mcp_url: str, agents: list[str], profiles: list[str],
+                 issued: dict[str, Any] | None = None, legacy: dict[str, Any] | None = None,
+                 flash: str | None = None, flash_kind: str = "ok") -> str:
+    """Connect a client: issue a registered token and get the config to paste.
+
+    The server keeps no copy of the token — only its id, to revoke it — so
+    the snippets below carry it this once.
+    """
+    known = "".join(f'<option value="{esc(a)}">' for a in agents)
+    profile_options = '<option value="">its rule’s profile, or the active one</option>' + "".join(
+        f'<option value="{esc(p)}">pinned to {esc(p)}</option>' for p in profiles)
+    form = (
+        '<section><h2>1 · Issue a token</h2>'
+        f'<form method="post" action="/admin/token/regenerate">{csrf_field(csrf)}'
+        '<div class=row><div><label>Agent (who this client is)</label>'
+        '<input type="text" name="actor" list="connect-agents" value="claude" '
+        'pattern="[A-Za-z0-9_.@\\-]{1,64}" required>'
+        f'<datalist id="connect-agents">{known}</datalist></div>'
+        f'<div><label>Odoo profile</label><select name="profile">{profile_options}</select></div>'
+        '<div><label>Label</label><input type="text" name="label" '
+        'placeholder="e.g. laptop, n8n, WhatsApp bot"></div>'
+        '<div><label>Hours (empty = default)</label><input type="number" name="hours" min="1">'
+        "</div></div><p><small>Each client gets its own token: revoke one without touching the "
+        "others. The token is shown once; the server keeps only its id.</small></p>"
+        '<p><button type="submit">Issue token</button></p></form></section>'
+    )
+    snippets = ""
+    if issued:
+        token = issued["token"]
+        config = json.dumps({"odoo-governed": {
+            "type": "http", "url": mcp_url,
+            "headers": {"Authorization": f"Bearer {token}"}}}, indent=2)
+        pinned = (f" · pinned to <b>{esc(issued['profile'])}</b>" if issued.get("profile")
+                  else " · follows its rule or the active profile")
+        snippets = (
+            f'<section class="issued"><h2>2 · Paste it into the client</h2>'
+            f'<p class="msg warn">Shown only once. Agent <b>{esc(issued["actor"])}</b>{pinned} · '
+            f'expires {esc(issued["expires_at"][:16].replace("T", " "))} UTC.</p>'
+            "<h3>Token</h3>"
+            f'<textarea readonly class="mono" rows="3">{esc(token)}</textarea>'
+            "<h3>Claude Code — inside <code>mcpServers</code> of <code>~/.claude.json</code>, "
+            "then <code>/mcp</code> → Reconnect</h3>"
+            f'<textarea readonly class="mono" rows="9">{esc(config)}</textarea>'
+            "<h3>Any HTTP client (n8n, a script, another agent)</h3>"
+            f'<textarea readonly class="mono" rows="4">URL: {esc(mcp_url)}\n'
+            f"Header: Authorization: Bearer {esc(token)}</textarea>"
+            "<h3>Test it from a terminal</h3>"
+            '<textarea readonly class="mono" rows="4">'
+            f"curl -s -X POST {esc(mcp_url)} -H 'Content-Type: application/json' "
+            f"-H 'Authorization: Bearer {esc(token)}' "
+            "-d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}'</textarea>"
+            "<p><small>A command line keeps what you type in its history: prefer pasting the "
+            "token into the file over passing it as an argument.</small></p>"
+            f'<p><a href="/admin/agents/view?name={esc(issued["actor"])}">'
+            f'🌳 Open {esc(issued["actor"])}’s tree</a> to see or revoke its tokens.</p>'
+            "</section>"
         )
     else:
-        body = '<section><h2>MCP access token</h2><p>No valid token. Generate one below.</p>'
-    body += (
-        '<form method="post" action="/admin/token/regenerate">'
-        f"{csrf_field(csrf)}<div class=row><div><label>Actor name</label>"
-        '<input type="text" name="actor" value="claude" pattern="[A-Za-z0-9_.@\\-]{1,64}" required>'
-        "</div><div><label>Odoo profile</label><select name=\"profile\">"
-        '<option value="">follow the active profile</option>'
-        + "".join(f'<option value="{esc(p)}">pinned to {esc(p)}</option>' for p in profiles or [])
-        + "</select><small>Pin one token per client: that agent then always works on that "
-        "Odoo, whatever is active here.</small></div></div><p>"
-        '<label class="inline"><input type="checkbox" name="confirm" value="yes" required> '
-        "I understand the stored token will be replaced</label> "
-        '<button type="submit">Generate new token</button></p></form></section>'
-    )
-    return page("Token", body)
-
+        snippets = (
+            "<section><h2>2 · Paste it into the client</h2><p>Issue a token above: this "
+            "section then shows it, ready to paste, for Claude Code, n8n or any HTTP client. "
+            f"The endpoint is <code>{esc(mcp_url)}</code>.</p></section>"
+        )
+    old = ""
+    if legacy:
+        old = (
+            '<details class="card-like"><summary><b>🗄️ A token stored by the old “Panel token” '
+            "page</b></summary><p><small>Older versions kept one token on disk and showed it "
+            f'here every time. Agent <b>{esc(legacy.get("actor"))}</b>, expires '
+            f'{esc(str(legacy.get("expires_at", ""))[:10])}. If a client still uses it, keep it '
+            "until you switch that client to a new token; then forget it. Forgetting deletes "
+            "the copy on disk — revoke it from the agent’s tree to stop it working.</small></p>"
+            f'<textarea readonly class="mono" rows="3">{esc(legacy.get("token"))}</textarea>'
+            f'<form method="post" action="/admin/token/forget">{csrf_field(csrf)}'
+            '<label class="inline"><input type="checkbox" name="confirm" value="yes" required> '
+            'confirm</label> <button class="danger" type="submit">Forget the stored copy</button>'
+            "</form></details>"
+        )
+    return page("Connect a client", message(flash, flash_kind) + form + snippets + old)
 
 def _event_row(e: AuditEvent) -> str:
     cls = "deny" if e.decision is Decision.DENY else (

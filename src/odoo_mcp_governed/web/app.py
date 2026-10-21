@@ -80,6 +80,8 @@ FLASH = {
         "ok",
     ),
     "agent_saved": ("Agent saved. Its rule applies to its next call.", "ok"),
+    "token_forgotten": ("The stored copy is gone. Revoke the token from the agent's tree if "
+                        "it should stop working.", "ok"),
     "agent_deleted": ("Agent deleted: tokens revoked, agent blocked, rule removed. Its audit "
                       "history stays.", "ok"),
     "agent_archived": ("Agent archived: tokens revoked and agent blocked. Find it under "
@@ -1306,18 +1308,28 @@ def create_app(runtime: Runtime) -> FastAPI:
             return settings.mcp_public_url.rstrip("/") + "/mcp"
         return str(request.base_url).rstrip("/") + "/mcp"
 
+    def connect_page(session, request: Request, *, issued=None, flash=None, kind="ok"):
+        names = sorted((set(runtime.agents.rules()) | set(actor_stats())
+                        | {"claude"}) - set(runtime.agents.archived()))
+        return HTMLResponse(views.connect_page(
+            csrf=session.csrf, mcp_url=mcp_url(request), agents=names,
+            profiles=[p["name"] for p in runtime.profiles.public()], issued=issued,
+            legacy=tokens.current(), flash=flash, flash_kind=kind,
+        ))
+
     @app.get("/token", response_class=HTMLResponse)
-    async def token_view(request: Request):
+    async def token_view(request: Request, m: str | None = None):
         session = session_for(request)
         if session is None:
             return RedirectResponse("/admin", status_code=303)
-        return HTMLResponse(views.token_page(
-            csrf=session.csrf, token=tokens.current(), mcp_url=mcp_url(request),
-            profiles=[p["name"] for p in runtime.profiles.public()],
-        ))
+        flash, kind = FLASH.get(m or "", (None, "ok"))
+        return await run_in_threadpool(lambda: connect_page(session, request, flash=flash,
+                                                            kind=kind))
 
-    @app.post("/admin/token/regenerate")
+    @app.post("/admin/token/regenerate", response_class=HTMLResponse)
     async def token_regenerate(request: Request):
+        """Issue a registered token and show it once, with the config to paste.
+        Nothing is kept on disk but its id."""
         session, form = await admin_form(request)
         if session is None:
             return RedirectResponse("/admin", status_code=303)
@@ -1325,14 +1337,40 @@ def create_app(runtime: Runtime) -> FastAPI:
             return back("csrf", "/token")
         actor = str(form.get("actor") or "claude").strip()
         profile = str(form.get("profile") or "").strip() or None
-        if not ACTOR_NAME.match(actor) or form.get("confirm") != "yes":
+        hours = str(form.get("hours") or "").strip()
+        problem = None
+        if not ACTOR_NAME.match(actor):
+            problem = "agent names may only contain letters, digits and _ . @ -"
+        elif profile is not None and runtime.profiles.get(profile) is None:
+            problem = "that profile does not exist"
+        else:
+            rule = runtime.agents.rule(actor)
+            if rule and rule.profile and profile and profile != rule.profile:
+                problem = (f"{actor} is pinned to {rule.profile} by its rule; pick that profile "
+                           "or change the rule")
+        if problem:
+            return connect_page(session, request, flash=f"No token issued: {problem}",
+                                kind="bad")
+        try:
+            issued = await run_in_threadpool(lambda: runtime.issue_agent_token(
+                actor, actor=admin_actor(request), profile=profile,
+                hours=int(hours) if hours.isdigit() else None,
+                label=str(form.get("label") or "connect page")[:80]))
+        except ValueError:
+            return connect_page(session, request, flash="No token issued: invalid value.",
+                                kind="bad")
+        return await run_in_threadpool(lambda: connect_page(session, request, issued=issued))
+
+    @app.post("/admin/token/forget")
+    async def token_forget(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None or form.get("confirm") != "yes":
             return back("csrf", "/token")
-        if profile is not None and runtime.profiles.get(profile) is None:
-            return back("csrf", "/token")
-        with runtime.admin_action(admin_actor(request), "admin.token.regenerate",
-                                  detail={"actor": actor, "profile": profile}):
-            tokens.regenerate(actor, profile, registry=runtime.agents)
-        return back("token_regenerated", "/token")
+        with runtime.admin_action(admin_actor(request), "admin.token.forget"):
+            settings.token_file.unlink(missing_ok=True)
+        return back("token_forgotten", "/token")
 
     # -- admin: audit ------------------------------------------------------
 

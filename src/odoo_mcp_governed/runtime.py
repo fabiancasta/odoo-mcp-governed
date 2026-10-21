@@ -409,7 +409,7 @@ class Runtime:
 
     def issue_agent_token(self, name: str, *, actor: str, hours: int | None = None,
                           variables: dict[str, Any] | None = None,
-                          label: str = "") -> dict[str, Any]:
+                          label: str = "", profile: str | None = None) -> dict[str, Any]:
         """A new token for ``name``, registered so it can be revoked alone. A
         rule's pinned profile goes into the token as well."""
         from .web.auth import issue_token
@@ -417,7 +417,13 @@ class Runtime:
         if not ACTOR_NAME.match(name):
             raise ValueError("agent names may only contain letters, digits and _ . @ -")
         rule = self.agents.rule(name)
-        profile = rule.profile if rule and rule.profile else None
+        if rule and rule.profile:
+            if profile and profile != rule.profile:
+                raise ValueError(f"agent {name!r} is pinned to profile {rule.profile!r} by its "
+                                 "rule; a token for another profile would be refused")
+            profile = rule.profile
+        if profile and self.profiles.get(profile) is None:
+            raise ValueError(f"there is no profile named {profile!r}")
         detail = {"agent": name, "profile": profile, "vars": sorted(variables or {})}
         with self.admin_action(actor, "admin.agent.token", detail=detail) as action:
             issued = issue_token(self.settings, name, hours=hours, profile=profile,

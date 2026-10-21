@@ -203,7 +203,7 @@ class TestHub:
                              ("/admin/approvals", "✋"), ("/admin/logs", "📜"),
                              ("/admin/changes", "↩️"), ("/admin/permissions", "🔑"),
                              ("/admin?tab=profiles", "🗄️"), ("/admin?tab=policy", "🛡️"),
-                             ("/token", "🔐"), ("/admin/agents/view?name=claude", "🤖")):
+                             ("/token", "🔌"), ("/admin/agents/view?name=claude", "🤖")):
             page = client.get(path).text
             assert 'class="side"' in page, path
             assert f'aria-current=page><span class="ico">{active}' in page, path
@@ -337,3 +337,25 @@ class TestArchive:
         client.post("/admin/agents/archive", data={"csrf": csrf, "name": "claude",
                                                    "action": "archive"})
         assert "claude" not in runtime.agents.archived()
+
+
+class TestConnect:
+    def test_a_rule_pin_wins_over_the_form(self, tmp_path) -> None:
+        runtime, client, csrf = app(tmp_path)
+        runtime.save_profile(Profile(name="co", url="http://co.invalid", database="co",
+                                     username="u", api_key="k", environment="development"),
+                             actor="a")
+        runtime.save_agent(AgentRule(name="bot", profile="default"), actor="a")
+        page = client.post("/admin/token/regenerate", data={
+            "csrf": csrf, "actor": "bot", "profile": "co"}).text
+        assert "No token issued" in page and "pinned to default" in page
+        assert not runtime.agents.tokens("bot")
+
+    def test_an_old_stored_token_can_be_forgotten(self, tmp_path) -> None:
+        from odoo_mcp_governed.web.auth import TokenStore
+        runtime, client, csrf = app(tmp_path)
+        TokenStore(runtime.settings).regenerate("claude")
+        assert "stored by the old" in client.get("/token").text
+        client.post("/admin/token/forget", data={"csrf": csrf, "confirm": "yes"})
+        assert not runtime.settings.token_file.exists()
+        assert "stored by the old" not in client.get("/token").text
