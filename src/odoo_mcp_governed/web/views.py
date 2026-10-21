@@ -14,7 +14,8 @@ from :meth:`Profile.public`, which has no secret fields to leak.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from html import escape
 from typing import Any
@@ -31,10 +32,28 @@ STYLE = """
 --line:#2b323e;--acc:#7d9cf0;--ok:#4cc38a;--warn:#e0a63a;--bad:#f07167;--chip:#242b36}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);
 font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-header{display:flex;gap:16px;align-items:center;justify-content:space-between;padding:14px 24px;
-border-bottom:1px solid var(--line);background:var(--card)}
-header b{font-size:15px}nav a{margin-right:14px;color:var(--acc);text-decoration:none}
-main{max-width:1180px;margin:0 auto;padding:20px 16px 48px}
+header.bare{padding:14px 24px;border-bottom:1px solid var(--line);background:var(--card)}
+.shell{display:grid;grid-template-columns:236px minmax(0,1fr);min-height:100vh}
+.side{position:sticky;top:0;height:100vh;overflow-y:auto;background:var(--card);
+border-right:1px solid var(--line);padding:16px 12px;display:flex;flex-direction:column;gap:10px}
+.brand{font-size:16px;color:var(--ink);text-decoration:none;padding:4px 10px}
+.side nav{display:flex;flex-direction:column;gap:14px;flex:1}
+.group{display:flex;flex-direction:column;gap:2px}.group small{color:var(--mute);
+text-transform:uppercase;letter-spacing:.06em;font-size:11px;padding:0 10px 4px}
+.group a{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;
+color:var(--ink);text-decoration:none}.group a:hover{background:var(--chip)}
+.group a.on{background:var(--acc);color:#fff}.ico{width:20px;text-align:center}
+.badge{margin-left:auto;background:var(--bad);color:#fff;border-radius:99px;padding:0 7px;
+font-size:11px;font-weight:700}.panic-chip{display:block;background:var(--bad);color:#fff;
+padding:8px 10px;border-radius:8px;text-decoration:none;font-weight:700;text-align:center}
+.logout button{width:100%}.content{min-width:0}
+header.top{padding:18px 28px 0}header.top h1{font-size:20px;margin:0}
+main{max-width:1240px;padding:16px 28px 48px}
+@media (max-width:900px){.shell{grid-template-columns:1fr}.side{position:static;height:auto;
+flex-direction:row;flex-wrap:wrap;align-items:center;border-right:0;border-bottom:1px solid var(--line)}
+.side nav{flex-direction:row;overflow-x:auto;flex:1 1 100%;gap:8px}.group{flex-direction:row}
+.group small{display:none}.group a{white-space:nowrap}.logout{margin-left:auto}
+header.top{padding:14px 16px 0}main{padding:12px 16px 40px}}
 section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px;margin:0 0 18px}
 h2{font-size:15px;margin:0 0 12px}h3{font-size:13px;margin:14px 0 6px;color:var(--mute)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
@@ -56,6 +75,14 @@ a.stat.link{display:block;color:inherit;text-decoration:none}a.stat.link:hover,
 a.hbar:hover{border-color:var(--acc);background:color-mix(in srgb,var(--acc) 7%,transparent)}
 a.hbar{color:inherit;text-decoration:none;border:1px solid transparent;border-radius:6px}
 svg.chart a rect:hover{opacity:.75;cursor:pointer}
+a.button{display:inline-block;padding:7px 13px;border-radius:6px;background:var(--acc);
+color:#fff;text-decoration:none}.spread{display:flex;justify-content:space-between;
+align-items:center;gap:12px;flex-wrap:wrap}
+.sum{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0}
+.sum span{font-size:12px;padding:2px 8px;border-radius:99px;background:var(--chip)}
+a.card.agent{display:block;color:var(--ink);text-decoration:none;transition:border-color .15s}
+a.card.agent:hover{border-color:var(--acc)}a.card.agent small{display:block;color:var(--mute)}
+a.card.agent .open{color:var(--acc);font-weight:600;font-size:13px}
 .tabs{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}.tabs a{padding:7px 14px;border-radius:99px;
 border:1px solid var(--line);background:var(--card);color:var(--ink);text-decoration:none}
 .tabs a.on{background:var(--acc);border-color:var(--acc);color:#fff}.tabs small{opacity:.75}
@@ -567,7 +594,7 @@ def report_html(r: dict[str, Any], profiles: list[str] | None = None) -> str:
         "action is sealed into a hash-chained audit log; any edit or deletion of a past "
         "entry breaks the chain.</small></p></section>"
     )
-    html = page("AI activity report", body)
+    html = page("AI activity report", body, active="report")
     return html.replace("</style>", REPORT_STYLE + "</style>", 1)
 
 
@@ -600,27 +627,70 @@ def esc(value: Any) -> str:
     return escape("" if value is None else str(value), quote=True)
 
 
-def page(title: str, body: str, *, nav: bool = True) -> str:
-    links = (
-        '<nav><a href="/admin">Dashboard</a><a href="/admin/logs">Audit log</a>'
-        '<a href="/admin/changes">Changes</a><a href="/admin/permissions">Permissions</a>'
-        '<a href="/admin/approvals">Approvals</a><a href="/admin/agents">Agents</a>'
-        '<a href="/admin/report">Report</a><a href="/token">Token</a></nav>'
-        if nav
-        else ""
-    )
-    logout = (
-        "" if not nav else
-        '<form method="post" action="/admin/logout" class="inline">'
-        '<button class="ghost" type="submit">Log out</button></form>'
-    )
+NAV_STATE: ContextVar[Callable[[], dict[str, Any]] | None] = ContextVar(
+    "nav_state", default=None)
+"""Set per request by the app: live numbers for the sidebar (pending
+approvals, panic). Pages render without it, with no badges."""
+
+NAV = (
+    ("", (("agents", "🤖", "Agents", "/admin/agents"),
+          ("summary", "📊", "Dashboard", "/admin"))),
+    ("Monitor", (("approvals", "✋", "Approvals", "/admin/approvals"),
+                 ("audit", "📜", "Audit log", "/admin/logs"),
+                 ("changes", "↩️", "Changes", "/admin/changes"),
+                 ("report", "📄", "Report", "/admin/report"))),
+    ("Configure", (("permissions", "🔑", "Permissions", "/admin/permissions"),
+                   ("profiles", "🗄️", "Odoo instances", "/admin?tab=profiles"),
+                   ("policy", "🛡️", "Policy & thresholds", "/admin?tab=policy"),
+                   ("token", "🔐", "Panel token", "/token"))),
+)
+ACTIVE_BY_TITLE = {"Dashboard": "summary", "Odoo instances": "profiles",
+                   "Policy & thresholds": "policy", "Audit log": "audit", "Changes": "changes",
+                   "Permissions": "permissions", "Approvals": "approvals", "Agents": "agents",
+                   "Report": "report", "Token": "token"}
+
+
+def _sidebar(active: str) -> str:
+    getter = NAV_STATE.get()
+    state = getter() if getter else {}
+    badges = {"approvals": state.get("approvals") or 0}
+    groups = []
+    for label, items in NAV:
+        links = "".join(
+            f'<a href="{url}"{" class=on aria-current=page" if key == active else ""}>'
+            f'<span class="ico">{icon}</span>{esc(text)}'
+            + (f'<span class="badge">{badges[key]}</span>' if badges.get(key) else "")
+            + "</a>"
+            for key, icon, text, url in items
+        )
+        head = f"<small>{esc(label)}</small>" if label else ""
+        groups.append(f'<div class="group">{head}{links}</div>')
+    panic = ('<a class="panic-chip" href="/admin">⛔ Panic is ON</a>'
+             if state.get("panic") else "")
     return (
+        '<aside class="side"><a class="brand" href="/admin/agents">🛡️ <b>governed</b></a>'
+        f'{panic}<nav aria-label="Main">{"".join(groups)}</nav>'
+        '<form method="post" action="/admin/logout" class="logout">'
+        '<button class="ghost" type="submit">Log out</button></form></aside>'
+    )
+
+
+def page(title: str, body: str, *, nav: bool = True, active: str | None = None) -> str:
+    head = (
         "<!doctype html><html lang=en><head><meta charset=utf-8>"
         '<meta name=viewport content="width=device-width,initial-scale=1">'
         f"<title>{esc(title)} · odoo-mcp-governed</title><style>{STYLE}</style>"
-        '<script src="/static/panel.js" defer></script></head><body>'
-        f"<header><div><b>odoo-mcp-governed</b></div>{links}{logout}</header>"
-        f"<main>{body}</main></body></html>"
+        '<script src="/static/panel.js" defer></script></head>'
+    )
+    if not nav:
+        return (head + '<body><header class="bare"><b>🛡️ odoo-mcp-governed</b></header>'
+                f"<main>{body}</main></body></html>")
+    key = active or ACTIVE_BY_TITLE.get(title) or (
+        "agents" if title.startswith("Agent") else "")
+    return (
+        head + f'<body class="shell">{_sidebar(key)}<div class="content">'
+        f'<header class="top"><h1>{esc(title)}</h1></header>'
+        f"<main>{body}</main></div></body></html>"
     )
 
 
@@ -902,14 +972,14 @@ def dashboard(
         "policy": ("🛡️ Policy and thresholds", policy_section + console),
     }
     tab = tab if tab in panes else "summary"
-    bar = '<div class="tabs">' + "".join(
-        f'<a href="/admin?tab={key}"{" class=on" if key == tab else ""}>{label}</a>'
-        for key, (label, _) in panes.items()
-    ) + '<a href="/admin/agents">🤖 Agents ›</a><a href="/admin/permissions">🔑 Permissions ›</a></div>'
-    # Every pane is in the page; only the chosen one is shown.
+    # One page, three places in the sidebar. Every pane is in the page so a
+    # link to any of them always works; only the chosen one is shown.
     body = "".join(f'<div id="pane-{key}"{"" if key == tab else " hidden"}>{html}</div>'
                    for key, (_, html) in panes.items())
-    return page("Dashboard", message(flash, flash_kind) + emergency + bar + body)
+    title = {"summary": "Dashboard", "profiles": "Odoo instances",
+             "policy": "Policy & thresholds"}[tab]
+    return page(title, message(flash, flash_kind) + (emergency if tab == "summary" else "")
+                + body, active=tab)
 
 
 def profile_cards(profiles: list[dict[str, Any]], *, summaries: dict[str, str],
@@ -1150,7 +1220,8 @@ def agents_page(*, csrf: str, rules: dict, tokens: list[dict], profiles: list[st
                 require_registered: bool = False, selected: str = "",
                 read_only_profiles: frozenset[str] = frozenset(),
                 seen: dict[str, tuple[int, int, str]] | None = None,
-                summaries: dict[str, str] | None = None, new_name: str = "") -> str:
+                summaries: dict[str, str] | None = None, new_name: str = "",
+                open_form: bool = False) -> str:
     """The agent registry: one rule per agent, every token it holds."""
     shown = ""
     if issued:
@@ -1165,52 +1236,30 @@ def agents_page(*, csrf: str, rules: dict, tokens: list[dict], profiles: list[st
     def chips(values, empty: str) -> str:
         return " ".join(f"<code>{esc(v)}</code>" for v in sorted(values)) or empty
 
-    def model_pills(r) -> str:
-        hidden = f'{csrf_field(csrf)}<input type="hidden" name="name" value="{esc(r.name)}">'
-        pills = "".join(
-            f'<span class="pill">{esc(m)}<form method="post" action="/admin/agents/model">'
-            f'{hidden}<input type="hidden" name="model" value="{esc(m)}">'
-            '<button name="action" value="remove" type="submit" title="Remove">×</button>'
-            "</form></span>" for m in sorted(r.models)
-        ) or "<small>every model the policy allows</small>"
-        return (
-            f'{pills}<form method="post" action="/admin/agents/model" class="plus">{hidden}'
-            '<input type="text" name="model" placeholder="limit to a model…" required>'
-            '<button name="action" value="add" type="submit" title="Add">+</button></form>'
-        )
 
     def card(name: str, r) -> str:
+        """One agent, the whole card a link to its tree — where it is managed."""
         has_rule = name in rules
         stat = (seen or {}).get(name)
-        activity = (f"<small>{stat[0]} calls in 24 h · last "
-                    f"{esc(stat[2][:16].replace('T', ' '))}</small>" if stat else
-                    "<small>no calls yet</small>")
+        activity = (f"{stat[0]} calls in 24 h · last {esc(stat[2][11:16])} UTC" if stat
+                    else "no calls yet")
         if not has_rule:
-            return (
-                f'<div class="card"><div class="who">{avatar(name)}<div><b>{esc(name)}</b><br>'
-                f'{activity}</div></div><p><span class="chip">🌐 follows the server policy</span>'
-                "</p>"
-                f'<div class="sum">{(summaries or {}).get(name, "")}</div>'
-                f'<p><a href="/admin/agents/view?name={esc(name)}">🌳 open its tree</a> · '
-                f'<a href="/admin/agents?edit={esc(name)}">＋ create rule</a></p></div>'
-            )
-        badges = " ".join(b for b in (
-            '<span class="chip warn">👁️ read-only</span>' if r.read_only else
-            '<span class="chip warn">🏭 read-only (production)</span>'
-            if r.profile in read_only_profiles else '<span class="chip ok">✏️ may write</span>',
-            f'<span class="chip">⏱️ {esc(r.daily_quota)}/day</span>' if r.daily_quota else "",
-            f'<span class="chip">📌 {esc(r.profile)}</span>' if r.profile else "",
-            '<span class="chip">🔐 own records only</span>' if r.scope else "",
-        ) if b)
+            badges = '<span class="chip">🌐 follows the server policy</span>'
+        else:
+            badges = " ".join(b for b in (
+                '<span class="chip warn">👁️ read-only</span>' if r.read_only else
+                '<span class="chip warn">🏭 read-only (production)</span>'
+                if r.profile in read_only_profiles else '<span class="chip ok">✏️ may write</span>',
+                f'<span class="chip">⏱️ {esc(r.daily_quota)}/day</span>' if r.daily_quota else "",
+                f'<span class="chip">📌 {esc(r.profile)}</span>' if r.profile else "",
+                '<span class="chip">🔐 own records only</span>' if r.scope else "",
+            ) if b)
         return (
-            f'<div class="card"><div class="who">{avatar(name)}<div><b>{esc(name)}</b><br>'
-            f'<small>{esc(r.note)}</small><br>{activity}</div></div><p>{badges}</p>'
-            f'<div class="sum">{(summaries or {}).get(name, "")}</div>'
-            f'<p><a href="/admin/agents/view?name={esc(name)}">🌳 open its tree</a></p>'
-            f'<h3>🧩 Models</h3>{model_pills(r)}'
-            f'<h3>🛠️ Tools</h3>{chips(r.tools, "<small>all</small>")}'
-            + (f'<h3>🔐 Scope</h3>{chips(r.scope, "")}' if r.scope else "")
-            + f'<p><a href="/admin/agents?edit={esc(name)}">✎ Edit rule</a></p></div>'
+            f'<a class="card agent" href="/admin/agents/view?name={esc(name)}">'
+            f'<div class="who">{avatar(name)}<div><b>{esc(name)}</b>'
+            f'<small>{esc(r.note) if has_rule and r.note else activity}</small></div></div>'
+            f'<p>{badges}</p><div class="sum">{(summaries or {}).get(name, "")}</div>'
+            '<span class="open">Open ›</span></a>'
         )
 
     pins = sorted({r.profile for r in rules.values() if r.profile})
@@ -1254,6 +1303,55 @@ def agents_page(*, csrf: str, rules: dict, tokens: list[dict], profiles: list[st
     token_rows = "".join(token_row(t) for t in tokens) or (
         "<tr><td colspan=9>No registered tokens.</td></tr>")
     e = edit if edit is not None or not new_name else AgentRule(name=new_name)
+    registered = (
+        "Unregistered tokens are refused (REQUIRE_REGISTERED_TOKENS=true)."
+        if require_registered else
+        "Tokens issued before the registry still work; set REQUIRE_REGISTERED_TOKENS=true "
+        "once every agent has a registered token, or revoke them from the agent's page."
+    )
+    form = rule_form(csrf=csrf, e=e, profiles=profiles, tools=tools)
+    known = sorted(everyone)
+    revoke_options = "".join(f'<option value="{esc(n)}">{esc(n)}</option>' for n in known)
+    body = (
+        message(flash, flash_kind) + shown
+        + '<section><div class="spread"><h2>Your agents</h2>'
+        '<a class="button" href="/admin/agents?new=1#new">＋ New agent</a></div>'
+        "<p><small>Open an agent to see — and change — what it can really do. A rule only "
+        "takes away: it can never reach what the server policy denies.</small></p>"
+        f"{rows}</section>"
+        f'<details class="card-like" id="new"{" open" if open_form else ""}><summary><b>'
+        + (f"✎ Edit the rule of {esc(e.name)}" if e is not None and e.name in rules
+           else "＋ New agent rule")
+        + f"</b></summary>{form}</details>"
+        '<details class="card-like"><summary><b>🔑 Issue a token</b></summary>'
+        f'<form method="post" action="/admin/agents/token">{csrf_field(csrf)}'
+        '<div class=row><div><label>Agent name</label>'
+        f'<input type="text" name="name" value="{esc(e.name if e else "")}" list="known-agents" '
+        'pattern="[A-Za-z0-9_.@\\-]{1,64}" required></div><div><label>Label</label>'
+        '<input type="text" name="label" placeholder="e.g. laptop, n8n, customer 42"></div>'
+        '<div><label>Hours (empty = default)</label><input type="number" name="hours" min="1">'
+        '</div></div><label>Variables for the scope (name=value, comma-separated)</label>'
+        '<input type="text" name="vars" placeholder="partner=42">'
+        '<p><button type="submit">Issue token</button></p></form></details>'
+        '<datalist id="known-agents">'
+        + "".join(f'<option value="{esc(n)}">' for n in known) + "</datalist>"
+        f'<details class="card-like"><summary><b>🗂️ All tokens ({len(tokens)})</b></summary>'
+        f'<p><small>{esc(registered)}</small></p>'
+        '<div class="wrap"><table><tr><th>Agent</th><th>Label</th><th>Id</th><th>Profile</th>'
+        "<th>Variables</th><th>Issued (UTC)</th><th>Expires</th><th>State</th><th></th></tr>"
+        f"{token_rows}</table></div>"
+        f'<form method="post" action="/admin/agents/revoke">{csrf_field(csrf)}'
+        '<div class=row><div><label>Revoke every token of agent (registered or not)</label>'
+        f'<select name="name" required>{revoke_options}</select></div></div>'
+        '<p><label class="inline"><input type="checkbox" name="confirm" value="yes" required>'
+        ' confirm</label> <button class="danger" type="submit">Revoke all</button></p></form>'
+        "</details>"
+    )
+    return page("Agents", body)
+
+
+def rule_form(*, csrf: str, e: Any, profiles: list[str], tools: list[str]) -> str:
+    """The full rule of one agent: models, tools, quota, profile, scope."""
     tool_boxes = "".join(
         f'<label class="inline"><input type="checkbox" name="tools" value="{esc(t)}"'
         f'{" checked" if e and t in e.tools else ""}> {esc(t)}</label> ' for t in tools)
@@ -1261,18 +1359,8 @@ def agents_page(*, csrf: str, rules: dict, tokens: list[dict], profiles: list[st
         f'<option value="{esc(p)}"{" selected" if e and e.profile == p else ""}>{esc(p)}</option>'
         for p in profiles)
     scope_json = json.dumps({m: list(d) for m, d in e.scope.items()}, indent=1) if e else ""
-    registered = (
-        "Unregistered tokens are refused (REQUIRE_REGISTERED_TOKENS=true)."
-        if require_registered else
-        "Tokens issued before the registry still work; set REQUIRE_REGISTERED_TOKENS=true "
-        "once every agent has a registered token, or use “Revoke all” per agent."
-    )
-    body = (
-        message(flash, flash_kind) + shown
-        + '<section><h2>Agents</h2><p><small>A rule only takes away: it can never reach '
-        "what the server policy denies. Empty fields mean “as the policy says”.</small></p>"
-        f"{rows}</section>"
-        f'<section><h2>{"Edit" if e else "New"} agent rule</h2>'
+    existing = bool(e and e.name)
+    return (
         f'<form method="post" action="/admin/agents/save">{csrf_field(csrf)}'
         '<div class=row><div><label>Agent name (token subject)</label>'
         f'<input type="text" name="name" value="{esc(e.name if e else "")}" '
@@ -1299,27 +1387,7 @@ def agents_page(*, csrf: str, rules: dict, tokens: list[dict], profiles: list[st
             f'{csrf_field(csrf)}<input type="hidden" name="name" value="{esc(e.name)}">'
             '<label class="inline"><input type="checkbox" name="confirm" value="yes" required>'
             ' confirm</label> <button class="danger" type="submit">Delete rule</button></form>'
-            if e else ""
+            if existing else ""
         )
-        + "</section>"
-        '<section><h2>Issue a token</h2><form method="post" action="/admin/agents/token">'
-        f'{csrf_field(csrf)}<div class=row><div><label>Agent name</label>'
-        f'<input type="text" name="name" value="{esc(e.name if e else "")}" '
-        'pattern="[A-Za-z0-9_.@\\-]{1,64}" required></div><div><label>Label</label>'
-        '<input type="text" name="label" placeholder="e.g. laptop, n8n, customer 42"></div>'
-        '<div><label>Hours (empty = default)</label><input type="number" name="hours" min="1">'
-        '</div></div><label>Variables for the scope (name=value, comma-separated)</label>'
-        '<input type="text" name="vars" placeholder="partner=42">'
-        '<p><button type="submit">Issue token</button></p></form></section>'
-        f'<section><h2>Tokens</h2><p><small>{esc(registered)}</small></p>'
-        '<div class="wrap"><table><tr><th>Agent</th><th>Label</th><th>Id</th><th>Profile</th>'
-        "<th>Variables</th><th>Issued (UTC)</th><th>Expires</th><th>State</th><th></th></tr>"
-        f"{token_rows}</table></div>"
-        '<form method="post" action="/admin/agents/revoke"><div class=row><div>'
-        f'{csrf_field(csrf)}<label>Revoke every token of agent (registered or not)</label>'
-        '<input type="text" name="name" pattern="[A-Za-z0-9_.@\\-]{1,64}" required></div></div>'
-        '<p><label class="inline"><input type="checkbox" name="confirm" value="yes" required>'
-        ' confirm</label> <button class="danger" type="submit">Revoke all</button></p></form>'
-        "</section>"
     )
-    return page("Agents", body)
+

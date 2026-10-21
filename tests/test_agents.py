@@ -426,3 +426,29 @@ class TestRecordScope:
             for m in ("res.partner", "sale.order", "account.move")]
         _, body = call("list_models")
         assert {m["model"] for m in body["models"]} == {"res.partner", "sale.order"}
+
+
+class TestPinnedProfiles:
+    """N agents, N Odoo instances: a pinned agent never lands on another one."""
+
+    def test_unpinned_agents_follow_the_active_profile_by_default(self, web) -> None:
+        runtime, client = web()
+        assert post(client, runtime.issue_agent_token("bot", actor="a")["token"]
+                    ).status_code == 200
+
+    def test_require_pinned_profile_refuses_unpinned_agents(self, web) -> None:
+        runtime, client = web(require_pinned_profile=True)
+        loose = runtime.issue_agent_token("bot", actor="a")["token"]
+        assert post(client, loose).status_code == 403
+        runtime.save_agent(AgentRule(name="bot", profile="default"), actor="a")
+        assert post(client, loose).status_code == 200  # pinned by its rule now
+
+    def test_a_token_pinned_elsewhere_than_its_rule_is_refused(self, web) -> None:
+        runtime, client = web()
+        runtime.save_profile(replace(runtime.profiles.active(), name="other"), actor="a")
+        runtime.save_agent(AgentRule(name="bot", profile="default"), actor="a")
+        token = issue_token(runtime.settings, "bot", profile="other")["token"]
+        reply = client.post("/mcp", headers={"Authorization": f"Bearer {token}"}, json=rpc(
+            "tools/call", {"name": "search_count", "arguments": {"model": "res.partner"}}
+        )).json()["result"]
+        assert reply["isError"] and "works only on profile 'default'" in reply["content"][0]["text"]

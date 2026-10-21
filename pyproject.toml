@@ -73,3 +73,4 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 # Lets the suite run straight from a checkout without an editable install.
 pythonpath = ["src"]
+markers = ["e2e: real-browser tests of the admin panel (need Playwright and Chromium)"]

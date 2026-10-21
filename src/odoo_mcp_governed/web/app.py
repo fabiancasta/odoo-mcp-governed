@@ -221,6 +221,10 @@ def create_app(runtime: Runtime) -> FastAPI:
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
+        views.NAV_STATE.set(lambda: {
+            "approvals": len(runtime.approvals.pending()),
+            "panic": runtime.engine.policy.config.panic,
+        })
         response = await call_next(request)
         for key, value in BASE_HEADERS.items():
             response.headers.setdefault(key, value)
@@ -387,6 +391,18 @@ def create_app(runtime: Runtime) -> FastAPI:
             # The registry pins the agent; a token claiming another profile
             # is refused by policy rather than quietly rerouted.
             pinned = pinned or rule.profile
+        if pinned is None and settings.require_pinned_profile:
+            runtime.audit.record(
+                ToolCall(actor=actor, profile=runtime.profile_name, tool="mcp.auth",
+                         operation=Operation.ADMIN),
+                decision=Decision.DENY,
+                reasons=("profile_not_pinned: REQUIRE_PINNED_PROFILE is on and this agent "
+                         "has no pinned profile",),
+                outcome=Outcome.DENIED,
+            )
+            return JSONResponse(
+                {"error": "this agent is not pinned to an Odoo profile; ask the administrator"},
+                status_code=403)
         try:
             variables = parse_vars(claims.get("vars") if isinstance(claims.get("vars"), dict)
                                    else None)
@@ -559,7 +575,7 @@ def create_app(runtime: Runtime) -> FastAPI:
             return HTMLResponse(views.login_page(error, totp=totp is not None),
                                 status_code=401)
         sid, _ = sessions.create(client_ip(request))
-        response = RedirectResponse("/admin", status_code=303)
+        response = RedirectResponse("/admin/agents", status_code=303)
         response.set_cookie(
             cookie_name, sid, httponly=True, samesite="strict", secure=settings.https_mode,
             path="/", max_age=int(settings.admin_session_ttl.total_seconds()),
@@ -888,7 +904,8 @@ def create_app(runtime: Runtime) -> FastAPI:
 
     # -- admin: agent registry -----------------------------------------------
 
-    def agents_page(session, *, flash=None, kind="ok", issued=None, edit=None, tab=""):
+    def agents_page(session, *, flash=None, kind="ok", issued=None, edit=None, tab="",
+                    open_form=False):
         rules = runtime.agents.rules()
         seen = actor_stats()
         names = set(rules) | set(seen) | {t["actor"] for t in runtime.agents.tokens()}
@@ -900,12 +917,46 @@ def create_app(runtime: Runtime) -> FastAPI:
             selected=tab, read_only_profiles=runtime.profiles.read_only_names(),
             seen=seen, summaries=agent_summaries(names),
             new_name=edit if edit and edit not in rules and ACTOR_NAME.match(edit) else "",
+            open_form=open_form or kind == "bad",
+        ))
+
+    def roster() -> list[tuple[str, str]]:
+        rules, seen = runtime.agents.rules(), actor_stats()
+        names = sorted(set(rules) | set(seen) | {t["actor"] for t in runtime.agents.tokens()})
+        out = []
+        for n in names:
+            rule = rules.get(n)
+            bits = []
+            if rule is None:
+                bits.append("policy")
+            else:
+                bits += ["read-only"] * rule.read_only + ([f"📌 {rule.profile}"] if rule.profile
+                                                          else [])
+            if n in seen:
+                bits.append(f"{seen[n][0]} calls/24h")
+            out.append((n, " · ".join(bits) or "rule"))
+        return out
+
+    def render_tree(session, name: str, *, flash=None, kind="ok", issued=None):
+        from .agent_tree import tree_page
+
+        cfg = runtime.engine.policy.config
+        rule = runtime.agents.rule(name)
+        return HTMLResponse(tree_page(
+            csrf=session.csrf, name=name, rule=rule, policy=cfg,
+            profiles=runtime.profiles.public(), active=runtime.profiles.active_name,
+            read_only_profiles=runtime.profiles.read_only_names(),
+            tokens=runtime.agents.tokens(name), stats=actor_stats().get(name),
+            tools=sorted(TOOLS), blocked=name in cfg.blocked_actors, flash=flash,
+            flash_kind=kind, agents_list=roster(), issued=issued,
+            edit_form=views.rule_form(csrf=session.csrf, e=rule or AgentRule(name=name),
+                                      profiles=[p["name"] for p in runtime.profiles.public()],
+                                      tools=sorted(TOOLS)),
         ))
 
     @app.get("/admin/agents/view", response_class=HTMLResponse)
     async def agent_view(request: Request, name: str = "", m: str | None = None):
         """One agent as a tree of what it can really do."""
-        from .agent_tree import tree_page
 
         session = session_for(request)
         if session is None:
@@ -913,15 +964,8 @@ def create_app(runtime: Runtime) -> FastAPI:
         if not ACTOR_NAME.match(name):
             return back("csrf", "/admin/agents")
         flash, kind = FLASH.get(m or "", (None, "ok"))
-        cfg = runtime.engine.policy.config
-        return HTMLResponse(tree_page(
-            csrf=session.csrf, name=name, rule=runtime.agents.rule(name), policy=cfg,
-            profiles=runtime.profiles.public(), active=runtime.profiles.active_name,
-            read_only_profiles=runtime.profiles.read_only_names(),
-            tokens=runtime.agents.tokens(name), stats=actor_stats().get(name),
-            tools=sorted(TOOLS), blocked=name in cfg.blocked_actors, flash=flash,
-            flash_kind=kind,
-        ))
+        return await run_in_threadpool(lambda: render_tree(session, name, flash=flash,
+                                                           kind=kind))
 
     def back_to(form, default: str) -> str:
         """Where a quick action returns: the agent tree it came from, if any."""
@@ -956,12 +1000,16 @@ def create_app(runtime: Runtime) -> FastAPI:
 
     @app.get("/admin/agents", response_class=HTMLResponse)
     async def agents_view(request: Request, m: str | None = None, edit: str | None = None,
-                          tab: str = ""):
+                          tab: str = "", new: str = "", name: str = ""):
         session = session_for(request)
         if session is None:
             return RedirectResponse("/admin", status_code=303)
+        if name and ACTOR_NAME.match(name):
+            return RedirectResponse(f"/admin/agents/view?{urlencode({'name': name})}",
+                                    status_code=303)
         flash, kind = FLASH.get(m or "", (None, "ok"))
-        return agents_page(session, flash=flash, kind=kind, edit=edit, tab=tab[:64])
+        return agents_page(session, flash=flash, kind=kind, edit=edit, tab=tab[:64],
+                           open_form=bool(new or edit))
 
     @app.post("/admin/agents/model")
     async def agents_model(request: Request):
@@ -1052,6 +1100,8 @@ def create_app(runtime: Runtime) -> FastAPI:
         except (AgentError, ValueError):
             return agents_page(session, flash="No token issued: invalid value.", kind="bad")
         # Shown once, in this response only: it is not stored to be shown again.
+        if form.get("from_tree") == "1":
+            return render_tree(session, name, issued=issued)
         return agents_page(session, issued=issued)
 
     @app.post("/admin/agents/revoke")
@@ -1061,6 +1111,13 @@ def create_app(runtime: Runtime) -> FastAPI:
             return RedirectResponse("/admin", status_code=303)
         if form is None:
             return back("csrf", "/admin/agents")
+        name = str(form.get("name") or "")
+        if form.get("kind") == "unregistered" and ACTOR_NAME.match(name):
+            await run_in_threadpool(lambda: runtime.revoke_unregistered_tokens(
+                name, actor=admin_actor(request)))
+            return RedirectResponse(
+                f"/admin/agents/view?{urlencode({'name': name, 'm': 'token_revoked'})}",
+                status_code=303)
         if form.get("jti"):
             await run_in_threadpool(runtime.revoke_token, str(form.get("jti")),
                                     actor=admin_actor(request))

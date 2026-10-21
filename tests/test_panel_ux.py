@@ -84,9 +84,12 @@ class TestDashboardTabs:
     def test_tabs_and_profile_cards(self, tmp_path) -> None:
         runtime, client, _ = app(tmp_path)
         page = client.get("/admin").text
-        assert "📊 Summary" in page and 'id="pane-profiles" hidden' in page
+        assert "<h1>Dashboard</h1>" in page and 'id="pane-profiles" hidden' in page
+        # One sidebar on every page, with this page marked.
+        assert 'class=on aria-current=page><span class="ico">📊' in page
         page = client.get("/admin?tab=profiles").text
         assert 'id="pane-summary" hidden' in page and "Your Odoo instances" in page
+        assert "<h1>Odoo instances</h1>" in page
         assert "/admin/permissions?profile=default" in page
 
     def test_editing_a_profile_opens_its_tab(self, tmp_path) -> None:
@@ -115,7 +118,8 @@ class TestTree:
     def test_the_tree_shows_effective_permissions(self, tmp_path) -> None:
         runtime, client, _ = app(tmp_path)
         page = client.get("/admin/agents/view?name=claude").text
-        assert "Agent tree" in page and "res.partner" in page
+        assert "What this agent can do" in page and "res.partner" in page
+        assert 'class="roster"' in page  # the hub: every agent on the left
         assert "not registered" in page  # it calls with a token from before the registry
 
     def test_quick_rule_from_the_tree(self, tmp_path) -> None:
@@ -184,3 +188,50 @@ def test_totp_setup_writes_a_private_file(tmp_path, monkeypatch, capsys) -> None
     assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
     secret = target.read_text().splitlines()[0].split("=", 1)[1]
     assert secret not in capsys.readouterr().out
+
+
+class TestHub:
+    def test_login_lands_on_agents(self, tmp_path) -> None:
+        runtime = Runtime(make_settings(tmp_path))
+        client = TestClient(create_app(runtime))
+        response = client.post("/admin", data={"password": ADMIN}, follow_redirects=False)
+        assert response.headers["location"] == "/admin/agents"
+
+    def test_every_page_has_the_same_sidebar(self, tmp_path) -> None:
+        _, client, _ = app(tmp_path)
+        for path, active in (("/admin/agents", "🤖"), ("/admin", "📊"),
+                             ("/admin/approvals", "✋"), ("/admin/logs", "📜"),
+                             ("/admin/changes", "↩️"), ("/admin/permissions", "🔑"),
+                             ("/admin?tab=profiles", "🗄️"), ("/admin?tab=policy", "🛡️"),
+                             ("/token", "🔐"), ("/admin/agents/view?name=claude", "🤖")):
+            page = client.get(path).text
+            assert 'class="side"' in page, path
+            assert f'aria-current=page><span class="ico">{active}' in page, path
+
+    def test_issuing_from_the_tree_shows_the_token_there(self, tmp_path) -> None:
+        runtime, client, csrf = app(tmp_path)
+        page = client.post("/admin/agents/token", data={
+            "csrf": csrf, "name": "claude", "label": "laptop", "from_tree": "1"}).text
+        assert "shown only once" in page and 'class="roster"' in page
+
+    def test_revoke_only_unregistered_tokens(self, tmp_path) -> None:
+        from odoo_mcp_governed.web.auth import issue_token
+        runtime, client, csrf = app(tmp_path)
+        old = issue_token(runtime.settings, "claude")["token"]
+        import time
+        time.sleep(1.1)
+        client.post("/admin/agents/revoke", data={"csrf": csrf, "name": "claude",
+                                                  "kind": "unregistered"})
+        time.sleep(1.1)
+        new = runtime.issue_agent_token("claude", actor="admin")["token"]
+
+        def status(token):
+            return client.post("/mcp", headers={"Authorization": f"Bearer {token}"},
+                               json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+                               ).status_code
+        assert status(old) == 401 and status(new) == 200
+
+    def test_revoke_all_offers_known_agents_only(self, tmp_path) -> None:
+        _, client, _ = app(tmp_path)
+        page = client.get("/admin/agents").text
+        assert '<select name="name" required><option value="claude">' in page

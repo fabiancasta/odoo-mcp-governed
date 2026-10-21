@@ -227,7 +227,8 @@ class AgentStore:
             self._mtime = None
         data = read_json(self.path, default=None) or {}
         return {"agents": dict(data.get("agents") or {}), "tokens": dict(data.get("tokens") or {}),
-                "revoked_before": dict(data.get("revoked_before") or {})}
+                "revoked_before": dict(data.get("revoked_before") or {}),
+                "unregistered_before": dict(data.get("unregistered_before") or {})}
 
     def _save(self) -> None:
         write_private_json(self.path, self._data)
@@ -300,6 +301,16 @@ class AgentStore:
             self._save()
             return True
 
+    def revoke_unregistered(self, actor: str) -> None:
+        """Refuse every token of ``actor`` that is not in the registry and was
+        issued until now — tokens from before the registry — while the
+        registered ones keep working."""
+        with self._lock:
+            self._fresh()
+            now = int(datetime.now(timezone.utc).timestamp())
+            self._data.setdefault("unregistered_before", {})[actor] = now
+            self._save()
+
     def revoke_all(self, actor: str) -> int:
         """Refuse every token issued to ``actor`` until now, registered or not."""
         with self._lock:
@@ -321,12 +332,16 @@ class AgentStore:
             self._fresh()
             token = self._data["tokens"].get(jti) if isinstance(jti, str) else None
             cutoff = self._data["revoked_before"].get(sub)
+            loose_cutoff = self._data.get("unregistered_before", {}).get(sub)
         if token is not None and token.get("revoked_at"):
             return "token revoked"
         if token is not None and token.get("actor") != sub:
             return "token registry mismatch"
         if cutoff is not None and int(claims.get("iat", 0)) <= int(cutoff):
             return "token revoked (all tokens of this agent)"
+        if token is None and loose_cutoff is not None and int(
+                claims.get("iat", 0)) <= int(loose_cutoff):
+            return "token revoked (unregistered tokens of this agent)"
         if token is None and require_registered:
             return "token not registered"
         return None

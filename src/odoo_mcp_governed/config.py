@@ -113,6 +113,11 @@ class Settings(BaseSettings):
     admin_totp_secret: str = ""
     """Base32 secret for a second login factor (authenticator app). Generate
     one with ``odoo-mcp-governed totp-setup``. Empty: password only."""
+    require_pinned_profile: bool = False
+    """Refuse agents whose token and rule name no profile, instead of sending
+    them to whatever profile is active in the panel. With several Odoo
+    instances on one server, this guarantees an agent can never be moved to
+    another client's database by a profile switch."""
     require_registered_tokens: bool = False
     """Refuse bearer tokens missing from the agent registry (issued before it
     existed, or minted elsewhere). Recommended once every agent has a token

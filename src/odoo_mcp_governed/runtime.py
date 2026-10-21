@@ -432,6 +432,12 @@ class Runtime:
             action.count = 1 if done else 0
         return done
 
+    def revoke_unregistered_tokens(self, name: str, *, actor: str) -> None:
+        with self.admin_action(actor, "admin.agent.revoke_unregistered",
+                               detail={"agent": name}) as action:
+            self.agents.revoke_unregistered(name)
+            action.count = 1
+
     def revoke_agent_tokens(self, name: str, *, actor: str) -> int:
         with self.admin_action(actor, "admin.agent.revoke_all", detail={"agent": name}) as action:
             count = self.agents.revoke_all(name)

@@ -13,7 +13,7 @@ leaked — and is built so that when that happens the damage is bounded and the
 evidence survives.
 
 > **Status:** v0.3 — all 19 tools, stdio and HTTP transports, admin panel and
-> Docker deployment work end to end against Odoo 19. 495 tests.
+> Docker deployment work end to end against Odoo 19. 516 tests, 13 of them clicking through the panel in a real browser.
 
 ## What the operator gets
 
@@ -308,6 +308,7 @@ own. For production:
 | Denylist | Kept as the floor, not relied on as the main control |
 | Secrets | A fresh `JWT_SECRET` (rotating it revokes every token) and `AUDIT_HMAC_KEY` |
 | Tokens | One per agent from the Agents page, then `REQUIRE_REGISTERED_TOKENS=true` |
+| Several Odoo | Pin every agent to its profile, then `REQUIRE_PINNED_PROFILE=true`: an unpinned agent is refused instead of following the active profile |
 | Panel | `ADMIN_TOTP_SECRET` set, HTTPS in front |
 
 ## Hardening carried over from day one
@@ -359,7 +360,7 @@ valid agents on the same IP) and the canaries found a content leak
 
 ## Tests
 
-The suite has 495 tests. The ones that matter are not the
+The suite has 516 tests (`pytest tests/e2e` drives the panel in Chromium with Playwright). The ones that matter are not the
 "it records events" kind — they are the adversarial ones:
 
 ```bash

@@ -40,6 +40,19 @@ background:var(--bg)}.node.root{border-color:var(--acc);padding:10px 14px}
 .quick{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.quick input[type=number]{width:90px}
 .quick select{width:auto}.sum{display:flex;gap:10px;flex-wrap:wrap;margin:6px 0}
 .sum span{font-size:12px;padding:2px 8px;border-radius:99px;background:var(--chip)}
+.hub{display:grid;grid-template-columns:240px minmax(0,1fr);gap:18px;align-items:start}
+.roster{position:sticky;top:12px;display:flex;flex-direction:column;gap:4px;background:var(--card);
+border:1px solid var(--line);border-radius:12px;padding:10px;max-height:calc(100vh - 40px);
+overflow-y:auto}.roster a{display:flex;gap:10px;align-items:center;padding:6px 8px;
+border-radius:8px;color:var(--ink);text-decoration:none}.roster a:hover{background:var(--chip)}
+.roster a.on{background:color-mix(in srgb,var(--acc) 14%,transparent);outline:1px solid var(--acc)}
+.roster small{display:block;color:var(--mute);font-size:11px}.roster .new{justify-content:center;
+border:1px dashed var(--acc);color:var(--acc);font-weight:600}.roster .all{color:var(--mute);
+justify-content:center;font-size:12px}.detail{min-width:0}
+details.card-like{background:var(--card);border:1px solid var(--line);border-radius:10px;
+padding:14px 18px;margin:0 0 18px}details.card-like>summary{cursor:pointer}
+@media (max-width:900px){.hub{grid-template-columns:1fr}.roster{position:static;
+flex-direction:row;overflow-x:auto;max-height:none}.roster a{flex:none}}
 .tree .plus{max-width:380px}.plus button{white-space:nowrap}
 </style>
 """
@@ -143,7 +156,9 @@ def tree_page(*, csrf: str, name: str, rule: AgentRule | None, policy: PolicyCon
               profiles: list[dict[str, Any]], active: str | None,
               read_only_profiles: frozenset[str], tokens: list[dict[str, Any]],
               stats: tuple[int, int, str] | None, tools: list[str], blocked: bool,
-              flash: str | None = None, flash_kind: str = "ok") -> str:
+              flash: str | None = None, flash_kind: str = "ok",
+              agents_list: list[tuple[str, str]] = (), issued: dict | None = None,
+              edit_form: str = "") -> str:
     back = f"/admin/agents/view?name={name}"
     has_rule = rule is not None
     r = rule or AgentRule(name=name)
@@ -251,15 +266,27 @@ def tree_page(*, csrf: str, name: str, rule: AgentRule | None, policy: PolicyCon
         + "</div></li>" for t in tokens
     )
     if stats and not any(not t.get("revoked_at") for t in tokens):
-        token_nodes += ('<li><div class="node"><span class="chip warn">⚠ uses a token that is '
-                        "not registered</span><small>issued before the registry: it works, but "
-                        "can only be revoked with “revoke all”. Issue a registered one and "
-                        "switch the agent to it.</small></div></li>")
+        token_nodes += (
+            '<li><div class="node"><span class="chip warn">⚠ may be using a token that is not '
+            "registered</span><small>issued before the registry. Issue a registered one, switch "
+            "the agent to it, then revoke the old ones:</small>"
+            f'<form method="post" action="/admin/agents/revoke" class="inline">{csrf_field(csrf)}'
+            f'<input type="hidden" name="name" value="{esc(name)}">'
+            '<input type="hidden" name="kind" value="unregistered">'
+            '<button class="danger" type="submit">Revoke unregistered tokens</button></form>'
+            "</div></li>")
     token_nodes += (
         f'<li><form method="post" action="/admin/agents/token" class="plus">{csrf_field(csrf)}'
         f'<input type="hidden" name="name" value="{esc(name)}">'
+        '<input type="hidden" name="from_tree" value="1">'
         '<input type="text" name="label" placeholder="label, e.g. laptop">'
         '<button type="submit" title="Issue a registered token">+ token</button></form></li>'
+        f'<li><form method="post" action="/admin/agents/revoke" class="inline">{csrf_field(csrf)}'
+        f'<input type="hidden" name="name" value="{esc(name)}">'
+        '<label class="inline"><input type="checkbox" name="confirm" value="yes" required> '
+        "confirm</label> "
+        '<button class="danger" type="submit">Revoke every token of this agent</button></form>'
+        "</li>"
     )
 
     tree = (
@@ -279,13 +306,33 @@ def tree_page(*, csrf: str, name: str, rule: AgentRule | None, policy: PolicyCon
         f'<a href="/admin/logs?actor={esc(name)}">audit log</a></div></li>'
         "</ul></li></ul>"
     )
-    body = (
-        TREE_STYLE + message(flash, flash_kind)
-        + '<p><a href="/admin/agents">← all agents</a></p>'
-        "<section><h2>Agent tree</h2><p><small>Every leaf is what the agent can really do: the "
-        "profile’s permissions, narrowed by its environment and by the agent’s own rule. "
-        "A + on a profile widens that profile for every agent on it; a + on the model limit "
-        "only narrows this agent.</small></p>"
-        f"{tree}</section>"
+    shown = ""
+    if issued:
+        shown = (
+            '<section class="issued"><h2>🔑 New token for '
+            f'{esc(issued["actor"])}</h2><p class="msg warn">Copy it now: it is shown only once. '
+            f'Expires {esc(issued["expires_at"][:16].replace("T", " "))} UTC.</p>'
+            f'<textarea readonly class="mono" rows="3">{esc(issued["token"])}</textarea></section>'
+        )
+    roster = "".join(
+        f'<a href="/admin/agents/view?name={esc(n)}"{" class=on" if n == name else ""}>'
+        f'{avatar(n, 30)}<span><b>{esc(n)}</b><small>{sub}</small></span></a>'
+        for n, sub in agents_list
     )
-    return page(f"Agent {name}", body)
+    detail = (
+        message(flash, flash_kind) + shown
+        + "<section><h2>What this agent can do</h2><p><small>Every leaf is what the agent can "
+        "really do: the profile’s permissions, narrowed by its environment and by its own "
+        "rule. A + on a profile widens that profile for every agent on it; a + on the model "
+        "limit only narrows this agent.</small></p>"
+        f"{tree}</section>"
+        + (f'<details class="card-like"><summary><b>✎ Advanced: edit the whole rule</b>'
+           f"</summary>{edit_form}</details>" if edit_form else "")
+    )
+    body = (
+        TREE_STYLE
+        + '<div class="hub"><aside class="roster"><a class="new" href="/admin/agents?new=1">'
+        f'＋ New agent</a>{roster}<a class="all" href="/admin/agents">All agents ›</a></aside>'
+        f'<div class="detail">{detail}</div></div>'
+    )
+    return page(f"Agent {name}", body, active="agents")
