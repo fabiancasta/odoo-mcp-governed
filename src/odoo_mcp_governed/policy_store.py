@@ -35,8 +35,12 @@ _SET_FIELDS = {
     "approval_required",
     "transient_allowlist",
 }
+LIST_FIELDS = ("allowed_models", "writable_models", "deletable_models")
+"""The model lists a profile can have of its own."""
+
 _EDITABLE = _SET_FIELDS | {
     "allow_execute_method", "max_records_per_call", "panic", "approval_bulk_threshold",
+    "profile_lists",
 }
 
 
@@ -61,7 +65,9 @@ def policy_from_settings(settings: Settings) -> PolicyConfig:
 def _serialise(config: PolicyConfig) -> dict[str, Any]:
     data = asdict(config)
     return {
-        key: sorted(value) if key in _SET_FIELDS else value
+        key: sorted(value) if key in _SET_FIELDS else
+        {p: {k: sorted(v) for k, v in lists.items()} for p, lists in value.items()}
+        if key == "profile_lists" else value
         for key, value in data.items()
         if key in _EDITABLE
     }
@@ -75,6 +81,15 @@ def _coerce(key: str, value: Any) -> Any:
         if key == "approval_required" and not items <= set(APPROVAL_KINDS):
             raise ValueError(f"approval_required may only hold {', '.join(APPROVAL_KINDS)}")
         return items
+    if key == "profile_lists":
+        if not isinstance(value, dict):
+            raise ValueError("profile_lists must map profile names to model lists")
+        out = {}
+        for profile, lists in value.items():
+            if not isinstance(lists, dict) or set(lists) - set(LIST_FIELDS):
+                raise ValueError(f"profile_lists[{profile!r}] may only hold {LIST_FIELDS}")
+            out[str(profile)] = {k: _coerce(k, lists.get(k, ())) for k in LIST_FIELDS}
+        return out
     if key in ("allow_execute_method", "panic"):
         return bool(value)
     if key == "approval_bulk_threshold":

@@ -28,7 +28,7 @@ tools that are actually governed as writes.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 
 from .agents import AgentRule
@@ -292,9 +292,21 @@ class PolicyConfig:
     missing, nothing in Odoo's own access control would stop the agent.
     Derived at runtime, not edited as policy."""
 
+    profile_lists: Mapping[str, Mapping[str, frozenset[str]]] = field(default_factory=dict)
+    """Per-profile model lists: ``{profile: {"allowed_models": …, "writable_models": …,
+    "deletable_models": …}}``. A profile listed here uses its own lists instead of the
+    three above; every other profile uses the defaults. The floor (denylist, system
+    models, credentials) is the same for all."""
+
     agent_rules: Mapping[str, AgentRule] = field(default_factory=dict)
     """Per-agent rules from the agent registry. They only ever narrow what
     the rest of this policy allows. Derived, not edited as policy."""
+
+    def for_profile(self, profile: str | None) -> PolicyConfig:
+        """This policy as it applies on ``profile``: its own model lists, if it
+        has them, in place of the defaults."""
+        lists = self.profile_lists.get(profile) if profile else None
+        return replace(self, **lists) if lists else self
 
     def validate(self) -> list[str]:
         """Config problems worth warning about at startup. Never raises —
@@ -387,7 +399,7 @@ class PolicyEngine:
 
     def evaluate(self, call: ToolCall) -> PolicyVerdict:
         reasons: list[str] = []
-        cfg = self.config
+        cfg = self.config.for_profile(call.profile)
 
         if cfg.panic:
             return PolicyVerdict(

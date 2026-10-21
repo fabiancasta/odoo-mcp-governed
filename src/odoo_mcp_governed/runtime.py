@@ -305,6 +305,23 @@ class Runtime:
             log.warning("policy: %s", warning)
         return config, changed
 
+    def set_profile_lists(
+        self, profile: str, lists: dict[str, Any] | None, *, actor: str
+    ) -> list[str]:
+        """Give ``profile`` its own model lists, or ``None`` to put it back on
+        the defaults. Audited like any other policy change."""
+        if self.profiles.get(profile) is None:
+            raise ValueError(f"there is no profile named {profile!r}")
+        current = {p: {k: sorted(v) for k, v in ls.items()}
+                   for p, ls in self.policy_store.config.profile_lists.items()}
+        if lists is None:
+            current.pop(profile, None)
+        else:
+            current[profile] = {k: sorted(lists.get(k, ())) for k in
+                                ("allowed_models", "writable_models", "deletable_models")}
+        _, changed = self.update_policy({"profile_lists": current}, actor=actor)
+        return changed
+
     # -- live thresholds (the console) ---------------------------------------
 
     def _tuned_risk(self):

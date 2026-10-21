@@ -51,6 +51,18 @@ font:inherit;cursor:pointer}button.ghost{background:transparent;color:var(--acc)
 button.danger{border-color:var(--bad);background:transparent;color:var(--bad)}
 .inline{display:inline-flex;gap:6px;align-items:center;margin:0}
 .chip{display:inline-block;padding:1px 8px;border-radius:99px;background:var(--chip);font-size:12px}
+.tabs{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}.tabs a{padding:7px 14px;border-radius:99px;
+border:1px solid var(--line);background:var(--card);color:var(--ink);text-decoration:none}
+.tabs a.on{background:var(--acc);border-color:var(--acc);color:#fff}.tabs small{opacity:.75}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}
+.card{border:1px solid var(--line);border-radius:12px;padding:14px;background:var(--bg)}
+.card h3{margin:10px 0 6px;color:var(--ink);font-size:14px;display:flex;align-items:center;gap:8px}
+.card .gate{font-size:22px}.who{display:flex;gap:12px;align-items:center}.who svg{flex:none}
+.pill{display:inline-flex;align-items:center;gap:2px;margin:2px;padding:1px 2px 1px 9px;
+border-radius:99px;background:var(--chip);font-size:12px}.pill form{display:inline}
+.pill button,.plus button{padding:0 7px;border:0;background:transparent;color:var(--mute);font-size:14px}
+.pill button:hover{color:var(--bad)}.plus{display:flex;gap:4px;margin-top:8px}
+.plus input{padding:4px 7px}.plus button{border:1px solid var(--acc);color:var(--acc);font-weight:700}
 .chip.bad{color:var(--bad);font-weight:600}.chip.warn{color:var(--warn)}.chip.ok{color:var(--ok)}
 .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
 .msg{padding:9px 12px;border-radius:8px;margin:0 0 14px;border:1px solid var(--line)}
@@ -203,10 +215,12 @@ def charts_fragment(summary: dict[str, Any], *, max_risk: int) -> str:
 def permissions_page(
     *, csrf: str, groups: list[tuple[str, str, list[dict]]], policy: dict[str, Any],
     denied: frozenset[str], seen: set[str], query: str, error: str | None,
-    flash: str | None, flash_kind: str = "ok",
+    flash: str | None, flash_kind: str = "ok", profiles: Iterable = (),
+    profile: str = "", own: bool = False, read_only: bool = False,
 ) -> str:
     gates = (("r", "allowed_models", "Read"), ("w", "writable_models", "Write"),
              ("d", "deletable_models", "Delete"))
+    every_model = sorted({m["model"] for _, _, ms in groups for m in ms} - set(denied))
     lists = {key: set(policy[name]) for key, name, _ in gates}
     switches = "".join(
         f'<label class="inline"><input type="checkbox" name="all_{key}" value="1" '
@@ -260,8 +274,10 @@ def permissions_page(
         "blocked until you tick them and save.</p>" if new_total else ""
     )
     odoo_note = f'<p class="msg bad">{esc(error)}</p>' if error else ""
+    head = _profile_tabs(list(profiles), profile, own, csrf, read_only) + _quick_permissions(
+        csrf, policy, profile, every_model)
     body = (
-        "<section><h2>Permissions by app</h2><p><small>From the active Odoo's own model list. "
+        "<section><h2>Permissions by app</h2><p><small>From this profile's Odoo model list. "
         "Wizards are not shown. Write and delete imply read. The denylist always wins. Saving "
         "applies to the next call and is sealed into the audit log.</small></p>"
         f'<form method="get" action="/admin/permissions" class="inline"><input type="text" '
@@ -269,10 +285,100 @@ def permissions_page(
         '<button class="ghost" type="submit">Filter</button></form>'
         f"{odoo_note}{banner}"
         f'<form method="post" action="/admin/permissions">{csrf_field(csrf)}'
+        f'<input type="hidden" name="profile" value="{esc(profile)}">'
         f'<div class="msg">{switches}</div>' + "".join(sections)
         + '<p><button type="submit">Save permissions</button></p></form></section>'
     )
-    return page("Permissions", message(flash, flash_kind) + body)
+    body = body.replace(
+        '<form method="get" action="/admin/permissions" class="inline">',
+        '<form method="get" action="/admin/permissions" class="inline">'
+        f'<input type="hidden" name="profile" value="{esc(profile)}">', 1)
+    return page("Permissions", message(flash, flash_kind) + head + body)
+
+
+ENV_ICON = {"production": "🏭", "staging": "🧪", "development": "🛠️"}
+GATE_ICON = {"r": ("👁️", "Can read"), "w": ("✏️", "Can change"), "d": ("🗑️", "Can delete")}
+
+
+def _profile_tabs(profiles: list, profile: str, own: bool, csrf: str,
+                  read_only: bool = False) -> str:
+    if not profiles:
+        return ""
+    tabs = [f'<a href="/admin/permissions"{" class=on" if not profile else ""}>'
+            "🌐 Default <small>(every profile)</small></a>"]
+    for name, env, has_own in profiles:
+        on = " class=on" if name == profile else ""
+        tabs.append(
+            f'<a href="/admin/permissions?profile={esc(name)}"{on}>'
+            f'{ENV_ICON.get(env, "🗄️")} {esc(name)} '
+            f'<small>{"own" if has_own else "default"}</small></a>')
+    if not profile:
+        note = ("<small>These lists apply to every profile that has no permissions of its own. "
+                "Pick a profile above to give it its own.</small>")
+    elif own:
+        note = (
+            f"<small>Profile <b>{esc(profile)}</b> has its own permissions; the default lists do "
+            "not apply to it.</small> "
+            '<form method="post" action="/admin/permissions/reset" class="inline">'
+            f'{csrf_field(csrf)}<input type="hidden" name="profile" value="{esc(profile)}">'
+            '<button class="ghost" type="submit">↺ Use the default again</button></form>')
+    else:
+        note = (f"<small>Profile <b>{esc(profile)}</b> uses the default permissions shown "
+                "below. Any change made here gives it its own, starting from these.</small>")
+    if read_only:
+        note += ('<p class="msg warn">🏭 This profile is production without “allow writes”: '
+                 "agents can only read it. Change and delete below take effect only if you "
+                 "turn writes on in the profile.</p>")
+    return f'<div class="tabs">{"".join(tabs)}</div><p>{note}</p>'
+
+
+def _quick_permissions(csrf: str, policy: dict, profile: str, models: list[str]) -> str:
+    """The three gates as cards of chips: × takes a model out, + puts one in."""
+    datalist = ('<datalist id="models">'
+                + "".join(f'<option value="{esc(m)}">' for m in models) + "</datalist>")
+    hidden = (f'{csrf_field(csrf)}<input type="hidden" name="profile" value="{esc(profile)}">')
+    cards = []
+    for key, field_name in (("r", "allowed_models"), ("w", "writable_models"),
+                            ("d", "deletable_models")):
+        icon, title = GATE_ICON[key]
+        pills = "".join(
+            f'<span class="pill">{"✱ every model" if m == "*" else esc(m)}'
+            f'<form method="post" action="/admin/permissions/chip">{hidden}'
+            f'<input type="hidden" name="gate" value="{key}">'
+            f'<input type="hidden" name="model" value="{esc(m)}">'
+            f'<button name="action" value="remove" title="Remove {esc(m)}" type="submit">×</button>'
+            "</form></span>" for m in sorted(policy[field_name])
+        ) or "<small>nothing yet</small>"
+        cards.append(
+            f'<div class="card"><h3><span class="gate">{icon}</span>{title}</h3>{pills}'
+            f'<form method="post" action="/admin/permissions/chip" class="plus">{hidden}'
+            f'<input type="hidden" name="gate" value="{key}">'
+            '<input type="text" name="model" list="models" placeholder="add a model…" required>'
+            '<button name="action" value="add" type="submit" title="Add">+</button></form></div>'
+        )
+    return ("<section><h2>Quick view</h2><p><small>Change and delete include read; removing "
+            "read removes change and delete too. The denylist always wins.</small></p>"
+            f'<div class="cards">{"".join(cards)}</div>{datalist}</section>')
+
+
+def avatar(name: str, size: int = 46) -> str:
+    """A small robot drawn from the agent's name, so each agent looks like itself."""
+    h = sum(ord(c) * (i + 7) for i, c in enumerate(name)) % 360
+    mouth = ("M15 31 q9 6 18 0" if h % 3 == 0 else "M15 31 h18" if h % 3 == 1
+             else "M15 33 q9 -5 18 0")
+    return (
+        f'<svg width="{size}" height="{size}" viewBox="0 0 48 48" aria-hidden="true">'
+        f'<line x1="24" y1="3" x2="24" y2="10" stroke="hsl({h} 55% 45%)" stroke-width="2"/>'
+        f'<circle cx="24" cy="4" r="3" fill="hsl({(h + 40) % 360} 75% 55%)"/>'
+        f'<rect x="6" y="10" width="36" height="30" rx="9" fill="hsl({h} 60% 52%)"/>'
+        f'<rect x="2" y="20" width="4" height="10" rx="2" fill="hsl({h} 55% 40%)"/>'
+        f'<rect x="42" y="20" width="4" height="10" rx="2" fill="hsl({h} 55% 40%)"/>'
+        '<circle cx="17" cy="22" r="4.5" fill="#fff"/><circle cx="31" cy="22" r="4.5" '
+        'fill="#fff"/><circle cx="18" cy="23" r="2" fill="#1d2330"/>'
+        '<circle cx="32" cy="23" r="2" fill="#1d2330"/>'
+        f'<path d="{mouth}" stroke="#fff" stroke-width="2.4" fill="none" '
+        'stroke-linecap="round"/></svg>'
+    )
 
 
 def _status_cls(r: dict) -> str:
@@ -971,7 +1077,8 @@ def audit_page(
 def agents_page(*, csrf: str, rules: dict, tokens: list[dict], profiles: list[str],
                 tools: list[str], issued: dict | None = None, edit: Any = None,
                 flash: str | None = None, flash_kind: str = "ok",
-                require_registered: bool = False) -> str:
+                require_registered: bool = False, selected: str = "",
+                read_only_profiles: frozenset[str] = frozenset()) -> str:
     """The agent registry: one rule per agent, every token it holds."""
     shown = ""
     if issued:
@@ -986,16 +1093,55 @@ def agents_page(*, csrf: str, rules: dict, tokens: list[dict], profiles: list[st
     def chips(values, empty: str) -> str:
         return " ".join(f"<code>{esc(v)}</code>" for v in sorted(values)) or empty
 
-    rows = "".join(
-        f'<tr><td><b>{esc(name)}</b><br><small>{esc(r.note)}</small></td>'
-        f'<td>{chips(r.models, "policy")}</td><td>{chips(r.tools, "all")}</td>'
-        f'<td>{"read-only" if r.read_only else "policy"}</td>'
-        f'<td>{esc(r.daily_quota) if r.daily_quota else "—"}</td>'
-        f'<td>{esc(r.profile) or "token / active"}</td>'
-        f'<td>{chips(r.scope, "all records")}</td>'
-        f'<td><a href="/admin/agents?edit={esc(name)}">Edit</a></td></tr>'
-        for name, r in sorted(rules.items())
-    ) or "<tr><td colspan=8>No agent rules yet: every agent follows the server policy.</td></tr>"
+    def model_pills(r) -> str:
+        hidden = f'{csrf_field(csrf)}<input type="hidden" name="name" value="{esc(r.name)}">'
+        pills = "".join(
+            f'<span class="pill">{esc(m)}<form method="post" action="/admin/agents/model">'
+            f'{hidden}<input type="hidden" name="model" value="{esc(m)}">'
+            '<button name="action" value="remove" type="submit" title="Remove">×</button>'
+            "</form></span>" for m in sorted(r.models)
+        ) or "<small>every model the policy allows</small>"
+        return (
+            f'{pills}<form method="post" action="/admin/agents/model" class="plus">{hidden}'
+            '<input type="text" name="model" placeholder="limit to a model…" required>'
+            '<button name="action" value="add" type="submit" title="Add">+</button></form>'
+        )
+
+    def card(name: str, r) -> str:
+        badges = " ".join(b for b in (
+            '<span class="chip warn">👁️ read-only</span>' if r.read_only else
+            '<span class="chip warn">🏭 read-only (production)</span>'
+            if r.profile in read_only_profiles else '<span class="chip ok">✏️ may write</span>',
+            f'<span class="chip">⏱️ {esc(r.daily_quota)}/day</span>' if r.daily_quota else "",
+            f'<span class="chip">📌 {esc(r.profile)}</span>' if r.profile else "",
+            '<span class="chip">🔐 own records only</span>' if r.scope else "",
+        ) if b)
+        return (
+            f'<div class="card"><div class="who">{avatar(name)}<div><b>{esc(name)}</b><br>'
+            f'<small>{esc(r.note)}</small></div></div><p>{badges}</p>'
+            f'<h3>🧩 Models</h3>{model_pills(r)}'
+            f'<h3>🛠️ Tools</h3>{chips(r.tools, "<small>all</small>")}'
+            + (f'<h3>🔐 Scope</h3>{chips(r.scope, "")}' if r.scope else "")
+            + f'<p><a href="/admin/agents?edit={esc(name)}">✎ Edit rule</a></p></div>'
+        )
+
+    pins = sorted({r.profile for r in rules.values() if r.profile})
+    tab = (selected or "").strip()
+    tabs = "" if not pins else (
+        '<div class="tabs">'
+        f'<a href="/admin/agents"{" class=on" if not tab else ""}>🤖 All</a>'
+        + "".join(f'<a href="/admin/agents?tab={esc(p)}"{" class=on" if tab == p else ""}>'
+                  f"📌 {esc(p)}</a>" for p in pins)
+        + f'<a href="/admin/agents?tab=-"{" class=on" if tab == "-" else ""}>🌐 not pinned</a>'
+        "</div>"
+    )
+    shown_rules = {n: r for n, r in rules.items()
+                   if not tab or (tab == "-" and not r.profile) or r.profile == tab}
+    rows = tabs + (
+        '<div class="cards">' + "".join(card(n, r) for n, r in sorted(shown_rules.items()))
+        + "</div>" if shown_rules
+        else "<p>No agent rules here yet: these agents follow the server policy.</p>"
+    )
 
     def token_row(t: dict) -> str:
         state = (f'<span class="chip bad">revoked {esc(t["revoked_at"][:10])}</span>'
@@ -1034,9 +1180,7 @@ def agents_page(*, csrf: str, rules: dict, tokens: list[dict], profiles: list[st
         message(flash, flash_kind) + shown
         + '<section><h2>Agents</h2><p><small>A rule only takes away: it can never reach '
         "what the server policy denies. Empty fields mean “as the policy says”.</small></p>"
-        '<div class="wrap"><table><tr><th>Agent</th><th>Models</th><th>Tools</th>'
-        "<th>Writes</th><th>Calls/day</th><th>Profile</th><th>Record scope</th><th></th></tr>"
-        f"{rows}</table></div></section>"
+        f"{rows}</section>"
         f'<section><h2>{"Edit" if e else "New"} agent rule</h2>'
         f'<form method="post" action="/admin/agents/save">{csrf_field(csrf)}'
         '<div class=row><div><label>Agent name (token subject)</label>'

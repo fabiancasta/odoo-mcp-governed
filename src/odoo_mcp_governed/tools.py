@@ -219,7 +219,8 @@ class ToolContext:
 
     @property
     def policy(self):
-        return self.runtime.engine.policy.config
+        """The policy as it applies on this call's profile."""
+        return self.runtime.engine.policy.config.for_profile(self.snapshot.profile.name)
 
     def redact(self, records: Any, model: str | None = None) -> Any:
         """Drop credential-like keys from returned records, whatever was asked.
