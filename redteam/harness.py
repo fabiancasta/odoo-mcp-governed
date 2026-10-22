@@ -147,8 +147,8 @@ class Harness:
         for group, attack in (
             ("rt-denylist", self.denylist), ("rt-credentials", self.credentials),
             ("rt-attachments", self.attachments), ("rt-bypass", self.wizards_and_methods),
-            ("rt-probe", self.probing), ("rt-transport", self.transport),
             ("rt-registry", self.registry), ("rt-scope", self.record_scope),
+            ("rt-probe", self.probing), ("rt-transport", self.transport),
             ("rt-operator", self.operator_controls), ("rt-burst", self.delete_burst),
         ):
             self.new_agent(f"{group}-{int(time.time())}")
@@ -297,6 +297,13 @@ class Harness:
         is_error, text = self.tool("server_status")
         self.check(g, "unblock this agent", "allowed", not is_error, text)
 
+    @staticmethod
+    def auth_refused(text: str) -> bool:
+        """Refused at the door: 401, or 429 once this IP has failed too often —
+        the server answers 429 only to failed authentication, never to a valid
+        token."""
+        return text.startswith(("HTTP 401", "HTTP 429"))
+
     def registry(self) -> None:
         """Archived agents stay out, whatever else happens to them."""
         g = "registry"
@@ -312,7 +319,7 @@ class Harness:
                         confirm="yes")
         is_error, text = self.tool("server_status")
         self.check(g, "an archived agent's token is refused", "refused",
-                   is_error and "401" in text, text)
+                   is_error and self.auth_refused(text), text)
         page = self.admin_post(session, "/admin/token/regenerate", actor=victim, label="rt")
         issued = re.search(r'class="mono"[^>]*>(eyJ[\w-]+\.[\w-]+\.[\w-]+)<', page)
         self.check(g, "no token is issued to an archived agent", "refused",
@@ -320,11 +327,11 @@ class Harness:
         self.admin_post(session, "/admin/actor/unblock", actor=victim)
         is_error, text = self.tool("server_status")
         self.check(g, "unblocking it by hand does not reopen it", "refused",
-                   is_error and "401" in text, text)
+                   is_error and self.auth_refused(text), text)
         self.admin_post(session, "/admin/agents/archive", name=victim, action="restore")
         is_error, text = self.tool("server_status")
         self.check(g, "restoring brings no old token back", "refused",
-                   is_error and "401" in text, text)
+                   is_error and self.auth_refused(text), text)
         time.sleep(1.1)  # a new token must be issued after the restore's cut-off second
         self.new_agent(victim)
         is_error, text = self.tool("server_status")
@@ -332,7 +339,7 @@ class Harness:
         self.admin_post(session, "/admin/agents/revoke", name=victim, confirm="yes")
         is_error, text = self.tool("server_status")
         self.check(g, "revoke all: the agent's token stops", "refused",
-                   is_error and "401" in text, text)
+                   is_error and self.auth_refused(text), text)
 
     def record_scope(self) -> None:
         """A bot scoped to one customer sees that customer and nobody else."""
