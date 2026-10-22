@@ -117,10 +117,10 @@ class Harness:
         self._session = (opener, match.group(1)) if match else None
         return self._session
 
-    def admin_post(self, session, path: str, **form: str) -> None:
+    def admin_post(self, session, path: str, **form: str) -> str:
         opener, csrf = session
         data = urllib.parse.urlencode({"csrf": csrf, **form}).encode()
-        opener.open(self.url + path, data=data, timeout=30)
+        return opener.open(self.url + path, data=data, timeout=30).read().decode()
 
     # -- attacks ----------------------------------------------------------
 
@@ -129,10 +129,11 @@ class Harness:
         session = self.admin()
         if session is None:
             return
-        self.admin_post(session, "/admin/token/regenerate", actor=name, confirm="yes")
-        opener, _ = session
-        page = opener.open(self.url + "/token", timeout=30).read().decode()
-        match = re.search(r'class="mono">(eyJ[\w-]+\.[\w-]+\.[\w-]+)<', page)
+        # "Connect a client" shows a new token once, in its own response:
+        # the server keeps no copy to read back later.
+        page = self.admin_post(session, "/admin/token/regenerate", actor=name,
+                               label="red team")
+        match = re.search(r'class="mono"[^>]*>(eyJ[\w-]+\.[\w-]+\.[\w-]+)<', page)
         if match:
             self.token = match.group(1)
 
