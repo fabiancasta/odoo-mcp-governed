@@ -148,6 +148,7 @@ class Harness:
             ("rt-denylist", self.denylist), ("rt-credentials", self.credentials),
             ("rt-attachments", self.attachments), ("rt-bypass", self.wizards_and_methods),
             ("rt-probe", self.probing), ("rt-transport", self.transport),
+            ("rt-registry", self.registry), ("rt-scope", self.record_scope),
             ("rt-operator", self.operator_controls), ("rt-burst", self.delete_burst),
         ):
             self.new_agent(f"{group}-{int(time.time())}")
@@ -295,6 +296,83 @@ class Harness:
         self.admin_post(session, "/admin/actor/unblock", actor=self.actor_name)
         is_error, text = self.tool("server_status")
         self.check(g, "unblock this agent", "allowed", not is_error, text)
+
+    def registry(self) -> None:
+        """Archived agents stay out, whatever else happens to them."""
+        g = "registry"
+        session = self.admin()
+        if session is None:
+            self.check(g, "agent registry (needs --admin-password)", "skipped", True, "skipped")
+            return
+        victim = f"rt-archived-{int(time.time())}"
+        self.new_agent(victim)
+        is_error, text = self.tool("server_status")
+        self.check(g, "a fresh agent's token works", "allowed", not is_error, text)
+        self.admin_post(session, "/admin/agents/archive", name=victim, action="archive",
+                        confirm="yes")
+        is_error, text = self.tool("server_status")
+        self.check(g, "an archived agent's token is refused", "refused",
+                   is_error and "401" in text, text)
+        page = self.admin_post(session, "/admin/token/regenerate", actor=victim, label="rt")
+        issued = re.search(r'class="mono"[^>]*>(eyJ[\w-]+\.[\w-]+\.[\w-]+)<', page)
+        self.check(g, "no token is issued to an archived agent", "refused",
+                   issued is None and "is archived" in page, "issued" if issued else "refused")
+        self.admin_post(session, "/admin/actor/unblock", actor=victim)
+        is_error, text = self.tool("server_status")
+        self.check(g, "unblocking it by hand does not reopen it", "refused",
+                   is_error and "401" in text, text)
+        self.admin_post(session, "/admin/agents/archive", name=victim, action="restore")
+        is_error, text = self.tool("server_status")
+        self.check(g, "restoring brings no old token back", "refused",
+                   is_error and "401" in text, text)
+        time.sleep(1.1)  # a new token must be issued after the restore's cut-off second
+        self.new_agent(victim)
+        is_error, text = self.tool("server_status")
+        self.check(g, "a token issued after restoring works", "allowed", not is_error, text)
+        self.admin_post(session, "/admin/agents/revoke", name=victim, confirm="yes")
+        is_error, text = self.tool("server_status")
+        self.check(g, "revoke all: the agent's token stops", "refused",
+                   is_error and "401" in text, text)
+
+    def record_scope(self) -> None:
+        """A bot scoped to one customer sees that customer and nobody else."""
+        g = "scope"
+        session = self.admin()
+        if session is None:
+            self.check(g, "record scope (needs --admin-password)", "skipped", True, "skipped")
+            return
+        is_error, text = self.tool("search_records", model="res.partner", fields=["name"],
+                                   limit=2, order="id")
+        rows = [] if is_error else json.loads(text).get("records", [])
+        if len(rows) < 2:
+            self.check(g, "two partners to test with", ">= 2", False, text)
+            return
+        mine, other = rows[0]["id"], rows[1]["id"]
+        bot = f"rt-scoped-{int(time.time())}"
+        scope = json.dumps({"res.partner": [["id", "=", "{partner}"]]})
+        self.admin_post(session, "/admin/agents/save", name=bot, scope=scope, read_only="yes")
+        page = self.admin_post(session, "/admin/agents/token", name=bot, vars=f"partner={mine}")
+        match = re.search(r'class="mono"[^>]*>(eyJ[\w-]+\.[\w-]+\.[\w-]+)<', page)
+        if not match:
+            self.check(g, "scoped token issued", "issued", False, page[:200])
+            return
+        self.token = match.group(1)
+        is_error, text = self.tool("search_records", model="res.partner", fields=["name"])
+        ids = [] if is_error else [r["id"] for r in json.loads(text).get("records", [])]
+        self.check(g, "search sees only its own customer", "[mine]", ids == [mine], str(ids))
+        self.refused(g, "reading another customer is refused", "get_record",
+                     model="res.partner", record_id=other)
+        is_error, text = self.tool("search_count", model="res.partner",
+                                   domain=["|", ["id", "=", other], ["id", "=", mine]])
+        count = None if is_error else json.loads(text).get("count")
+        self.check(g, "an OR in the domain cannot widen the scope", "1", count == 1, text)
+        is_error, text = self.tool("search_count", model="res.partner",
+                                   domain=["|", ["id", "=", other]])
+        self.check(g, "an unbalanced OR is refused", "error", is_error, text)
+        self.refused(g, "models outside the scope are refused", "search_records",
+                     model="sale.order", fields=["name"])
+        self.refused(g, "a read-only bot cannot write", "update_record", model="res.partner",
+                     record_id=mine, values={"comment": "rt"})
 
     @property
     def actor_name(self) -> str:
