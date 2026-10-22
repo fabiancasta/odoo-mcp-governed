@@ -13,7 +13,7 @@ leaked — and is built so that when that happens the damage is bounded and the
 evidence survives.
 
 > **Status:** v0.3 — all 19 tools, stdio and HTTP transports, admin panel and
-> Docker deployment work end to end against Odoo 19. 532 tests, 15 of them clicking through the panel in a real browser.
+> Docker deployment work end to end against Odoo 19. 537 tests, 15 of them clicking through the panel in a real browser.
 
 ## What the operator gets
 
@@ -29,6 +29,7 @@ evidence survives.
 | **Sandbox profiles** | For test databases: model lists off and risk only observed, while the denylist, credential fields and audit stay on. Never on production. |
 | **Activity report** | A printable "what your AI did" page per client and period — counts, refusals, changes — with no record values, ready to send as a PDF. |
 | **Several clients** | Pin each agent's token to its client's Odoo profile; switching the active profile can never send it to another client's database. |
+| **Two layers, in plain words** | The Permissions page first shows what Odoo itself lets the profile's user do — asked of Odoo, per app — then three brakes on every agent: may change, may delete, a person approves deletes and bulk changes. Passwords, keys, certificates, modules, code, users and settings stay out whatever the switches say. Per-app and per-model lists are under Advanced. |
 | **Permissions per profile** | One server, several Odoo (Spain, Colombia…): each profile can have its own lists, or follow the default ones. Each app gets one level in one click — none, read, change, delete — with a selector per model to fine-tune, a search box, and Odoo's system models kept apart. |
 | **Archive or delete agents** | Revokes every token, blocks the agent and hides it; restore any time. The audit log keeps its history. |
 | **Clickable dashboard** | Tabs (summary, Odoo profiles, policy). Every number, bar, refusal kind and model opens the audit log filtered to exactly those events. |
@@ -361,7 +362,7 @@ valid agents on the same IP) and the canaries found a content leak
 
 ## Tests
 
-The suite has 532 tests (`pytest tests/e2e` drives the panel in Chromium with Playwright). The ones that matter are not the
+The suite has 537 tests (`pytest tests/e2e` drives the panel in Chromium with Playwright). The ones that matter are not the
 "it records events" kind — they are the adversarial ones:
 
 ```bash

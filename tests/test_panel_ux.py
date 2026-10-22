@@ -411,3 +411,69 @@ class TestArchiveIsFinal:
         assert self.status(client, old) == 401
         time.sleep(1.1)
         assert self.status(client, runtime.issue_agent_token("claude", actor="a")["token"]) == 200
+
+
+class TestTwoLayers:
+    """Odoo's own rights first, then three brakes — not hundreds of ticks."""
+
+    def setup(self, tmp_path):
+        runtime, client, csrf = perm_app(tmp_path)
+        runtime.cache.get_or_set(("default", "permissions", "mirror"), lambda: [
+            {"icon": "👥", "title": "Contacts", "model": "res.partner", "read": True,
+             "create": True, "write": True, "unlink": False}])
+        return runtime, client, csrf
+
+    def test_the_page_shows_what_odoo_allows(self, tmp_path) -> None:
+        _, client, _ = self.setup(tmp_path)
+        page = client.get("/admin/permissions").text
+        assert "What Odoo lets" in page and "Contacts" in page
+        assert "Brakes on every agent here" in page and "Never, whatever the switches" in page
+
+    def test_switches_follow_odoo_and_add_brakes(self, tmp_path) -> None:
+        runtime, client, csrf = self.setup(tmp_path)
+        client.post("/admin/permissions/brakes", data={"csrf": csrf, "switch": "follow",
+                                                       "value": "on"})
+        cfg = runtime.engine.policy.config
+        assert cfg.allowed_models == {"*"} and not cfg.writable_models
+        assert not cfg.deletable_models
+        client.post("/admin/permissions/brakes", data={"csrf": csrf, "switch": "changes",
+                                                       "value": "on"})
+        assert runtime.engine.policy.config.writable_models == {"*"}
+        client.post("/admin/permissions/brakes", data={"csrf": csrf, "switch": "deletes",
+                                                       "value": "on"})
+        assert runtime.engine.policy.config.deletable_models == {"*"}
+        # Turning changes off takes deleting with it.
+        client.post("/admin/permissions/brakes", data={"csrf": csrf, "switch": "changes",
+                                                       "value": "off"})
+        cfg = runtime.engine.policy.config
+        assert not cfg.writable_models and not cfg.deletable_models
+
+    def test_following_odoo_still_never_reaches_system_models(self, tmp_path, clock) -> None:
+        from odoo_mcp_governed.governance import Operation
+
+        from .conftest import make_call
+        runtime, client, csrf = self.setup(tmp_path)
+        client.post("/admin/permissions/brakes", data={"csrf": csrf, "switch": "deletes",
+                                                       "value": "on"})
+        engine = runtime.engine.policy
+        assert "system_model" in engine.evaluate(make_call(clock, model="res.users")).codes
+        assert "model_denied" in engine.evaluate(make_call(
+            clock, model="ir.config_parameter")).codes
+        assert engine.evaluate(make_call(clock, model="res.partner")).allowed
+        # The profile is production without writes: the switch cannot override that.
+        assert "profile_read_only" in engine.evaluate(make_call(
+            clock, model="res.partner", operation=Operation.DELETE)).codes
+
+    def test_the_approval_switch(self, tmp_path) -> None:
+        runtime, client, csrf = self.setup(tmp_path)
+        client.post("/admin/permissions/brakes", data={"csrf": csrf, "switch": "approvals",
+                                                       "value": "on"})
+        assert {"delete", "bulk"} <= runtime.engine.policy.config.approval_required
+        client.post("/admin/permissions/brakes", data={"csrf": csrf, "switch": "approvals",
+                                                       "value": "off"})
+        assert not runtime.engine.policy.config.approval_required
+
+    def test_custom_lists_say_so_and_can_go_back(self, tmp_path) -> None:
+        _, client, csrf = self.setup(tmp_path)
+        page = client.get("/admin/permissions").text  # make_settings: res.partner only
+        assert "custom model lists" in page and "Follow Odoo’s rights again" in page

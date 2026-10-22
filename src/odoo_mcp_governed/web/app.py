@@ -745,6 +745,9 @@ def create_app(runtime: Runtime) -> FastAPI:
         flash, kind = FLASH.get(m or "", (None, "ok"))
         tabs = [(p["name"], p.get("environment", ""), p["name"] in cfg.profile_lists)
                 for p in runtime.profiles.public()]
+        lists = {k: set(v) for k, v in lists_for(profile).items()}
+        mirror, settings_access, user, production = await run_in_threadpool(
+            odoo_mirror, profile, models)
         return HTMLResponse(views.permissions_page(
             csrf=session.csrf, groups=permissions.group(models if isinstance(models, list)
                                                         else [], q),
@@ -754,7 +757,81 @@ def create_app(runtime: Runtime) -> FastAPI:
             error=error, flash=flash, flash_kind=kind, profiles=tabs, profile=profile,
             own=profile in cfg.profile_lists,
             read_only=bool(profile) and profile in runtime.profiles.read_only_names(),
+            following=views.follow_mode(lists)[0],
+            top=views.brakes_section(
+                csrf=session.csrf, profile=profile, user=user, mirror=mirror,
+                settings_access=settings_access, lists=lists,
+                approvals=runtime.policy_store.config.approval_required,
+                read_only=(profile or runtime.profile_name) in runtime.profiles.read_only_names(),
+                production=production),
         ))
+
+    def odoo_mirror(profile: str, models: Any):
+        """What the profile's own Odoo user may do with the main business apps,
+        asked of Odoo itself. ``(rows, settings_access, user, production)``."""
+        try:
+            snap = runtime.snapshot_for(profile or None)
+        except Exception:  # noqa: BLE001 - shown as "unknown"
+            return None, None, "?", False
+        installed = {str(x.get("model")) for x in models if isinstance(x, dict)} \
+            if isinstance(models, list) else set()
+
+        def build():
+            rows = []
+            for icon, title, model in views.KEY_APPS:
+                if model not in installed:
+                    continue
+                row = {"icon": icon, "title": title, "model": model}
+                for op in ("read", "create", "write", "unlink"):
+                    try:
+                        row[op] = bool(snap.client.execute(model, "has_access", [[], op]))
+                    except Exception:  # noqa: BLE001 - older Odoo, then unknown
+                        try:
+                            row[op] = bool(snap.client.execute(
+                                model, "check_access_rights", [op, False]))
+                        except Exception:  # noqa: BLE001
+                            row[op] = None
+                rows.append(row)
+            return rows
+
+        rows = runtime.cache.get_or_set((snap.profile.name, "permissions", "mirror"), build) \
+            if installed else None
+        return (rows, snap.settings_access(), snap.profile.username,
+                snap.profile.environment == "production")
+
+    @app.post("/admin/permissions/brakes")
+    async def permissions_brakes(request: Request):
+        """The three switches: governed's brakes on top of Odoo's own rights."""
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf", "/admin/permissions")
+        profile = target_profile(form.get("profile"))
+        switch, on = str(form.get("switch") or ""), form.get("value") == "on"
+        if switch == "approvals":
+            kinds = set(runtime.policy_store.config.approval_required)
+            kinds = kinds | {"delete", "bulk"} if on else kinds - {"delete", "bulk"}
+            await run_in_threadpool(lambda: runtime.update_policy(
+                {"approval_required": sorted(kinds)}, actor=admin_actor(request)))
+            return to_permissions("permissions_saved", profile)
+        if switch not in ("changes", "deletes", "follow"):
+            return to_permissions("permissions_error", profile)
+        lists = {k: set(v) for k, v in lists_for(profile).items()}
+        following, changes, deletes = views.follow_mode(lists)
+        if switch == "follow" or not following:
+            changes, deletes = False, False
+        if switch == "changes":
+            changes = on
+            deletes = deletes and on  # no deleting without changing
+        elif switch == "deletes":
+            deletes = on
+            changes = changes or on
+        star = {"*"}
+        new = {"allowed_models": star, "writable_models": star if changes else set(),
+               "deletable_models": star if deletes else set()}
+        await run_in_threadpool(save_lists, profile, new, admin_actor(request))
+        return to_permissions("permissions_saved", profile)
 
     def mark_seen(profile: str, models: list[str]) -> None:
         seen = seen_models()

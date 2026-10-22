@@ -93,6 +93,17 @@ background:var(--card);color:var(--ink);padding:7px 2px;font-size:12px;white-spa
 .levels button:last-child{border-right:0}.levels button.on{background:var(--acc);color:#fff}
 .levels button:hover{background:var(--chip)}.levels button.on:hover{background:var(--acc)}
 #perm-filter{max-width:320px}table.compact select{width:auto}
+.layers{display:grid;grid-template-columns:1fr 1fr;gap:18px}.layer h2{font-size:15px}
+.mirror td,.mirror th{text-align:center}.mirror td:first-child,.mirror th:first-child{text-align:left}
+.brakes{display:flex;flex-direction:column;gap:10px;margin:6px 0 12px}
+.brake{display:flex;justify-content:space-between;align-items:center;gap:12px;
+border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--bg)}
+.brake small{display:block;color:var(--mute)}.brake.on{border-color:var(--ok)}
+.toggle{min-width:64px;font-weight:700;background:var(--chip);color:var(--mute);border-color:var(--line)}
+.brake.on .toggle{background:var(--ok);border-color:var(--ok);color:#fff}
+.never{background:var(--chip);border-radius:8px;padding:8px 10px;font-size:13px}
+.mute{color:var(--mute)}
+@media (max-width:900px){.layers{grid-template-columns:1fr}}
 .tabs{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}.tabs a{padding:7px 14px;border-radius:99px;
 border:1px solid var(--line);background:var(--card);color:var(--ink);text-decoration:none}
 .tabs a.on{background:var(--acc);border-color:var(--acc);color:#fff}.tabs small{opacity:.75}
@@ -277,11 +288,114 @@ def charts_fragment(summary: dict[str, Any], *, max_risk: int) -> str:
     )
 
 
+KEY_APPS = (
+    ("👥", "Contacts", "res.partner"), ("📦", "Products", "product.template"),
+    ("💼", "Sales", "sale.order"), ("🎯", "CRM", "crm.lead"),
+    ("🧾", "Invoices", "account.move"), ("💳", "Payments", "account.payment"),
+    ("🏬", "Inventory", "stock.picking"), ("🛒", "Purchases", "purchase.order"),
+    ("🧑‍💼", "Point of Sale", "pos.order"), ("📋", "Projects", "project.task"),
+    ("🪪", "Employees", "hr.employee"), ("📅", "Calendar", "calendar.event"),
+)
+"""The apps a business agent works with, each by its main model. The mirror
+shows what the profile's own Odoo user may do with them."""
+
+
+def follow_mode(lists: dict[str, set[str]]) -> tuple[bool, bool, bool]:
+    """``(following_odoo, changes, deletes)``: governed only adds brakes on top
+    of Odoo's own rights when every business model is open to read."""
+    star = {WILDCARD}
+    following = lists["allowed_models"] == star and lists["writable_models"] in (set(), star) \
+        and lists["deletable_models"] in (set(), star)
+    return following, lists["writable_models"] == star, lists["deletable_models"] == star
+
+
+def brakes_section(*, csrf: str, profile: str, user: str, mirror: list[dict] | None,
+                   settings_access: bool | None, lists: dict[str, set[str]],
+                   approvals: frozenset[str], read_only: bool, production: bool) -> str:
+    """Two layers, in the order a person thinks about them: what Odoo allows
+    this profile's user, then the brakes governed puts on every agent."""
+    hidden = f'{csrf_field(csrf)}<input type="hidden" name="profile" value="{esc(profile)}">'
+    tick = {True: '<span class="ok">✔</span>', False: '<span class="bad">✘</span>',
+            None: '<span class="mute">?</span>'}
+    if mirror is None:
+        table = ('<p class="msg bad">Odoo could not be asked what this user may do (is it '
+                 "reachable?).</p>")
+    else:
+        rows = "".join(
+            f'<tr><td>{icon} {esc(title)} <small><code>{esc(model)}</code></small></td>'
+            + "".join(f"<td>{tick[r[op]]}</td>" for op in ("read", "create", "write", "unlink"))
+            + "</tr>"
+            for icon, title, model, r in ((m["icon"], m["title"], m["model"], m)
+                                          for m in mirror)
+        ) or "<tr><td colspan=5>None of the usual business apps is installed.</td></tr>"
+        table = (
+            '<div class="wrap"><table class="compact mirror"><tr><th>App</th><th>👁️ See</th>'
+            f"<th>➕ Create</th><th>✏️ Change</th><th>🗑️ Delete</th></tr>{rows}</table></div>")
+    if settings_access:
+        who = (f'<p class="msg bad">⚠️ <b>{esc(user)}</b> has Settings access: Odoo will not '
+               "stop an agent that uses it. "
+               + ("On production governed refuses “follow Odoo” for such a user. " if production
+                  else "")
+               + "Connect this profile with a least-privilege user such as "
+               "<code>mcp_agent</code> instead.</p>")
+    elif settings_access is False:
+        who = (f'<p class="msg ok">✔ <b>{esc(user)}</b> is a least-privilege user: Odoo itself '
+               "enforces the table below, whatever happens in governed.</p>")
+    else:
+        who = ""
+    following, changes, deletes = follow_mode(lists)
+
+    def switch(name: str, on: bool, icon: str, title: str, hint: str,
+               action: str = "/admin/permissions/brakes") -> str:
+        return (
+            f'<form method="post" action="{action}" class="brake{" on" if on else ""}">'
+            f'{hidden}<input type="hidden" name="switch" value="{name}">'
+            f'<input type="hidden" name="value" value="{"off" if on else "on"}">'
+            f'<div><b>{icon} {esc(title)}</b><small>{esc(hint)}</small></div>'
+            f'<button type="submit" class="toggle" aria-pressed="{"true" if on else "false"}">'
+            f'{"ON" if on else "OFF"}</button></form>'
+        )
+
+    if read_only:
+        brakes = ('<p class="msg warn">🏭 This profile is production without “allow writes”: '
+                  "agents only read, whatever these switches say.</p>")
+    else:
+        brakes = ""
+    approvals_on = {"delete", "bulk"} <= set(approvals)
+    brakes += (
+        '<div class="brakes">'
+        + switch("changes", changes, "✏️", "Agents may change records",
+                 "create and edit what the Odoo user may — never more")
+        + switch("deletes", deletes, "🗑️", "Agents may delete records",
+                 "off is the safe default: deleting is rarely an agent's job")
+        + switch("approvals", approvals_on, "✋", "A person approves deletes and bulk changes",
+                 "every profile: the agent waits, you approve in Approvals")
+        + "</div>"
+    )
+    custom = "" if following else (
+        '<p class="msg warn">This profile uses custom model lists (see “Advanced” below), so '
+        "the switches above are not in charge. "
+        f'<form method="post" action="/admin/permissions/brakes" class="inline">{hidden}'
+        '<input type="hidden" name="switch" value="follow"><input type="hidden" name="value" '
+        'value="on"><button type="submit">Follow Odoo’s rights again</button></form></p>')
+    return (
+        '<section class="layers"><div class="layer"><h2>1 · What Odoo lets '
+        f'<code>{esc(user)}</code> do</h2>{who}{table}<p><small>To change this, change the '
+        f"user’s groups in Odoo (Settings → Users → {esc(user)}). It is the strongest layer: "
+        "Odoo enforces it even if governed were bypassed.</small></p></div>"
+        '<div class="layer"><h2>2 · Brakes on every agent here</h2>'
+        f"{brakes}{custom}"
+        '<p class="never">🔒 <b>Never, whatever the switches:</b> passwords, API keys, '
+        "certificates and keys, modules, code, users and settings.</p></div></section>"
+    )
+
+
 def permissions_page(
     *, csrf: str, groups: list[tuple[str, str, list[dict]]], policy: dict[str, Any],
     denied: frozenset[str], seen: set[str], query: str, error: str | None,
     flash: str | None, flash_kind: str = "ok", profiles: Iterable = (),
-    profile: str = "", own: bool = False, read_only: bool = False,
+    profile: str = "", own: bool = False, read_only: bool = False, top: str = "",
+    following: bool = False,
 ) -> str:
     """Permissions as apps with one level each, not hundreds of checkboxes.
 
@@ -399,14 +513,17 @@ def permissions_page(
     )
     legend = " ".join(f"<span>{icon} {label}</span>" for _, icon, label in LEVELS)
     body = (
-        _profile_tabs(list(profiles), profile, own, csrf, read_only)
+        _profile_tabs(list(profiles), profile, own, csrf, read_only) + top
+        + f'<details class="card-like limit"{"" if following else " open"}><summary><b>⚙️ '
+        "Advanced: limit agents to some apps or models</b> <small>only if you need less than "
+        "the Odoo user may do</small></summary>"
         + odoo_note + banner + star_note
         + '<section><div class="spread"><h2>Apps</h2><input type="search" id="perm-filter" '
         f'placeholder="Find an app or model…" value="{esc(query)}" aria-label="Filter apps">'
         f'</div><p class="sum">{legend} <small>— each level includes the ones before it. One '
         "click sets every model of the app.</small></p>"
         f'<div class="apps">{"".join(cards) or "<p>No models to show.</p>"}</div></section>'
-        + system + advanced
+        + system + advanced + "</details>"
     )
     return page("Permissions", message(flash, flash_kind) + body)
 
