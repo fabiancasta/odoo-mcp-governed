@@ -25,11 +25,23 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
-from .approvals import ApprovalStore, needs_approval, needs_configurator_approval
+from .approvals import (
+    MAX_PENDING_PER_AGENT,
+    ApprovalLimit,
+    ApprovalStore,
+    needs_approval,
+    needs_configurator_approval,
+)
 from .audit import AuditLog
 from .detectors import DetectionContext, Detector, DetectorConfig, default_detectors
 from .events import AuditEvent, Decision, Operation, Outcome, Signal, ToolCall, utcnow
-from .policy import REASON_SEPARATOR, PolicyEngine, PolicyVerdict, reason_code
+from .policy import (
+    CONTENT_INJECTION,
+    REASON_SEPARATOR,
+    PolicyEngine,
+    PolicyVerdict,
+    reason_code,
+)
 
 RISK_BLOCK = "risk_block"
 
@@ -397,15 +409,35 @@ class GovernanceEngine:
         """
         call, cfg = judgement.call, self.policy.config
         configurator = call.profile in cfg.configurator_profiles
-        if self.approvals is None or (call.profile in cfg.sandbox_profiles and not configurator):
+        if call.profile in cfg.sandbox_profiles and not configurator:
             return judgement
-        required = needs_approval(call, cfg.approval_required, cfg.approval_bulk_threshold) or (
+        changes = call.operation.mutates or call.operation is Operation.EXECUTE
+        # Injected instructions are the one case a person always decides: text
+        # addressed to an AI written into a record, or any change an agent
+        # makes shortly after it read such text — it may be following it.
+        injected = changes and (CONTENT_INJECTION in call.fields_touched
+                                or self._recently_injected(call.actor))
+        required = injected or needs_approval(
+            call, cfg.approval_required, cfg.approval_bulk_threshold) or (
             configurator and cfg.configurator_approvals and needs_configurator_approval(call)
         )
-        if not required or self.approvals.consume(call):
+        if not required:
+            return judgement
+        if self.approvals is None:
+            if not injected:
+                return judgement
+            self._hold(judgement, "approval_required: possible prompt injection and no approval "
+                                  "store to ask a person. Tell the user.")
+        if self.approvals.consume(call):
             return judgement
         already_waiting = self.approvals.pending_like(call)
-        request, created = self.approvals.request(call)
+        try:
+            request, created = self.approvals.request(call)
+        except ApprovalLimit:
+            self._hold(judgement, (
+                f"approval_limit: {MAX_PENDING_PER_AGENT} requests from this agent are already "
+                "waiting for the operator. Stop and tell the user; new ones are refused until "
+                "those are decided."))
         minutes = int(self.approvals.ttl.total_seconds() // 60)
         if request["status"] == "denied":
             reason = (
@@ -431,6 +463,20 @@ class GovernanceEngine:
                 self.on_approval_request(request)
             except Exception:  # noqa: BLE001 - a notification must never break a call
                 log.exception("approval notification failed")
+        raise GovernanceDenied(held)
+
+    INJECTION_WINDOW = timedelta(minutes=30)
+
+    def _recently_injected(self, actor: str) -> bool:
+        since = self._now() - self.INJECTION_WINDOW
+        return any(e.tool == "guard.injection" for e in self.audit.since(since, actor))
+
+    def _hold(self, judgement: Judgement, reason: str) -> None:
+        """Refuse a call that policy and risk allowed, for a reason of the gate."""
+        held = replace(judgement, decision=Decision.DENY,
+                       policy=PolicyVerdict(allowed=False, reasons=(reason,)),
+                       reasons=(*judgement.reasons, reason), throttle_seconds=0.0)
+        self.record(held, outcome=Outcome.DENIED)
         raise GovernanceDenied(held)
 
     def self_check(self) -> list[str]:

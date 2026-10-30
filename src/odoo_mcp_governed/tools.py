@@ -34,11 +34,14 @@ from .governance.policy import (
     ATTACHMENT_CONTENT_FIELDS,
     ATTACHMENT_MODEL,
     CONFIG_PARAMETER_MODEL,
+    CONTENT_INJECTION,
     OUTSIDE_SCOPE,
+    USER_IDENTITY,
     WILDCARD,
     covers,
     is_sensitive,
 )
+from .guards import LINKED_MODELS, context_problem, identity_fields, injection_suspect
 from .runtime import Runtime, Snapshot
 
 log = logging.getLogger(__name__)
@@ -63,6 +66,7 @@ class ToolContext:
     guarded: bool = False
     variables: dict[str, Any] = field(default_factory=dict)
     """The token's signed ``vars`` claim, filling the agent's scope."""
+    _readable: dict[str, bool] = field(default_factory=dict, repr=False)
 
     def guard(
         self,
@@ -97,9 +101,69 @@ class ToolContext:
     def odoo(self, model: str, method: str, args: list | None = None, kwargs: dict | None = None):
         return self.snapshot.client.execute(model, method, args, kwargs)
 
+    # -- what this agent may read ---------------------------------------------
+
+    def can_read(self, model: str) -> bool:
+        """Whether a read of ``model`` would pass the policy for this agent on
+        this profile — the same rules as a real call, asked without one."""
+        if model not in self._readable:
+            call = ToolCall(actor=self.actor, profile=self.snapshot.profile.name,
+                            tool="search_records", operation=Operation.READ, model=model)
+            self._readable[model] = self.runtime.engine.policy.evaluate(call).allowed
+        return self._readable[model]
+
+    def installed_models(self) -> list[str]:
+        rows = self.cached(("installed_models",), lambda: self.odoo(
+            "ir.model", "search_read", [[["transient", "=", False]]], {"fields": ["model"]}))
+        return [r["model"] for r in rows if isinstance(r, dict) and r.get("model")]
+
+    def linked(self, model: str | None) -> tuple[str, list[str]] | None:
+        """For chatter, activities, followers…: ``(parent field, the parent
+        models this agent may read)``. They follow their parent's governance —
+        no message about an invoice to an agent that may not read invoices.
+        Asked only for a linked model the agent may read, so a refused call
+        never reaches Odoo."""
+        parent = LINKED_MODELS.get(model or "")
+        if parent is None or not self.can_read(str(model)):
+            return None
+        return parent, sorted(m for m in self.installed_models()
+                              if m != model and self.can_read(m))
+
+    def clean(self, records: Any, model: str) -> Any:
+        """Results as an agent may see them: credentials redacted, and links to
+        records it may not read cut — a ``user_id`` would otherwise hand out
+        names from ``res.users``."""
+        rows = self.redact(records, model)
+        if not isinstance(rows, list) or not rows:
+            return rows
+        defs = _fields_get(self, model, ["type", "relation"]) or {}
+        hidden = {name for name, meta in defs.items()
+                  if isinstance(meta, dict) and meta.get("relation")
+                  and not self.can_read(str(meta["relation"]))}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for name in hidden & set(row):
+                row[name] = False if defs[name].get("type") == "many2one" else []
+        return rows
+
     # -- record scope ------------------------------------------------------
 
     def scope(self, model: str | None) -> list | None:
+        """Every record condition on ``model``: the agent's own scope and, for
+        records that belong to other records, their parent's governance."""
+        parts = [d for d in (self.agent_scope(model), self._linked_domain(model)) if d]
+        if not parts:
+            return None
+        if len(parts) == 1:
+            return parts[0]
+        return ["&", *normalize_domain(parts[0]), *normalize_domain(parts[1])]
+
+    def _linked_domain(self, model: str | None) -> list | None:
+        link = self.linked(model)
+        return [[link[0], "in", link[1]]] if link else None
+
+    def agent_scope(self, model: str | None) -> list | None:
         """The agent's record scope on ``model``, or ``None`` if it has none.
 
         A model the scope does not name is refused by policy; only the models
@@ -137,8 +201,14 @@ class ToolContext:
         scope = self.scope(model)
         if scope is None:
             return set()
-        if any_call:
+        own = self.agent_scope(model)
+        if any_call and own is not None:
             return {OUTSIDE_SCOPE}
+        link = self.linked(model)
+        if values is not None and link is not None:
+            parent, readable = link
+            if (creating or parent in values) and values.get(parent) not in readable:
+                return {OUTSIDE_SCOPE}
         if ids is not None:
             wanted = set(ids)
             if not wanted:
@@ -147,8 +217,8 @@ class ToolContext:
                               [self.scoped_domain(model, [["id", "in", sorted(wanted)]])])
             if found != len(wanted):
                 return {OUTSIDE_SCOPE}
-        if values is not None:
-            fixed = equalities(scope)
+        if values is not None and own is not None:
+            fixed = equalities(own)
             if creating:
                 if fixed is None:
                     return {OUTSIDE_SCOPE}
@@ -156,7 +226,7 @@ class ToolContext:
                     if values.setdefault(name, value) != value:
                         return {OUTSIDE_SCOPE}
             else:
-                touched = scope_fields(scope) & set(values)
+                touched = scope_fields(own) & set(values)
                 if touched and (fixed is None or any(values[f] != fixed.get(f) for f in touched)):
                     return {OUTSIDE_SCOPE}
         return set()
@@ -463,6 +533,62 @@ def _max_attachment_bytes(ctx: ToolContext) -> int:
     return int(ctx.runtime.settings.max_attachment_mb * 1024 * 1024)
 
 
+def _planted(values: dict[str, Any]) -> set[str]:
+    """Text addressed to an AI, written into a record: the next agent to read
+    it would be the victim. A person approves such a write."""
+    blob = json.dumps(values, ensure_ascii=False, default=str)
+    return {CONTENT_INJECTION} if injection_suspect(blob) else set()
+
+
+def _identity(ctx: ToolContext, model: str, ids: list[int], values: dict[str, Any]) -> set[str]:
+    """The e-mail of a contact that belongs to a user decides who can reset
+    that user's password: never changed through MCP."""
+    if not identity_fields(model, values):
+        return set()
+    users = ctx.odoo("res.users", "search_count", [[["partner_id", "in", ids]]],
+                     {"context": {"active_test": False}})
+    return {USER_IDENTITY} if users else set()
+
+
+IDEMPOTENCY_KEY = {"type": "string", "description": (
+    "Optional. A key unique to this change (e.g. a UUID). Repeating the call with the same key "
+    "returns the first result instead of creating a duplicate.")}
+
+
+def _idempotency_key(ctx: ToolContext) -> str | None:
+    key = ctx.arguments.get("idempotency_key")
+    if key is None:
+        return None
+    if not isinstance(key, str) or not 1 <= len(key) <= 128:
+        raise ToolInputError("'idempotency_key' must be a string of 1 to 128 characters")
+    return key
+
+
+def _intent(ctx: ToolContext) -> str:
+    return digest_args({k: v for k, v in ctx.arguments.items() if k != "idempotency_key"})
+
+
+def _replay(ctx: ToolContext, key: str | None) -> dict[str, Any] | None:
+    """The result of the first call with this key — a retry after a lost
+    answer must not create a second invoice."""
+    if key is None:
+        return None
+    stored = ctx.runtime.idempotency.get(ctx.actor, ctx.snapshot.profile.name, ctx.tool, key)
+    if stored is None:
+        return None
+    intent, result = stored
+    if intent != _intent(ctx):
+        raise ToolInputError("this idempotency_key was already used for a different change")
+    return {**result, "replayed": True}
+
+
+def _remember(ctx: ToolContext, key: str | None, result: dict[str, Any]) -> dict[str, Any]:
+    if key is not None:
+        ctx.runtime.idempotency.put(ctx.actor, ctx.snapshot.profile.name, ctx.tool, key,
+                                    _intent(ctx), result)
+    return result
+
+
 def _done(guarded: GuardedCall, count: int | None, result: Any) -> Any:
     guarded.affected(count)
     return result
@@ -519,7 +645,7 @@ def get_record(ctx: ToolContext) -> Any:
     ) as g:
         wanted = _read_fields(ctx, model, fields)
         kwargs = {"fields": wanted} if wanted else {}
-        records = ctx.redact(ctx.odoo(model, "read", [ids], kwargs), model)
+        records = ctx.clean(ctx.odoo(model, "read", [ids], kwargs), model)
         missing = sorted(set(ids) - {r["id"] for r in records})
         result: dict[str, Any] = {"records": records}
         if missing:
@@ -543,7 +669,7 @@ def search_records(ctx: ToolContext) -> Any:
             kwargs["fields"] = wanted
         if order:
             kwargs["order"] = order
-        records = ctx.redact(ctx.odoo(model, "search_read", [domain], kwargs), model)
+        records = ctx.clean(ctx.odoo(model, "search_read", [domain], kwargs), model)
         return _done(
             g,
             len(records),
@@ -557,15 +683,18 @@ def create_record(ctx: ToolContext) -> Any:
     if not values:
         raise ToolInputError("'values' must not be empty")
     values = dict(values)
+    key = _idempotency_key(ctx)
     outside = ctx.outside_scope(model, values=values, creating=True)
-    with ctx.guard(operation=Operation.CREATE, model=model, fields={*values, *outside},
-                   count=1) as g:
+    with ctx.guard(operation=Operation.CREATE, model=model,
+                   fields={*values, *outside, *_planted(values)}, count=1) as g:
+        if (replay := _replay(ctx, key)) is not None:
+            return _done(g, 0, replay)
         created = ctx.odoo(model, "create", [values])
         new_id = created[0] if isinstance(created, list) else created
         if isinstance(new_id, int):
             g.touched([new_id])
             ctx.journal(g, model, "create", {new_id: (None, ctx.redact(values, model))})
-        return _done(g, 1, {"id": new_id, "model": model})
+        return _done(g, 1, _remember(ctx, key, {"id": new_id, "model": model}))
 
 
 def update_record(ctx: ToolContext) -> Any:
@@ -576,7 +705,9 @@ def update_record(ctx: ToolContext) -> Any:
         raise ToolInputError("'values' must not be empty")
     outside = ctx.outside_scope(model, ids, values=values)
     with ctx.guard(
-        operation=Operation.WRITE, model=model, fields={*values, *outside}, count=len(ids)
+        operation=Operation.WRITE, model=model,
+        fields={*values, *outside, *_planted(values), *_identity(ctx, model, ids, values)},
+        count=len(ids),
     ) as g:
         before = ctx.snapshot_before(model, ids, values)
         ctx.odoo(model, "write", [ids, values])
@@ -605,6 +736,8 @@ def execute_method(ctx: ToolContext) -> Any:
     kwargs = ctx.arguments.get("kwargs", {}) or {}
     if not isinstance(args, list) or not isinstance(kwargs, dict):
         raise ToolInputError("'args' must be a list and 'kwargs' an object")
+    if problem := context_problem(kwargs):
+        raise ToolInputError(problem)
     # Best-effort description of what the call touches: record ids if the first
     # argument looks like them, the keys of any value dicts passed along, and
     # any list of strings — read(ids, ['password']) and default_get(['x'])
@@ -940,12 +1073,15 @@ def upload_attachment(ctx: ToolContext) -> Any:
     data = _arg_str(ctx, "data_base64")
     mimetype = _arg_str(ctx, "mimetype", required=False) or None
     raw = _decode_base64(data, _max_attachment_bytes(ctx))
+    key = _idempotency_key(ctx)
     # Attaching a file to a record changes that record, so it needs write
     # permission on the record's model — governed as a create against it.
     with ctx.guard(
         operation=Operation.CREATE, model=model,
         fields={"attachment", *ctx.outside_scope(model, [record_id])}, count=1
     ) as g:
+        if (replay := _replay(ctx, key)) is not None:
+            return _done(g, 0, replay)
         values: dict[str, Any] = {
             "name": filename,
             "datas": base64.b64encode(raw).decode("ascii"),
@@ -958,9 +1094,8 @@ def upload_attachment(ctx: ToolContext) -> Any:
         new_id = created[0] if isinstance(created, list) else created
         if isinstance(new_id, int):
             g.touched([new_id])
-        return _done(
-            g, 1, {"id": new_id, "filename": filename, "size_bytes": len(raw), "res_model": model}
-        )
+        return _done(g, 1, _remember(ctx, key, {
+            "id": new_id, "filename": filename, "size_bytes": len(raw), "res_model": model}))
 
 
 def list_attachments(ctx: ToolContext) -> Any:
@@ -1174,7 +1309,8 @@ TOOLS: dict[str, Tool] = {
             "create_record",
             "Create a record.",
             Operation.CREATE,
-            {"model": MODEL, "values": {"type": "object", "description": "Field values"}},
+            {"model": MODEL, "values": {"type": "object", "description": "Field values"},
+             "idempotency_key": IDEMPOTENCY_KEY},
             ("model", "values"),
             create_record,
             WRITES,
@@ -1321,6 +1457,7 @@ TOOLS: dict[str, Tool] = {
                 "filename": {"type": "string"},
                 "data_base64": {"type": "string"},
                 "mimetype": {"type": "string"},
+                "idempotency_key": IDEMPOTENCY_KEY,
             },
             ("model", "record_id", "filename", "data_base64"),
             upload_attachment,

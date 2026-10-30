@@ -303,6 +303,7 @@ def scoped(tmp_path):
         _env_file=None, data_dir=tmp_path, odoo_url="http://fake.invalid", odoo_db="d",
         odoo_username="u", odoo_api_key="k", allowed_models="*", writable_models="*",
         deletable_models="*", allow_execute_method=True, business_timezone="UTC",
+        execute_method_allowlist="action_confirm,search_read",
         business_hours="00:00-23:59", business_days="mon,tue,wed,thu,fri,sat,sun",
         risk_throttle_seconds=0, odoo_environment="development",
     ))
@@ -356,7 +357,7 @@ class TestRecordScope:
         fake.responses[("res.partner", "read")] = [PARTNERS[7]]
         assert not call("get_record", model="res.partner", record_id=7)[0]
         is_error, body = call("get_record", model="res.partner", ids=[7, 8])
-        assert is_error and "own records" in body
+        assert is_error and "outside what agent" in body
 
     def test_models_outside_the_scope_are_refused(self, scoped) -> None:
         call, fake = scoped

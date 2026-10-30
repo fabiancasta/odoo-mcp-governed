@@ -359,6 +359,14 @@ class PolicyVerdict:
         return tuple(reason_code(r) for r in self.reasons)
 
 
+USER_IDENTITY = "identity:user"
+"""Pseudo-field: the call would change the e-mail of a contact that belongs
+to a user — whoever controls it can reset that user's password."""
+
+CONTENT_INJECTION = "content:injection"
+"""Pseudo-field: the values written contain text addressed to an AI. Allowed,
+but only once a person approves it."""
+
 OUTSIDE_SCOPE = "scope:outside"
 """Pseudo-field the tool layer reports when a call names records, or would
 write values, outside the agent's record scope."""
@@ -384,10 +392,6 @@ def _agent_refusal(rule: AgentRule, call: ToolCall, cfg: PolicyConfig) -> str | 
         return _reason("agent_scope",
                        f"agent {call.actor!r} is limited to its own records, and its scope "
                        f"does not include {call.model!r}")
-    if OUTSIDE_SCOPE in call.fields_touched:
-        return _reason("record_scope",
-                       f"agent {call.actor!r} may only reach its own records of "
-                       f"{call.model!r}; this call names or would create others")
     return None
 
 
@@ -530,6 +534,22 @@ class PolicyEngine:
                 ),
             )
 
+        if OUTSIDE_SCOPE in call.fields_touched:
+            # Every agent: its own scope, and records that belong to a record
+            # it may not read (a message about a blocked invoice).
+            return PolicyVerdict(allowed=False, reasons=(_reason(
+                "record_scope",
+                f"this call names or would create records of {call.model!r} outside what agent "
+                f"{call.actor!r} may reach",
+            ),))
+
+        if USER_IDENTITY in call.fields_touched:
+            return PolicyVerdict(allowed=False, reasons=(_reason(
+                "user_identity",
+                "the e-mail of a contact that belongs to a user cannot be changed through this "
+                "server: it could hand over the account through a password reset. Do it in Odoo",
+            ),))
+
         if call.model == CONFIG_PARAMETER_MODEL and "domain:value" in call.fields_touched:
             return PolicyVerdict(
                 allowed=False,
@@ -607,14 +627,15 @@ class PolicyEngine:
                     "dedicated tool for that operation instead",
                 )
             )
-        elif (
-            not sandbox
-            and cfg.execute_method_allowlist
-            and method not in cfg.execute_method_allowlist
-        ):
-            reasons.append(
-                _reason("method_not_allowed", f"{method!r} is not in EXECUTE_METHOD_ALLOWLIST")
-            )
+        elif not sandbox and method not in cfg.execute_method_allowlist:
+            # Fail closed: with no allowlist, no method. "Any method but the
+            # blocked ones" is how an agent finds the one nobody thought of.
+            reasons.append(_reason(
+                "method_not_allowed",
+                f"{method!r} is not in EXECUTE_METHOD_ALLOWLIST" if cfg.execute_method_allowlist
+                else "execute_method has no EXECUTE_METHOD_ALLOWLIST: name the methods agents may "
+                     "call (e.g. action_confirm, message_post); with none, none is allowed",
+            ))
 
         # An arbitrary method may write, so it needs write permission on the model.
         if call.model and not sandbox and not matches(call.model, cfg.writable_models):

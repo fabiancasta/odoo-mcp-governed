@@ -42,6 +42,7 @@ from .governance.agents import AgentRule, AgentStore
 from .governance.approvals import ApprovalStore
 from .governance.detectors import DetectorConfig
 from .governance.engine import RiskScorer
+from .idempotency import IdempotencyStore
 from .journal import ChangeJournal
 from .notify import Notifier
 from .odoo import OdooClient, TTLCache
@@ -144,6 +145,7 @@ class Runtime:
 
         self.policy_store = PolicyStore(settings.policy_file, policy_from_settings(settings))
         self.agents = AgentStore(settings.data_dir / "agents.json")
+        self.idempotency = IdempotencyStore(settings.data_dir / "idempotency.db")
         self._privileged: set[str] = set()
         self._privileged_lock = threading.Lock()
         self.audit = AuditLog(AuditStore(settings.audit_db), hmac_key=settings.hmac_key())

@@ -65,6 +65,15 @@ CREATE TABLE IF NOT EXISTS approval_grants (
 );
 """
 
+MAX_PENDING_PER_AGENT = 10
+"""More waiting requests than this from one agent is flooding the operator —
+the approval-fatigue attack. New ones are refused until some are decided."""
+
+
+class ApprovalLimit(Exception):
+    """The agent already has too many requests waiting."""
+
+
 GRANT_MINUTES = (30, 120, 480)
 """The choices offered for "approve similar calls for…"."""
 GRANT_MAX_USES = 50
@@ -173,6 +182,12 @@ class ApprovalStore:
             row = self._recent(call)
             if row is not None and row["status"] in ("pending", "denied"):
                 return dict(row), False
+            cutoff = (self._now() - self.ttl).isoformat()
+            waiting = self._conn.execute(
+                "SELECT COUNT(*) FROM approvals WHERE actor = ? AND status = 'pending' "
+                "AND created_at >= ?", (call.actor, cutoff)).fetchone()[0]
+            if waiting >= MAX_PENDING_PER_AGENT:
+                raise ApprovalLimit(waiting)
             cursor = self._conn.execute(
                 "INSERT INTO approvals (created_at, actor, profile, tool, model, operation, "
                 "record_count, arg_digest, status) VALUES (?,?,?,?,?,?,?,?, 'pending')",

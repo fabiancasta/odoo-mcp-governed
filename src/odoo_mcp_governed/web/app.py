@@ -15,12 +15,14 @@ Hardening carried in from day one, each item for a concrete reason:
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
 import secrets
 import time
 from dataclasses import replace
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlencode, urlsplit
 
@@ -36,7 +38,18 @@ from ..governance.policy import is_system_model
 from ..odoo import OdooClient, OdooError
 from ..policy_store import LIST_FIELDS
 from ..profiles import PROFILE_NAME, Profile, ProfileError
-from ..protocol import INVALID_REQUEST, PARSE_ERROR, Dispatcher, _error
+from ..protocol import (
+    HEADER_MISMATCH,
+    INVALID_REQUEST,
+    META_PROTOCOL_VERSION,
+    METHOD_NOT_FOUND,
+    PARSE_ERROR,
+    STATELESS_VERSIONS,
+    SUPPORTED_PROTOCOL_VERSIONS,
+    UNSUPPORTED_VERSION,
+    Dispatcher,
+    _error,
+)
 from ..runtime import Runtime, UndoError
 from ..storage import read_json, write_private_json
 from ..tools import TOOLS
@@ -44,6 +57,15 @@ from ..tuning import LIMITS, TuningError
 from . import permissions, views
 from .auth import AdminSessions, AuthError, TokenStore, csrf_matches, password_matches, verify_token
 from .metrics import summarise
+from .oauth import (
+    CODE_TTL,
+    Grant,
+    OAuthError,
+    OAuthStore,
+    metadata,
+    resource_metadata,
+    with_query,
+)
 from .ratelimit import RateLimiter
 from .totp import TotpVerifier
 
@@ -80,6 +102,8 @@ FLASH = {
         "ok",
     ),
     "agent_saved": ("Agent saved. Its rule applies to its next call.", "ok"),
+    "oauth_forgotten": ("That app's registration is gone. Its tokens stay valid until you "
+                        "revoke them in the agent's tree.", "ok"),
     "token_forgotten": ("The stored copy is gone. Revoke the token from the agent's tree if "
                         "it should stop working.", "ok"),
     "agent_deleted": ("Agent deleted: tokens revoked, agent blocked, rule removed. Its audit "
@@ -219,8 +243,12 @@ def create_app(runtime: Runtime) -> FastAPI:
         "auth_fail": RateLimiter(settings.rate_limit_auth_fail),
         "health": RateLimiter(settings.rate_limit_health),
         "login": RateLimiter(settings.rate_limit_login),
+        # Registration and code exchange: enough for real clients, too few to
+        # guess a code or flood the client list.
+        "oauth": RateLimiter("30/minute"),
     }
     totp = TotpVerifier(settings.admin_totp_secret) if settings.admin_totp_secret else None
+    oauth = OAuthStore(settings.data_dir / "oauth_clients.json")
     cookie_name = "__Host-gov_admin" if settings.https_mode else "gov_admin"
     chain_cache: dict[str, Any] = {"at": 0.0, "status": None}
 
@@ -356,7 +384,9 @@ def create_app(runtime: Runtime) -> FastAPI:
             return JSONResponse(
                 {"error": "invalid or expired token"},
                 status_code=401,
-                headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
+                headers={"WWW-Authenticate": (
+                    'Bearer error="invalid_token", resource_metadata="'
+                    f'{public_base(request)}/.well-known/oauth-protected-resource"')},
             )
         actor = claims["sub"]
 
@@ -378,6 +408,16 @@ def create_app(runtime: Runtime) -> FastAPI:
                        f"message nests deeper than {settings.max_json_depth} levels"),
                 status_code=400,
             )
+
+        version = request.headers.get("mcp-protocol-version")
+        problem = protocol_problem(request.headers, payload, version)
+        if problem is not None:
+            code, message, status = problem
+            body = _error(payload.get("id") if isinstance(payload, dict) else None, code, message)
+            if code == UNSUPPORTED_VERSION:
+                body["error"]["data"] = {"supported": list(SUPPORTED_PROTOCOL_VERSIONS)}
+            return JSONResponse(body, status_code=status)
+        stateless = version in STATELESS_VERSIONS
 
         messages = payload if isinstance(payload, list) else [payload]
         if len(messages) > settings.mcp_max_batch:
@@ -417,13 +457,15 @@ def create_app(runtime: Runtime) -> FastAPI:
         except AgentError:
             variables = {}
         result = await run_in_threadpool(dispatcher.handle_payload, payload, actor, pinned,
-                                         variables)
+                                         variables, stateless)
         headers: dict[str, str] = {}
         if any(isinstance(m, dict) and m.get("method") == "initialize" for m in messages):
             headers["Mcp-Session-Id"] = secrets.token_urlsafe(24)
         if result is None:
             return Response(status_code=202, headers=headers)
-        return JSONResponse(result, headers=headers)
+        not_found = stateless and isinstance(result, dict) and \
+            result.get("error", {}).get("code") == METHOD_NOT_FOUND
+        return JSONResponse(result, headers=headers, status_code=404 if not_found else 200)
 
     app.add_api_route("/mcp", mcp_endpoint, methods=["POST"])
     app.add_api_route("/", mcp_endpoint, methods=["POST"])
@@ -578,12 +620,14 @@ def create_app(runtime: Runtime) -> FastAPI:
             # Both checked every time, so the answer never says which was wrong.
             ok = totp.verify(str(form.get("totp") or "")) and ok
         await run_in_threadpool(runtime.record_login, admin_actor(request), success=ok)
+        next_url = str(form.get("next") or "")
+        next_url = next_url if next_url.startswith("/oauth/authorize?") else ""
         if not ok:
             error = "Wrong password or code." if totp is not None else "Wrong password."
-            return HTMLResponse(views.login_page(error, totp=totp is not None),
+            return HTMLResponse(views.login_page(error, totp=totp is not None, next_url=next_url),
                                 status_code=401)
         sid, _ = sessions.create(client_ip(request))
-        response = RedirectResponse("/admin/agents", status_code=303)
+        response = RedirectResponse(next_url or "/admin/agents", status_code=303)
         response.set_cookie(
             cookie_name, sid, httponly=True, samesite="strict", secure=settings.https_mode,
             path="/", max_age=int(settings.admin_session_ttl.total_seconds()),
@@ -1394,7 +1438,7 @@ def create_app(runtime: Runtime) -> FastAPI:
         return HTMLResponse(views.connect_page(
             csrf=session.csrf, mcp_url=mcp_url(request), agents=names,
             profiles=[p["name"] for p in runtime.profiles.public()], issued=issued,
-            legacy=tokens.current(), flash=flash, flash_kind=kind,
+            legacy=tokens.current(), flash=flash, flash_kind=kind, oauth_clients=oauth.clients(),
         ))
 
     @app.get("/token", response_class=HTMLResponse)
@@ -1455,6 +1499,148 @@ def create_app(runtime: Runtime) -> FastAPI:
         with runtime.admin_action(admin_actor(request), "admin.token.forget"):
             settings.token_file.unlink(missing_ok=True)
         return back("token_forgotten", "/token")
+
+    # -- OAuth (Claude.ai, ChatGPT and other hosted clients) -----------------
+
+    def public_base(request: Request) -> str:
+        if settings.mcp_public_url:
+            return settings.mcp_public_url.rstrip("/")
+        return str(request.base_url).rstrip("/")
+
+    @app.get("/.well-known/oauth-protected-resource")
+    @app.get("/.well-known/oauth-protected-resource/mcp")
+    async def oauth_resource(request: Request):
+        return JSONResponse(resource_metadata(public_base(request)))
+
+    @app.get("/.well-known/oauth-authorization-server")
+    async def oauth_metadata(request: Request):
+        return JSONResponse(metadata(public_base(request)))
+
+    def oauth_error(error: OAuthError, status: int = 400) -> JSONResponse:
+        return JSONResponse({"error": error.code, "error_description": error.description},
+                            status_code=status)
+
+    @app.post("/oauth/register")
+    async def oauth_register(request: Request):
+        if (blocked := limited("oauth", request)) is not None:
+            return blocked
+        try:
+            body = json.loads(await request.body() or b"{}")
+        except ValueError:
+            return oauth_error(OAuthError("invalid_client_metadata", "body must be JSON"))
+        if not isinstance(body, dict):
+            return oauth_error(OAuthError("invalid_client_metadata", "body must be an object"))
+        try:
+            client = oauth.register(body.get("client_name"), body.get("redirect_uris"))
+        except OAuthError as exc:
+            return oauth_error(exc)
+        with runtime.admin_action(f"oauth@{client_ip(request)}", "oauth.register",
+                                  detail={"client": client["client_name"]}):
+            pass
+        return JSONResponse(client, status_code=201)
+
+    OAUTH_PARAMS = ("response_type", "client_id", "redirect_uri", "code_challenge",
+                    "code_challenge_method", "state", "scope", "resource")
+
+    def oauth_params(source) -> dict[str, str]:
+        return {k: str(source.get(k))[:512] for k in OAUTH_PARAMS if source.get(k) is not None}
+
+    @app.get("/oauth/authorize", response_class=HTMLResponse)
+    async def oauth_authorize(request: Request):
+        params = oauth_params(request.query_params)
+        try:
+            client = oauth.check_request(params)
+        except OAuthError as exc:
+            # Never redirect on a bad client or redirect_uri: that is an open redirect.
+            return HTMLResponse(views.page("Connect an app", views.message(
+                f"This connection request is not valid: {exc.description}.", "bad"), nav=False),
+                status_code=400)
+        session = session_for(request)
+        if session is None:
+            return HTMLResponse(views.login_page(
+                totp=totp is not None, next_url=f"/oauth/authorize?{urlencode(params)}"))
+        names = sorted((set(runtime.agents.rules()) | set(actor_stats()))
+                       - set(runtime.agents.archived()))
+        return HTMLResponse(views.consent_page(
+            csrf=session.csrf, client=client, params=params, agents=names,
+            profiles=[p["name"] for p in runtime.profiles.public()]))
+
+    @app.post("/oauth/authorize")
+    async def oauth_consent(request: Request):
+        session, form = await admin_form(request)
+        if session is None or form is None:
+            return RedirectResponse("/admin", status_code=303)
+        params = oauth_params(form)
+        try:
+            client = oauth.check_request(params)
+        except OAuthError as exc:
+            return oauth_error(exc)
+        redirect, state = params["redirect_uri"], params.get("state")
+        extra = {"state": state} if state else {}
+        if form.get("decision") != "allow":
+            return RedirectResponse(with_query(redirect, {
+                "error": "access_denied", **extra, "iss": public_base(request)}), status_code=303)
+        agent = str(form.get("agent") or "").strip()
+        profile = str(form.get("profile") or "").strip() or None
+        problem = None
+        if not ACTOR_NAME.match(agent):
+            problem = "agent names may only contain letters, digits and _ . @ -"
+        elif agent in runtime.agents.archived():
+            problem = f"{agent} is archived; restore it first"
+        elif profile and runtime.profiles.get(profile) is None:
+            problem = "that profile does not exist"
+        if problem:
+            return HTMLResponse(views.page("Connect an app", views.message(problem, "bad"),
+                                           nav=False), status_code=400)
+        code = oauth.issue_code(Grant(client_id=params["client_id"], redirect_uri=redirect,
+                                      challenge=params["code_challenge"], agent=agent,
+                                      profile=profile, expires=time.time() + CODE_TTL))
+        with runtime.admin_action(admin_actor(request), "admin.oauth.consent",
+                                  detail={"client": client["client_name"], "agent": agent,
+                                          "profile": profile}):
+            pass
+        return RedirectResponse(with_query(redirect, {
+            "code": code, **extra, "iss": public_base(request)}), status_code=303)
+
+    @app.post("/oauth/token")
+    async def oauth_token(request: Request):
+        if (blocked := limited("oauth", request)) is not None:
+            return blocked
+        form = await request.form()
+        if form.get("grant_type") != "authorization_code":
+            return oauth_error(OAuthError("unsupported_grant_type",
+                                          "only grant_type=authorization_code"))
+        try:
+            grant = oauth.redeem(str(form.get("code") or ""), str(form.get("client_id") or ""),
+                                 str(form.get("redirect_uri") or ""),
+                                 str(form.get("code_verifier") or ""))
+            client = oauth.clients().get(grant.client_id) or {"client_name": "?"}
+            issued = await run_in_threadpool(lambda: runtime.issue_agent_token(
+                grant.agent, actor=f"oauth:{grant.client_id[:16]}", profile=grant.profile,
+                label=f"OAuth · {client['client_name']}"[:80]))
+        except OAuthError as exc:
+            return oauth_error(exc)
+        except ValueError:
+            return oauth_error(OAuthError("invalid_grant", "the agent can no longer be issued "
+                                                           "a token"))
+        expires_in = max(0, int(datetime.fromisoformat(issued["expires_at"]).timestamp()
+                                - time.time()))
+        return JSONResponse({"access_token": issued["token"], "token_type": "Bearer",
+                             "expires_in": expires_in},
+                            headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
+    @app.post("/admin/oauth/forget")
+    async def oauth_forget(request: Request):
+        session, form = await admin_form(request)
+        if session is None:
+            return RedirectResponse("/admin", status_code=303)
+        if form is None:
+            return back("csrf", "/token")
+        client_id = str(form.get("client_id") or "")
+        with runtime.admin_action(admin_actor(request), "admin.oauth.forget",
+                                  detail={"client": client_id[:16]}):
+            oauth.forget(client_id)
+        return back("oauth_forgotten", "/token")
 
     # -- admin: audit ------------------------------------------------------
 
@@ -1569,6 +1755,51 @@ def create_app(runtime: Runtime) -> FastAPI:
         return back("anchor_written", "/admin/logs")
 
     return app
+
+
+NAMED_METHODS = {"tools/call": "name", "prompts/get": "name", "resources/read": "uri"}
+BASE64_HEADER = re.compile(r"^=\?base64\?([A-Za-z0-9+/=]*)\?=$")
+
+
+def _header_value(value: str | None) -> str | None:
+    """2026-07-28 sends non-ASCII header values as =?base64?...?=."""
+    match = BASE64_HEADER.match(value or "")
+    if not match:
+        return value
+    try:
+        return base64.b64decode(match.group(1), validate=True).decode("utf-8")
+    except ValueError:
+        return "\0unreadable"
+
+
+def protocol_problem(headers, payload: Any, version: str | None) -> tuple[int, str, int] | None:
+    """Whether the request's protocol framing is acceptable: ``None``, or
+    ``(json-rpc code, message, http status)``.
+
+    2026-07-28 mirrors body fields in headers so proxies can route on them.
+    The body is the truth and any difference is refused: a proxy and this
+    server must never see two different requests.
+    """
+    is_initialize = isinstance(payload, dict) and payload.get("method") == "initialize"
+    if version and not is_initialize and version not in SUPPORTED_PROTOCOL_VERSIONS:
+        return UNSUPPORTED_VERSION, f"unsupported MCP-Protocol-Version {str(version)[:40]}", 400
+    if version not in STATELESS_VERSIONS:
+        return None
+    if not isinstance(payload, dict):
+        return INVALID_REQUEST, "send one JSON-RPC message per request", 400
+    params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+    meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+    if meta.get(META_PROTOCOL_VERSION) != version:
+        return HEADER_MISMATCH, "MCP-Protocol-Version header does not match the body", 400
+    if "id" not in payload:
+        return None  # notifications mirror nothing
+    method = payload.get("method")
+    if headers.get("mcp-method") != method:
+        return HEADER_MISMATCH, "Mcp-Method header does not match the body", 400
+    if method in NAMED_METHODS and _header_value(headers.get("mcp-name")) != params.get(
+            NAMED_METHODS[method]):
+        return HEADER_MISMATCH, "Mcp-Name header does not match the body", 400
+    return None
 
 
 def _tab_for(flash_code: str | None, error: str | None, edit: Any) -> str:

@@ -33,7 +33,9 @@ def wide_open(tmp_path):
         writable_models="*",
         deletable_models="*",
         allow_execute_method=True,
-        execute_method_allowlist="",
+        # Wide open on purpose — but a method allowlist is never empty (fail closed).
+        execute_method_allowlist="read,web_search_read,default_get,action_x,execute,"
+                                 "button_immediate_uninstall",
         max_records_per_call=50,
         business_timezone="UTC",
         business_hours="00:00-23:59",

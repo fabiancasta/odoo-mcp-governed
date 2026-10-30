@@ -14,11 +14,13 @@ from :meth:`Profile.public`, which has no secret fields to leak.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Iterable
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from html import escape
 from typing import Any
+from urllib.parse import urlsplit
 
 from ..governance import AuditEvent, ChainStatus, Decision, Outcome
 from ..governance.agents import AgentRule
@@ -919,7 +921,7 @@ def message(text: str | None, kind: str = "ok") -> str:
     return f'<div class="msg {esc(kind)}">{esc(text)}</div>' if text else ""
 
 
-def login_page(error: str | None = None, *, totp: bool = False) -> str:
+def login_page(error: str | None = None, *, totp: bool = False, next_url: str = "") -> str:
     code = (
         '<label for=t>Authenticator code</label>'
         '<input id=t type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" '
@@ -930,11 +932,43 @@ def login_page(error: str | None = None, *, totp: bool = False) -> str:
         '<section class="login"><h2>Administrator login</h2>'
         f"{message(error, 'bad')}"
         '<form method="post" action="/admin">'
-        '<label for=p>Password</label>'
+        + (f'<input type="hidden" name="next" value="{esc(next_url)}">'
+           '<p class="msg">An app asks to connect to this server. Log in to review it.</p>'
+           if next_url else "")
+        + '<label for=p>Password</label>'
         '<input id=p type="password" name="password" autocomplete="current-password" required autofocus>'
         f'{code}<p><button type="submit">Log in</button></p></form></section>'
     )
     return page("Login", body, nav=False)
+
+
+def consent_page(*, csrf: str, client: dict[str, Any], params: dict[str, str],
+                 agents: list[str], profiles: list[str]) -> str:
+    """OAuth consent: which agent this app becomes, on which Odoo profile."""
+    host = urlsplit(params.get("redirect_uri", "")).hostname or "?"
+    suggested = re.sub(r"[^A-Za-z0-9_.@-]+", "-", client["client_name"]).strip("-").lower()[:40]
+    hidden = "".join(f'<input type="hidden" name="{esc(k)}" value="{esc(v)}">'
+                     for k, v in params.items())
+    profile_options = '<option value="">its rule’s profile, or the active one</option>' + "".join(
+        f'<option value="{esc(p)}">pinned to {esc(p)}</option>' for p in profiles)
+    known = "".join(f'<option value="{esc(a)}">' for a in agents)
+    body = (
+        '<section class="login"><h2>🔌 Connect an app</h2>'
+        f'<p><b>{esc(client["client_name"])}</b> asks to use this server. After you allow it, '
+        f"it is sent back to <code>{esc(host)}</code> with an access token.</p>"
+        f'<form method="post" action="/oauth/authorize">{csrf_field(csrf)}{hidden}'
+        '<label>It will act as agent</label>'
+        f'<input type="text" name="agent" value="{esc(suggested or "oauth-client")}" '
+        'list="consent-agents" pattern="[A-Za-z0-9_.@\\-]{1,64}" required>'
+        f'<datalist id="consent-agents">{known}</datalist>'
+        '<small>Its rules, quota, scope and permissions apply; you can revoke it from its tree.'
+        "</small>"
+        f'<label>Odoo profile</label><select name="profile">{profile_options}</select>'
+        '<p><button type="submit" name="decision" value="allow">Allow</button> '
+        '<button class="danger" type="submit" name="decision" value="deny">Deny</button></p>'
+        "</form></section>"
+    )
+    return page("Connect an app", body, nav=False)
 
 
 def _chain_badge(status: ChainStatus) -> str:
@@ -1229,7 +1263,8 @@ def profile_cards(profiles: list[dict[str, Any]], *, summaries: dict[str, str],
 
 def connect_page(*, csrf: str, mcp_url: str, agents: list[str], profiles: list[str],
                  issued: dict[str, Any] | None = None, legacy: dict[str, Any] | None = None,
-                 flash: str | None = None, flash_kind: str = "ok") -> str:
+                 flash: str | None = None, flash_kind: str = "ok",
+                 oauth_clients: dict[str, Any] | None = None) -> str:
     """Connect a client: issue a registered token and get the config to paste.
 
     The server keeps no copy of the token — only its id, to revoke it — so
@@ -1305,7 +1340,26 @@ def connect_page(*, csrf: str, mcp_url: str, agents: list[str], profiles: list[s
             'confirm</label> <button class="danger" type="submit">Forget the stored copy</button>'
             "</form></details>"
         )
-    return page("Connect a client", message(flash, flash_kind) + form + snippets + old)
+    rows = "".join(
+        f'<tr><td>{esc(c.get("client_name"))}</td><td class="mono">{esc(cid[:12])}…</td>'
+        f'<td><small>{esc(", ".join(c.get("redirect_uris", [])))}</small></td>'
+        f'<td><form method="post" action="/admin/oauth/forget" class="inline">{csrf_field(csrf)}'
+        f'<input type="hidden" name="client_id" value="{esc(cid)}">'
+        '<button class="ghost" type="submit">Forget</button></form></td></tr>'
+        for cid, c in sorted((oauth_clients or {}).items(),
+                             key=lambda kv: kv[1].get("created_at", 0), reverse=True)
+    )
+    hosted = (
+        "<section><h2>Hosted apps (Claude.ai, ChatGPT…) — OAuth</h2><p>Give the app the "
+        f"endpoint <code>{esc(mcp_url)}</code>. It registers itself, sends you here to log in, "
+        "and you choose which agent it becomes and on which profile. The token it receives is "
+        "a registered agent token: revocable from the agent’s tree like any other.</p>"
+        + ('<div class="wrap"><table><tr><th>App</th><th>Client id</th><th>Returns to</th>'
+           f"<th></th></tr>{rows}</table></div>" if rows else "<p><small>No app registered yet."
+           "</small></p>")
+        + "</section>"
+    )
+    return page("Connect a client", message(flash, flash_kind) + form + snippets + hosted + old)
 
 def _event_row(e: AuditEvent) -> str:
     cls = "deny" if e.decision is Decision.DENY else (

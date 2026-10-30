@@ -13,7 +13,7 @@ leaked — and is built so that when that happens the damage is bounded and the
 evidence survives.
 
 > **Status:** v0.3 — all 19 tools, stdio and HTTP transports, admin panel and
-> Docker deployment work end to end against Odoo 19. 537 tests, 15 of them clicking through the panel in a real browser.
+> Docker deployment work end to end against Odoo 19. 569 tests, 15 of them clicking through the panel in a real browser.
 
 ## What the operator gets
 
@@ -29,6 +29,13 @@ evidence survives.
 | **Sandbox profiles** | For test databases: model lists off and risk only observed, while the denylist, credential fields and audit stay on. Never on production. |
 | **Activity report** | A printable "what your AI did" page per client and period — counts, refusals, changes — with no record values, ready to send as a PDF. |
 | **Several clients** | Pin each agent's token to its client's Odoo profile; switching the active profile can never send it to another client's database. |
+| **Connect from Claude.ai or ChatGPT** | OAuth 2.1 with PKCE (S256) and dynamic registration. The app sends you to the panel; you choose which agent it becomes and on which profile. It gets an ordinary registered token — revocable from the agent's tree. Redirects must be HTTPS (HTTP only to localhost); codes are hashed, single use, ten minutes. |
+| **MCP 2026-07-28** | Stateless requests with `server/discover`; headers that must match the body (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`); self-describing results. Clients from 2024-11-05 to 2025-11-25 keep working. |
+| **Content guards** | Text addressed to an AI is caught in English, Spanish, Portuguese and French, through look-alike letters, full-width forms and invisible characters. Writing such text, or changing anything in the 30 minutes after reading some, waits for a person. At most 10 requests per agent wait at once. |
+| **No account takeover** | The e-mail of a contact that belongs to a user — the address a password reset goes to — is never changed through MCP. |
+| **Nothing leaks sideways** | Links to models the agent may not read (`user_id` → `res.users`…) come back empty; chatter, activities and followers follow the governance of the record they belong to; Odoo's errors reach the agent without the list of groups that would grant access. |
+| **Strict calls** | Unknown arguments (`sudo`, `uid`…) are refused, not ignored; a method's context accepts only `lang`, `tz`, `active_test` and `allowed_company_ids`; `execute_method` with no allowlist refuses every method. |
+| **Idempotent creates** | `idempotency_key` on `create_record` and `upload_attachment`: a retry returns the first result instead of a duplicate. |
 | **Two layers, in plain words** | The Permissions page first shows what Odoo itself lets the profile's user do — asked of Odoo, per app — then three brakes on every agent: may change, may delete, a person approves deletes and bulk changes. Passwords, keys, certificates, modules, code, users and settings stay out whatever the switches say. Per-app and per-model lists are under Advanced. |
 | **Permissions per profile** | One server, several Odoo (Spain, Colombia…): each profile can have its own lists, or follow the default ones. Each app gets one level in one click — none, read, change, delete — with a selector per model to fine-tune, a search box, and Odoo's system models kept apart. |
 | **Archive or delete agents** | Revokes every token, blocks the agent and hides it; restore any time. The audit log keeps its history. |
@@ -306,7 +313,7 @@ own. For production:
 |---|---|
 | Odoo user | A dedicated user (for example `mcp_agent`) with an API key, only the groups of the apps the agent works with, and **neither Settings nor Technical** |
 | Models | Explicit `ALLOWED_MODELS` and `WRITABLE_MODELS`; `DELETABLE_MODELS` empty unless needed |
-| Methods | `ALLOW_EXECUTE_METHOD` off, or a closed `EXECUTE_METHOD_ALLOWLIST` such as `action_confirm,message_post` |
+| Methods | `ALLOW_EXECUTE_METHOD` off, or a closed `EXECUTE_METHOD_ALLOWLIST` such as `action_confirm,message_post` (an empty one refuses every method) |
 | Denylist | Kept as the floor, not relied on as the main control |
 | Secrets | A fresh `JWT_SECRET` (rotating it revokes every token) and `AUDIT_HMAC_KEY` |
 | Tokens | One per agent from the Agents page, then `REQUIRE_REGISTERED_TOKENS=true` |
@@ -362,7 +369,7 @@ valid agents on the same IP) and the canaries found a content leak
 
 ## Tests
 
-The suite has 537 tests (`pytest tests/e2e` drives the panel in Chromium with Playwright). The ones that matter are not the
+The suite has 569 tests (`pytest tests/e2e` drives the panel in Chromium with Playwright). The ones that matter are not the
 "it records events" kind — they are the adversarial ones:
 
 ```bash

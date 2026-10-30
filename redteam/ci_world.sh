@@ -38,7 +38,12 @@ values = {
     "ODOO_ENVIRONMENT": "development",
     # Widest policy on purpose: the floor must hold on its own.
     "ALLOWED_MODELS": "*", "WRITABLE_MODELS": "*", "DELETABLE_MODELS": "*",
-    "ALLOW_EXECUTE_METHOD": "true", "EXECUTE_METHOD_ALLOWLIST": "",
+    # An empty method allowlist now refuses every method (fail closed), so
+    # it names the methods the harness attacks: what must refuse them is the
+    # floor — blocked methods, the denylist, credential fields — not the list.
+    "ALLOW_EXECUTE_METHOD": "true",
+    "EXECUTE_METHOD_ALLOWLIST": "default_get,button_immediate_uninstall,read,web_search_read,"
+                                "unlink,write,create,sudo,copy,message_post",
     "BUSINESS_HOURS": "00:00-23:59", "BUSINESS_DAYS": "mon,tue,wed,thu,fri,sat,sun",
     "BUSINESS_TIMEZONE": "UTC", "RISK_THROTTLE_SECONDS": "0",
     "DATA_DIR": "/data", "MCP_HOST": "0.0.0.0", "MCP_PORT": "8000",
