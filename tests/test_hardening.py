@@ -137,10 +137,22 @@ class TestLinkedRecords:
         _, fake, call = world()
         call("search_records", model="mail.message", fields=["body"])
         [(_, _, args, _)] = odoo_saw(fake, "mail.message", "search_read")
+        leaves = [x for x in args[0] if isinstance(x, list)]
+        assert ["model", "=like", "ir.%"] in leaves and ["model", "=like", "res.users"] in leaves
+        [blocked] = [x for x in leaves if x[1] == "not in"]
+        assert "ir.config_parameter" in blocked[2] and "ir.attachment" in blocked[2]
+        # Built from the policy alone: a least-privilege Odoo user may not read
+        # ir.model, so it is never asked.
+        assert not [c for c in fake.calls if c[0] == "ir.model" and "transient" not in str(c)]
+
+    def test_with_explicit_lists_only_those_parents(self, world) -> None:
+        _, fake, call = world(allowed_models="res.partner,sale.order,mail.message,res.users")
+        call("search_records", model="mail.message", fields=["body"])
+        [(_, _, args, _)] = odoo_saw(fake, "mail.message", "search_read")
         [leaf] = [x for x in args[0] if isinstance(x, list)]
-        assert leaf[0] == "model" and leaf[1] == "in"
-        assert "res.partner" in leaf[2] and "account.move" in leaf[2]
-        assert "res.users" not in leaf[2] and "ir.cron" not in leaf[2]
+        # Exactly the models it may read; res.users is in only because it is named exactly.
+        assert leaf[:2] == ["model", "in"]
+        assert set(leaf[2]) == {"mail.message", "res.partner", "res.users", "sale.order"}
 
     def test_a_message_of_a_blocked_record_is_refused(self, world) -> None:
         _, fake, call = world()
@@ -157,6 +169,14 @@ class TestLinkedRecords:
         assert not call("create_record", model="mail.activity",
                         values={"res_model": "res.partner", "res_id": 1, "summary": "x"})[0]
         assert len(odoo_saw(fake, "mail.activity", "create")) == 1
+
+
+class TestOdooErrorsSameLine:
+    def test_spanish_groups_on_the_same_line_are_cut(self) -> None:
+        from odoo_mcp_governed.guards import clean_odoo_error
+        text = ("No puede acceder a los registros 'Models' (ir.model). Esta operación está "
+                "permitida para los siguientes grupos:\n- Administration/Settings")
+        assert clean_odoo_error(text) == "No puede acceder a los registros 'Models' (ir.model)."
 
 
 class TestOdooErrors:

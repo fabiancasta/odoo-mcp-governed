@@ -79,13 +79,21 @@ def identity_fields(model: str, values: dict[str, Any]) -> set[str]:
 
 # -- Odoo error messages ----------------------------------------------------------
 
+GROUPS_HINT = re.compile(
+    r"\s*(?:This operation is allowed for|Esta operaci[oó]n est[aá] permitida|"
+    r"Esta opera[cç][aã]o [eé] permitida|Cette op[eé]ration est autoris[eé]e|"
+    r"Diese Operation ist|Questa operazione [eè] consentita).*",
+    re.IGNORECASE | re.DOTALL)
+
+
 def clean_odoo_error(message: str) -> str:
-    """The first paragraph of an Odoo error. Odoo appends which groups would
-    grant access — free reconnaissance for an attacker — and sometimes a
-    traceback; neither reaches the agent."""
-    first = str(message).strip().split("\n\n", 1)[0]
-    first = first.split("\nTraceback", 1)[0].strip()
-    return first[:300] or "Odoo refused the operation."
+    """The first paragraph of an Odoo error, without the part that says which
+    groups would grant access (free reconnaissance for an attacker, in any
+    language and sometimes on the same line) and without a traceback."""
+    first = str(message).strip().split("\n\n", 1)[0].split("\nTraceback", 1)[0]
+    first = GROUPS_HINT.sub("", first)
+    lines = [line for line in first.splitlines() if not line.lstrip().startswith("-")]
+    return " ".join(lines).strip()[:300] or "Odoo refused the operation."
 
 
 # -- method context -----------------------------------------------------------------

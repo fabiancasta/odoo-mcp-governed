@@ -22,7 +22,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..governance.agents import AgentRule
-from ..governance.policy import ALWAYS_DENIED, WILDCARD, PolicyConfig
+from ..governance.policy import ALWAYS_DENIED, WILDCARD, PolicyConfig, narrow
 from .views import ENV_ICON, GATE_ICON, avatar, csrf_field, esc, message, page
 
 TREE_STYLE = """
@@ -56,18 +56,6 @@ flex-direction:row;overflow-x:auto;max-height:none}.roster a{flex:none}}
 .tree .plus{max-width:380px}.plus button{white-space:nowrap}
 </style>
 """
-
-
-def narrow(models: set[str], limit: set[str] | frozenset[str]) -> set[str]:
-    """``models`` held to ``limit``, with ``*`` meaning every business model."""
-    limit = set(limit)
-    if WILDCARD in models and WILDCARD in limit:
-        return {WILDCARD}
-    if WILDCARD in models:
-        return limit
-    if WILDCARD in limit:
-        return set(models)
-    return models & limit
 
 
 def effective(policy: PolicyConfig, rule: AgentRule | None, profile: str,

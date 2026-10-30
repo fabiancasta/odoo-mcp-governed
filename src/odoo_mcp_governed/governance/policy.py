@@ -144,6 +144,18 @@ SYSTEM_MODEL_PATTERNS = frozenset({
 })
 
 
+def narrow(models: set[str] | frozenset[str], limit: set[str] | frozenset[str]) -> set[str]:
+    """``models`` held to ``limit``, ``*`` meaning every business model."""
+    models, limit = set(models), set(limit)
+    if WILDCARD in models and WILDCARD in limit:
+        return {WILDCARD}
+    if WILDCARD in models:
+        return limit
+    if WILDCARD in limit:
+        return models
+    return models & limit
+
+
 def is_system_model(model: str) -> bool:
     return any(fnmatchcase(model, pattern) for pattern in SYSTEM_MODEL_PATTERNS)
 

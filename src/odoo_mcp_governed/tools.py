@@ -36,10 +36,12 @@ from .governance.policy import (
     CONFIG_PARAMETER_MODEL,
     CONTENT_INJECTION,
     OUTSIDE_SCOPE,
+    SYSTEM_MODEL_PATTERNS,
     USER_IDENTITY,
     WILDCARD,
     covers,
     is_sensitive,
+    narrow,
 )
 from .guards import LINKED_MODELS, context_problem, identity_fields, injection_suspect
 from .runtime import Runtime, Snapshot
@@ -112,22 +114,35 @@ class ToolContext:
             self._readable[model] = self.runtime.engine.policy.evaluate(call).allowed
         return self._readable[model]
 
-    def installed_models(self) -> list[str]:
-        rows = self.cached(("installed_models",), lambda: self.odoo(
-            "ir.model", "search_read", [[["transient", "=", False]]], {"fields": ["model"]}))
-        return [r["model"] for r in rows if isinstance(r, dict) and r.get("model")]
-
-    def linked(self, model: str | None) -> tuple[str, list[str]] | None:
-        """For chatter, activities, followers…: ``(parent field, the parent
-        models this agent may read)``. They follow their parent's governance —
-        no message about an invoice to an agent that may not read invoices.
-        Asked only for a linked model the agent may read, so a refused call
-        never reaches Odoo."""
+    def linked(self, model: str | None) -> str | None:
+        """For chatter, activities, followers…: the field naming the record
+        they belong to. They follow that record's governance — no message
+        about an invoice to an agent that may not read invoices."""
         parent = LINKED_MODELS.get(model or "")
-        if parent is None or not self.can_read(str(model)):
-            return None
-        return parent, sorted(m for m in self.installed_models()
-                              if m != model and self.can_read(m))
+        return parent if parent and self.can_read(str(model)) else None
+
+    def readable_parents(self, field_name: str) -> list:
+        """A domain on ``field_name`` (a model name) keeping only the models
+        this agent may read — built from the policy alone. Odoo's model list
+        is not asked: a least-privilege Odoo user may not read it."""
+        cfg, profile = self.policy, self.snapshot.profile.name
+        configurator = profile in cfg.configurator_profiles
+        reach = {WILDCARD} if configurator or profile in cfg.sandbox_profiles \
+            else set(cfg.allowed_models)
+        rule = cfg.agent_rules.get(self.actor)
+        for limit in ((rule.models, frozenset(rule.scope)) if rule else ()):
+            if limit:
+                reach = narrow(reach, limit)
+        if WILDCARD not in reach:
+            return [[field_name, "in", sorted(m for m in reach if self.can_read(m))]]
+        # Every business model: all but what can never be read. System models
+        # are excluded by pattern, even one named exactly — erring closed.
+        blocked = set(ALWAYS_DENIED) | (set() if configurator else set(cfg.denied_models))
+        domain: list = [[field_name, "not in", sorted(blocked)]]
+        if not configurator:
+            for pattern in sorted(SYSTEM_MODEL_PATTERNS):
+                domain += ["!", [field_name, "=like", pattern.replace("*", "%")]]
+        return domain
 
     def clean(self, records: Any, model: str) -> Any:
         """Results as an agent may see them: credentials redacted, and links to
@@ -160,8 +175,8 @@ class ToolContext:
         return ["&", *normalize_domain(parts[0]), *normalize_domain(parts[1])]
 
     def _linked_domain(self, model: str | None) -> list | None:
-        link = self.linked(model)
-        return [[link[0], "in", link[1]]] if link else None
+        parent = self.linked(model)
+        return self.readable_parents(parent) if parent else None
 
     def agent_scope(self, model: str | None) -> list | None:
         """The agent's record scope on ``model``, or ``None`` if it has none.
@@ -204,10 +219,10 @@ class ToolContext:
         own = self.agent_scope(model)
         if any_call and own is not None:
             return {OUTSIDE_SCOPE}
-        link = self.linked(model)
-        if values is not None and link is not None:
-            parent, readable = link
-            if (creating or parent in values) and values.get(parent) not in readable:
+        parent = self.linked(model)
+        if values is not None and parent is not None and (creating or parent in values):
+            target = values.get(parent)
+            if not isinstance(target, str) or not self.can_read(target):
                 return {OUTSIDE_SCOPE}
         if ids is not None:
             wanted = set(ids)
