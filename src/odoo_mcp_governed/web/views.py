@@ -215,7 +215,7 @@ PANEL_JS = """(function () {
 CATEGORY_COLORS = {
     "denylist": "#d0453a", "sensitive": "#8a5cd1", "risk": "#c27d0e", "operator": "#b42318",
     "production": "#2f5bd3", "methods": "#c2410c", "not allowed": "#64748b", "auth": "#0e7490",
-    "volume": "#a16207", "other": "#94a3b8",
+    "volume": "#a16207", "approval": "#0f766e", "agent rule": "#7c3aed", "other": "#94a3b8",
 }
 
 

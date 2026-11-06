@@ -34,11 +34,23 @@ _CATEGORIES = {
     "profile_read_only": "production",
     "privileged_wildcard": "production",
     "auth_failed": "auth",
+    "system_model": "denylist",
+    "user_identity": "sensitive",
+    "record_scope": "agent rule",
+    "agent_tool": "agent rule",
+    "agent_model": "agent rule",
+    "agent_scope": "agent rule",
+    "agent_read_only": "agent rule",
+    "agent_profile": "agent rule",
+    "agent_quota": "agent rule",
+    "approval_required": "approval",
+    "approval_denied": "approval",
+    "approval_limit": "approval",
     "volume_exceeded": "volume",
 }
 
-CATEGORY_ORDER = ("denylist", "sensitive", "risk", "operator", "production", "methods",
-                  "not allowed", "auth", "volume", "other")
+CATEGORY_ORDER = ("denylist", "sensitive", "risk", "approval", "operator", "agent rule",
+                  "production", "methods", "not allowed", "auth", "volume", "other")
 
 
 def categorise(reasons: tuple[str, ...]) -> str:

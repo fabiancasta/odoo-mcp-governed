@@ -441,3 +441,11 @@ class TestOAuth:
         assert "error=access_denied" in denied
         runtime.archive_agent("claude-ai", actor="admin")
         assert self.consent(client, csrf, params).status_code == 400
+
+
+def test_new_refusals_have_a_kind_on_the_dashboard() -> None:
+    from odoo_mcp_governed.web.metrics import categorise
+    for code, kind in (("user_identity", "sensitive"), ("record_scope", "agent rule"),
+                       ("approval_required", "approval"), ("approval_limit", "approval"),
+                       ("agent_quota", "agent rule"), ("system_model", "denylist")):
+        assert categorise((f"{code}: x",)) == kind, code
