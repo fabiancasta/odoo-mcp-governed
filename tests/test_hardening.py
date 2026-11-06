@@ -379,11 +379,12 @@ class TestOAuth:
         verifier, challenge = self.pkce()
         params = self.authorize_params(client_id, challenge)
         page = client.get("/oauth/authorize", params=params).text
-        assert 'name="next"' in page  # not logged in: log in first, then come back
-        landing = client.post("/admin", data={"password": ADMIN, "next": re.search(
-            r'name="next" value="([^"]+)"', page).group(1).replace("&amp;", "&")},
-            follow_redirects=False)
+        assert 'name="pending"' in page  # not logged in: log in first, then come back
+        pending = re.search(r'name="pending" value="([^"]+)"', page).group(1)
+        landing = client.post("/admin", data={"password": ADMIN, "pending": pending},
+                              follow_redirects=False)
         assert landing.headers["location"].startswith("/oauth/authorize?")
+        assert "client_id=" + client_id in landing.headers["location"]
         csrf = login(client)
         consent = client.get("/oauth/authorize", params=params).text
         assert "Connect an app" in consent and "claude" in consent
@@ -412,6 +413,27 @@ class TestOAuth:
         assert client.post("/oauth/token", data={
             "grant_type": "authorization_code", "code": code, "client_id": client_id,
             "redirect_uri": self.REDIRECT, "code_verifier": verifier}).status_code == 400
+
+    @pytest.mark.parametrize("pending", ["https://evil.example/", "//evil.example",
+                                         "/oauth/authorize?x", "made-up-id"])
+    def test_the_login_never_redirects_where_the_browser_says(self, web, pending) -> None:
+        _, client = web
+        response = client.post("/admin", data={"password": ADMIN, "pending": pending},
+                               follow_redirects=False)
+        assert response.headers["location"] == "/admin/agents"
+
+    def test_a_pending_request_is_used_once(self, web) -> None:
+        _, client = web
+        client_id = self.register(client)
+        _, challenge = self.pkce()
+        page = client.get("/oauth/authorize", params=self.authorize_params(client_id, challenge))
+        pending = re.search(r'name="pending" value="([^"]+)"', page.text).group(1)
+        first = client.post("/admin", data={"password": ADMIN, "pending": pending},
+                            follow_redirects=False)
+        again = client.post("/admin", data={"password": ADMIN, "pending": pending},
+                            follow_redirects=False)
+        assert first.headers["location"].startswith("/oauth/authorize?")
+        assert again.headers["location"] == "/admin/agents"
 
     def test_a_bad_request_is_never_redirected(self, web) -> None:
         _, client = web
