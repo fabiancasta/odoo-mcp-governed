@@ -620,14 +620,13 @@ def create_app(runtime: Runtime) -> FastAPI:
             # Both checked every time, so the answer never says which was wrong.
             ok = totp.verify(str(form.get("totp") or "")) and ok
         await run_in_threadpool(runtime.record_login, admin_actor(request), success=ok)
-        next_url = str(form.get("next") or "")
-        next_url = next_url if next_url.startswith("/oauth/authorize?") else ""
+        pending = str(form.get("pending") or "")[:64]
         if not ok:
             error = "Wrong password or code." if totp is not None else "Wrong password."
-            return HTMLResponse(views.login_page(error, totp=totp is not None, next_url=next_url),
+            return HTMLResponse(views.login_page(error, totp=totp is not None, pending=pending),
                                 status_code=401)
         sid, _ = sessions.create(client_ip(request))
-        response = RedirectResponse(next_url or "/admin/agents", status_code=303)
+        response = RedirectResponse(after_login(pending), status_code=303)
         response.set_cookie(
             cookie_name, sid, httponly=True, samesite="strict", secure=settings.https_mode,
             path="/", max_age=int(settings.admin_session_ttl.total_seconds()),
@@ -1545,6 +1544,32 @@ def create_app(runtime: Runtime) -> FastAPI:
     def oauth_params(source) -> dict[str, str]:
         return {k: str(source.get(k))[:512] for k in OAUTH_PARAMS if source.get(k) is not None}
 
+    # An authorization request that arrived before the login is kept here,
+    # by an opaque id, for ten minutes. After the login the server rebuilds
+    # the URL from what it kept and checks it again: the browser never names
+    # where it is sent (no open redirect, whatever is posted).
+    pending_requests: dict[str, tuple[float, dict[str, str]]] = {}
+
+    def remember_request(params: dict[str, str]) -> str:
+        now = time.time()
+        for key in [k for k, (until, _) in pending_requests.items() if until < now]:
+            del pending_requests[key]
+        if len(pending_requests) >= 1000:
+            pending_requests.pop(next(iter(pending_requests)))
+        key = secrets.token_urlsafe(18)
+        pending_requests[key] = (now + CODE_TTL, params)
+        return key
+
+    def after_login(pending: str) -> str:
+        until, params = pending_requests.pop(pending, (0.0, {}))
+        if until < time.time():
+            return "/admin/agents"
+        try:
+            oauth.check_request(params)
+        except OAuthError:
+            return "/admin/agents"
+        return "/oauth/authorize?" + urlencode(params)
+
     @app.get("/oauth/authorize", response_class=HTMLResponse)
     async def oauth_authorize(request: Request):
         params = oauth_params(request.query_params)
@@ -1557,8 +1582,8 @@ def create_app(runtime: Runtime) -> FastAPI:
                 status_code=400)
         session = session_for(request)
         if session is None:
-            return HTMLResponse(views.login_page(
-                totp=totp is not None, next_url=f"/oauth/authorize?{urlencode(params)}"))
+            return HTMLResponse(views.login_page(totp=totp is not None,
+                                                 pending=remember_request(params)))
         names = sorted((set(runtime.agents.rules()) | set(actor_stats()))
                        - set(runtime.agents.archived()))
         return HTMLResponse(views.consent_page(
@@ -1575,7 +1600,10 @@ def create_app(runtime: Runtime) -> FastAPI:
             client = oauth.check_request(params)
         except OAuthError as exc:
             return oauth_error(exc)
-        redirect, state = params["redirect_uri"], params.get("state")
+        # Where to send the browser comes from the client's registration, not
+        # from the form: the form only says which registered URI it means.
+        redirect = next(u for u in client["redirect_uris"] if u == params["redirect_uri"])
+        state = params.get("state")
         extra = {"state": state} if state else {}
         if form.get("decision") != "allow":
             return RedirectResponse(with_query(redirect, {

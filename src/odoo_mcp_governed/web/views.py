@@ -921,7 +921,7 @@ def message(text: str | None, kind: str = "ok") -> str:
     return f'<div class="msg {esc(kind)}">{esc(text)}</div>' if text else ""
 
 
-def login_page(error: str | None = None, *, totp: bool = False, next_url: str = "") -> str:
+def login_page(error: str | None = None, *, totp: bool = False, pending: str = "") -> str:
     code = (
         '<label for=t>Authenticator code</label>'
         '<input id=t type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" '
@@ -932,9 +932,9 @@ def login_page(error: str | None = None, *, totp: bool = False, next_url: str = 
         '<section class="login"><h2>Administrator login</h2>'
         f"{message(error, 'bad')}"
         '<form method="post" action="/admin">'
-        + (f'<input type="hidden" name="next" value="{esc(next_url)}">'
+        + (f'<input type="hidden" name="pending" value="{esc(pending)}">'
            '<p class="msg">An app asks to connect to this server. Log in to review it.</p>'
-           if next_url else "")
+           if pending else "")
         + '<label for=p>Password</label>'
         '<input id=p type="password" name="password" autocomplete="current-password" required autofocus>'
         f'{code}<p><button type="submit">Log in</button></p></form></section>'
