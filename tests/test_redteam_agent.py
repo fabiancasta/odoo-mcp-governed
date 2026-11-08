@@ -145,3 +145,58 @@ def test_a_request_too_large_shrinks_the_history_and_retries() -> None:
                            budget_chars=4_000)
     assert outcome["report"] == "done"
     assert any("request too large" in str(e.get("note", "")) for e in log)
+
+
+class FakeHTTP:
+    """urlopen stand-in: answers from a script, records each request body."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.bodies = []
+
+    def __call__(self, request, timeout=None):
+        import io
+        import urllib.error
+        self.bodies.append(json.loads(request.data))
+        status, body, headers = self.script.pop(0)
+        if status != 200:
+            raise urllib.error.HTTPError(request.full_url, status, "x", headers,
+                                         io.BytesIO(body.encode()))
+        return io.BytesIO(body.encode())
+
+
+OK = json.dumps({"choices": [{"message": {"role": "assistant", "content": "done"},
+                              "finish_reason": "stop"}]})
+OTPM = json.dumps({"error": {"message": "Request too large for model `q` on output tokens per "
+                             "minute (OTPM): Limit 1000, Requested 1371. reduce max_tokens",
+                             "code": "rate_limit_exceeded"}})
+
+
+def test_one_reply_over_the_output_cap_is_capped_not_waited_for(monkeypatch) -> None:
+    fake = FakeHTTP([(429, OTPM, {}), (200, OK, {})])
+    monkeypatch.setattr(agent.urllib.request, "urlopen", fake)
+    slept = []
+    complete = agent.openai_complete("http://x", "k", "q", sleep=slept.append)
+    assert complete([], [])["content"] == "done"
+    assert "max_tokens" not in fake.bodies[0]
+    assert fake.bodies[1]["max_tokens"] == 900
+    assert slept == []
+
+
+def test_a_busy_minute_waits_as_long_as_retry_after_says(monkeypatch) -> None:
+    busy = json.dumps({"error": {"message": "Rate limit reached, try again in 7s"}})
+    fake = FakeHTTP([(429, busy, {"retry-after": "7"}), (200, OK, {})])
+    monkeypatch.setattr(agent.urllib.request, "urlopen", fake)
+    slept = []
+    complete = agent.openai_complete("http://x", "k", "q", max_tokens=500, sleep=slept.append)
+    assert complete([], [])["content"] == "done"
+    assert slept == [8.0]
+    assert fake.bodies[0]["max_tokens"] == 500
+
+
+def test_a_cut_off_reply_is_not_taken_for_the_final_report() -> None:
+    replies = iter([{"role": "assistant", "content": "", "finish_reason": "length"},
+                    {"role": "assistant", "content": "final", "finish_reason": "stop"}])
+    outcome = agent.attack(FakeGoverned({}), lambda messages, tools: next(replies), turns=5,
+                           canaries=CANARIES, log=lambda entry: None)
+    assert outcome["report"] == "final"

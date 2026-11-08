@@ -24,6 +24,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -102,30 +103,59 @@ class RequestTooLarge(RuntimeError):
     """The model API refused one request for its size (HTTP 413)."""
 
 
-def openai_complete(base_url: str, api_key: str, model: str) -> Callable[[list, list], dict]:
-    """A chat-completions call against any OpenAI-compatible endpoint."""
+OUTPUT_CAP = re.compile(r"output tokens per minute.*?Limit (\d+)", re.IGNORECASE | re.DOTALL)
+
+
+def openai_complete(base_url: str, api_key: str, model: str,
+                    max_tokens: int | None = None,
+                    sleep: Callable[[float], None] = time.sleep) -> Callable[[list, list], dict]:
+    """A chat-completions call against any OpenAI-compatible endpoint.
+
+    Free tiers rate-limit in two ways, and they need opposite answers:
+    *too many tokens this minute* passes if we wait (as long as the API's
+    ``retry-after`` says), while *one reply could exceed the per-minute
+    output cap* (Groq's Qwen: 1K) never passes by waiting: the reply is
+    capped below that limit and the call sent again.
+    """
+    cap = {"max_tokens": max_tokens}
+
     def complete(messages: list, tools: list) -> dict:
-        body = json.dumps({"model": model, "messages": messages, "tools": tools,
-                           "tool_choice": "auto", "temperature": 0.8}).encode()
-        request = urllib.request.Request(
-            base_url.rstrip("/") + "/chat/completions", data=body, method="POST",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
-                     # Groq sits behind Cloudflare, which refuses urllib's default
-                     # "Python-urllib" signature with 403 / error code 1010.
-                     "User-Agent": "odoo-mcp-governed-redteam/0.2"})
-        for attempt in range(5):
+        for attempt in range(6):
+            payload = {"model": model, "messages": messages, "tools": tools,
+                       "tool_choice": "auto", "temperature": 0.8}
+            if cap["max_tokens"]:
+                payload["max_tokens"] = cap["max_tokens"]
+            request = urllib.request.Request(
+                base_url.rstrip("/") + "/chat/completions", data=json.dumps(payload).encode(),
+                method="POST",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
+                         # Groq sits behind Cloudflare, which refuses urllib's default
+                         # "Python-urllib" signature with 403 / error code 1010.
+                         "User-Agent": "odoo-mcp-governed-redteam/0.2"})
             try:
                 with urllib.request.urlopen(request, timeout=120) as response:
-                    return json.loads(response.read())["choices"][0]["message"]
+                    choice = json.loads(response.read())["choices"][0]
+                    return choice["message"] | {"finish_reason": choice.get("finish_reason")}
             except urllib.error.HTTPError as exc:
-                if exc.code == 429 and attempt < 4:  # free tiers rate-limit: back off
-                    time.sleep(15 * (attempt + 1))
-                    continue
                 # Say why: "HTTP Error 400" alone left a failed run unexplained.
                 detail = exc.read().decode("utf-8", "replace")[:2000]
+                too_big = OUTPUT_CAP.search(detail) if "too large" in detail.lower() else None
+                if exc.code == 429 and too_big and attempt < 5:
+                    limit = int(too_big.group(1))
+                    if not cap["max_tokens"] or cap["max_tokens"] > limit * 9 // 10:
+                        cap["max_tokens"] = limit * 9 // 10
+                        print(f"output capped at {cap['max_tokens']} tokens per reply", flush=True)
+                        continue
+                elif exc.code == 429 and attempt < 5:
+                    try:
+                        wait = float(exc.headers.get("retry-after") or 0)
+                    except (TypeError, ValueError):
+                        wait = 0.0
+                    sleep(min(wait + 1 if wait > 0 else 15.0 * (attempt + 1), 120.0))
+                    continue
                 kind = RequestTooLarge if exc.code == 413 else RuntimeError
                 raise kind(f"LLM API {exc.code}: {detail}") from None
-        raise RuntimeError("unreachable")
+        raise RuntimeError("LLM API still rate-limited after 6 attempts")
     return complete
 
 
@@ -211,6 +241,12 @@ def attack(governed: Any, complete: Callable[[list, list], dict], *, turns: int,
         calls = reply.get("tool_calls") or []
         messages.append({k: v for k, v in reply.items() if k in ("role", "content", "tool_calls")}
                         | {"role": "assistant"})
+        if not calls and reply.get("finish_reason") == "length":
+            # The reply hit the output cap before choosing a tool: not a report.
+            log({"turn": turn, "note": "reply cut off at the output cap"})
+            messages.append({"role": "user",
+                             "content": "Your reply was cut off. Be brief: call one tool now."})
+            continue
         if not calls:
             report = reply.get("content") or ""
             log({"turn": turn, "final_report": report})
@@ -256,6 +292,9 @@ def main() -> int:
     parser.add_argument("--model", default=os.environ.get("LLM_MODEL") or "openai/gpt-oss-120b")
     parser.add_argument("--pause", type=float, default=float(os.environ.get("LLM_PAUSE", "12")),
                         help="seconds between model calls (free tiers limit tokens per minute)")
+    parser.add_argument("--max-tokens", type=int,
+                        default=int(os.environ.get("LLM_MAX_TOKENS") or 0) or None,
+                        help="cap on each reply (lowered by itself if the API's limit is smaller)")
     args = parser.parse_args()
     api_key = os.environ.get("LLM_API_KEY")
     if not args.token or not api_key:
@@ -270,7 +309,7 @@ def main() -> int:
         print(f"model: {args.model} via {args.llm_url}", flush=True)
         try:
             outcome = attack(Governed(args.url, args.token),
-                             openai_complete(args.llm_url, api_key, args.model),
+                             openai_complete(args.llm_url, api_key, args.model, args.max_tokens),
                              turns=args.turns, canaries=canaries, log=log, pause=args.pause)
         except Exception as exc:  # noqa: BLE001 - reported, then the run fails
             annotate("error", f"LLM attacker ({args.model}) could not run",
